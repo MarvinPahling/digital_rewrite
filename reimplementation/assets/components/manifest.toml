@@ -1,0 +1,182 @@
+# Component symbol manifest. Paths are relative to this file's directory.
+# Eight masters, ten (style, kind) bindings. See STYLE.md for the contract.
+# Anchor x,y are relative to origin; the SVG anchors group stores artboard coordinates
+# (artboard = origin + relative). direction is the port direction on the component.
+# drawn = false means the SVG does not exist yet; build.rs must skip or reject it explicitly.
+
+[meta]
+version = 1
+grid_unit = 20            # world units per grid unit
+artboard = [120, 120]     # viewBox width, height (6x6 grid units)
+stroke_width = 1.5
+default_style = "rect"    # IEEE is a runtime option
+anchor_group = "anchors"  # <g id="anchors" opacity="0"> of <circle id cx cy r="1">
+
+[[master]]
+id = "rect-and"
+src = "src/rect-and.svg"
+svg = "svg/rect-and.svg"
+drawn = true
+
+[[master]]
+id = "rect-or"
+src = "src/rect-or.svg"
+svg = "svg/rect-or.svg"
+drawn = false
+
+[[master]]
+id = "rect-not"
+src = "src/rect-not.svg"
+svg = "svg/rect-not.svg"
+drawn = false
+
+[[master]]
+id = "ieee-and"
+src = "src/ieee-and.svg"
+svg = "svg/ieee-and.svg"
+drawn = true
+
+[[master]]
+id = "ieee-or"
+src = "src/ieee-or.svg"
+svg = "svg/ieee-or.svg"
+drawn = false
+
+[[master]]
+id = "ieee-not"
+src = "src/ieee-not.svg"
+svg = "svg/ieee-not.svg"
+drawn = false
+
+[[master]]
+id = "shared-input"
+src = "src/shared-input.svg"
+svg = "svg/shared-input.svg"
+drawn = false
+
+[[master]]
+id = "shared-output"
+src = "src/shared-output.svg"
+svg = "svg/shared-output.svg"
+drawn = false
+
+[[binding]]
+id = "rect-and"
+kind = "and"
+style = "rect"
+master = "rect-and"
+origin = [20, 40]
+anchors = [
+  { name = "pin-in-0", x = 0, y = 0, direction = "in" },
+  { name = "pin-in-1", x = 0, y = 40, direction = "in" },
+  { name = "pin-out-0", x = 60, y = 20, direction = "out" },
+]
+drawn = true
+
+[[binding]]
+id = "rect-or"
+kind = "or"
+style = "rect"
+master = "rect-or"
+origin = [20, 40]
+anchors = [
+  { name = "pin-in-0", x = 0, y = 0, direction = "in" },
+  { name = "pin-in-1", x = 0, y = 40, direction = "in" },
+  { name = "pin-out-0", x = 60, y = 20, direction = "out" },
+]
+drawn = false
+
+[[binding]]
+id = "rect-not"
+kind = "not"
+style = "rect"
+master = "rect-not"
+origin = [20, 60]
+anchors = [
+  { name = "pin-in-0", x = 0, y = 0, direction = "in" },
+  { name = "pin-out-0", x = 40, y = 0, direction = "out" },
+]
+drawn = false
+
+[[binding]]
+id = "ieee-and"
+kind = "and"
+style = "ieee"
+master = "ieee-and"
+origin = [20, 40]
+anchors = [
+  { name = "pin-in-0", x = 0, y = 0, direction = "in" },
+  { name = "pin-in-1", x = 0, y = 40, direction = "in" },
+  { name = "pin-out-0", x = 60, y = 20, direction = "out" },
+]
+drawn = true
+
+[[binding]]
+id = "ieee-or"
+kind = "or"
+style = "ieee"
+master = "ieee-or"
+origin = [20, 40]
+anchors = [
+  { name = "pin-in-0", x = 0, y = 0, direction = "in" },
+  { name = "pin-in-1", x = 0, y = 40, direction = "in" },
+  { name = "pin-out-0", x = 60, y = 20, direction = "out" },
+]
+drawn = false
+
+[[binding]]
+id = "ieee-not"
+kind = "not"
+style = "ieee"
+master = "ieee-not"
+origin = [20, 60]
+anchors = [
+  { name = "pin-in-0", x = 0, y = 0, direction = "in" },
+  { name = "pin-out-0", x = 40, y = 0, direction = "out" },
+]
+drawn = false
+
+# Input and Output use one shared master each for both styles.
+[[binding]]
+id = "rect-input"
+kind = "input"
+style = "rect"
+master = "shared-input"
+origin = [60, 60]
+anchors = [
+  { name = "pin-out-0", x = 0, y = 0, direction = "out" },
+]
+drawn = false
+
+[[binding]]
+id = "ieee-input"
+kind = "input"
+style = "ieee"
+master = "shared-input"
+origin = [60, 60]
+anchors = [
+  { name = "pin-out-0", x = 0, y = 0, direction = "out" },
+]
+drawn = false
+
+[[binding]]
+id = "rect-output"
+kind = "output"
+style = "rect"
+master = "shared-output"
+origin = [60, 60]
+anchors = [
+  { name = "pin-in-0", x = 0, y = 0, direction = "in" },
+]
+drawn = false
+
+[[binding]]
+id = "ieee-output"
+kind = "output"
+style = "ieee"
+master = "shared-output"
+origin = [60, 60]
+anchors = [
+  { name = "pin-in-0", x = 0, y = 0, direction = "in" },
+]
+drawn = false
