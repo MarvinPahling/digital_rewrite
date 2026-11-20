@@ -98,10 +98,7 @@ impl SymbolLayout {
         })
     }
 
-    pub fn def(&self) -> &'static SymbolDef {
-        self.def
-    }
-
+    #[cfg(test)]
     pub fn origin(&self) -> Point {
         self.origin
     }

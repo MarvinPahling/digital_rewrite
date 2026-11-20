@@ -6,9 +6,8 @@
 //! are world units (20 per grid unit) relative to the symbol origin, so a symbol placed at a
 //! grid-aligned position has every anchor on the grid.
 //!
-//! The data types deliberately know nothing about egui. Painting, tessellation of compound
-//! fills, caching and wiring the symbols into hit testing are the next integration step; until
-//! then the module is exercised only by its tests.
+//! The data types deliberately know nothing about egui. `symbol_tessellate` and
+//! `symbol_render` turn them into meshes, and the UI adapter draws and picks through them.
 
 use crate::domain::ComponentKind;
 
@@ -150,6 +149,7 @@ pub fn symbol(style: SymbolStyle, kind: ComponentKind) -> Option<&'static Symbol
 }
 
 /// Iterates all symbol definitions in manifest order.
+#[cfg(test)]
 pub fn symbols() -> impl Iterator<Item = &'static SymbolDef> {
     SYMBOLS.iter()
 }

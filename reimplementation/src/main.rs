@@ -3,19 +3,15 @@
 // Icons are not wired into the UI yet; the module is only exercised by its tests.
 #[allow(dead_code)]
 mod assets;
-#[allow(dead_code, reason = "wired into the UI by the next commit")]
 mod canvas;
 mod components;
 mod domain;
 mod engine;
 mod formats;
-#[allow(dead_code, reason = "wired into the UI by the next commit")]
 mod symbol_render;
 #[cfg(test)]
 mod symbol_sheet;
-#[allow(dead_code, reason = "wired into the UI by the next commit")]
 mod symbol_tessellate;
-#[allow(dead_code, reason = "wired into the UI by the next commit")]
 mod symbols;
 mod ui;
 

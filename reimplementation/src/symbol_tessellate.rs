@@ -148,6 +148,7 @@ pub struct RawTriangles {
     pub indices: Vec<u32>,
 }
 
+#[cfg(test)]
 impl RawTriangles {
     /// Sum of the triangle areas, in squared world units.
     pub fn area(&self) -> f32 {
@@ -258,6 +259,7 @@ fn stroke_triangles(
 }
 
 /// Tessellates one filled `path` (ignoring its stroke) without fringe, for area checks.
+#[cfg(test)]
 pub fn tessellate_fill_raw(
     path: &SymbolPath,
     physical_scale: f32,
