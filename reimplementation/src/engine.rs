@@ -2,13 +2,33 @@
 use crate::domain::{Component, ComponentId, ComponentKind, Document, Position};
 #[derive(Default)]
 pub struct Session {
-    pub document: Document,
+    document: Document,
     undo: Vec<Document>,
     redo: Vec<Document>,
     saved: Document,
     next_id: u64,
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum EditError {
+    InvalidPosition,
+    UnknownComponent,
+    IdExhausted,
+}
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidPosition => "Invalid position",
+            Self::UnknownComponent => "Unknown component",
+            Self::IdExhausted => "No component IDs remaining",
+        })
+    }
+}
+impl std::error::Error for EditError {}
 impl Session {
+    pub fn document(&self) -> &Document {
+        &self.document
+    }
+
     pub fn dirty(&self) -> bool {
         self.document != self.saved
     }
@@ -20,15 +40,12 @@ impl Session {
         &mut self,
         kind: ComponentKind,
         position: Position,
-    ) -> Result<ComponentId, &'static str> {
+    ) -> Result<ComponentId, EditError> {
         if !position.valid() {
-            return Err("Invalid position");
+            return Err(EditError::InvalidPosition);
         }
         let id = ComponentId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or("No component IDs remaining")?;
+        self.next_id = self.next_id.checked_add(1).ok_or(EditError::IdExhausted)?;
         let mut next = self.document.clone();
         next.components.push(Component {
             id,
@@ -39,33 +56,29 @@ impl Session {
         self.edit(next);
         Ok(id)
     }
-    pub fn move_component(
-        &mut self,
-        id: ComponentId,
-        position: Position,
-    ) -> Result<(), &'static str> {
+    pub fn move_component(&mut self, id: ComponentId, position: Position) -> Result<(), EditError> {
         if !position.valid() {
-            return Err("Invalid position");
+            return Err(EditError::InvalidPosition);
         }
         let mut next = self.document.clone();
         let component = next
             .components
             .iter_mut()
             .find(|c| c.id == id)
-            .ok_or("Unknown component")?;
+            .ok_or(EditError::UnknownComponent)?;
         if component.position != position {
             component.position = position;
             self.edit(next);
         }
         Ok(())
     }
-    pub fn delete(&mut self, id: ComponentId) -> Result<(), &'static str> {
+    pub fn delete(&mut self, id: ComponentId) -> Result<(), EditError> {
         let mut next = self.document.clone();
         let index = next
             .components
             .iter()
             .position(|c| c.id == id)
-            .ok_or("Unknown component")?;
+            .ok_or(EditError::UnknownComponent)?;
         next.components.remove(index);
         self.edit(next);
         Ok(())
@@ -85,6 +98,37 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typed_errors_and_id_exhaustion_leave_state_unchanged() {
+        let mut session = Session::default();
+        let p = Position { x: 1., y: 2. };
+        let id = session.place(ComponentKind::Not, p).unwrap();
+        let snapshot = session.document().clone();
+        assert_eq!(
+            session.move_component(
+                id,
+                Position {
+                    x: f32::INFINITY,
+                    y: 0.
+                }
+            ),
+            Err(EditError::InvalidPosition)
+        );
+        assert_eq!(
+            session.delete(ComponentId(999)),
+            Err(EditError::UnknownComponent)
+        );
+        session.next_id = u64::MAX;
+        assert_eq!(
+            session.place(ComponentKind::And, p),
+            Err(EditError::IdExhausted)
+        );
+        assert_eq!(*session.document(), snapshot);
+        session.undo();
+        assert!(!session.dirty());
+        session.redo();
+        assert_eq!(*session.document(), snapshot);
+    }
     #[test]
     fn history_and_branch_ids() {
         let mut s = Session::default();
