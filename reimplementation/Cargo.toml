@@ -10,3 +10,10 @@ eframe = { version = "0.31", default-features = false, features = ["default_font
 resvg = { version = "0.50.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.2"
+
+# The component symbol pipeline (build_support/) is also compiled into the test build so that
+# its failure diagnostics are unit-tested; nothing here is linked into the application.
+[dev-dependencies]
+resvg = { version = "0.50.0", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.2"

@@ -1,6 +1,9 @@
 //! Rasterizes the delivery SVGs listed in `assets/icons/manifest.toml` into PNGs under
 //! `$OUT_DIR/assets/` and generates `$OUT_DIR/assets.rs` with tables embedding them.
 //! PNGs are build outputs and are never committed.
+//!
+//! It also converts the component symbol SVGs listed in `assets/components/manifest.toml` into
+//! toolkit-neutral vector data (`$OUT_DIR/component_symbols.rs`); see `build_support`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -9,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 use resvg::{tiny_skia, usvg};
 use serde::Deserialize;
+
+#[path = "build_support/component_symbols.rs"]
+mod component_symbols;
 
 const ICON_PIXEL_SIZES: [u32; 2] = [24, 48];
 const SPLASH_SCALES: [u32; 2] = [1, 2];
@@ -64,6 +70,7 @@ fn run() -> Result<(), String> {
     let manifest_path = assets_dir.join("icons").join("manifest.toml");
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support/component_symbols.rs");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
 
     let manifest_text = fs::read_to_string(&manifest_path)
@@ -144,6 +151,27 @@ fn run() -> Result<(), String> {
         format!(
             "{}: cannot write generated tables: {e}",
             generated_path.display()
+        )
+    })?;
+
+    generate_component_symbols(&assets_dir, &out_dir)
+}
+
+/// Writes `$OUT_DIR/component_symbols.rs` and registers the manifest and SVGs for rerun.
+fn generate_component_symbols(assets_dir: &Path, out_dir: &Path) -> Result<(), String> {
+    let manifest_path = assets_dir.join("components").join("manifest.toml");
+    let generated = component_symbols::generate(&manifest_path, &|path| fs::read_to_string(path))?;
+    for input in &generated.inputs {
+        println!("cargo:rerun-if-changed={}", input.display());
+    }
+    for warning in &generated.warnings {
+        println!("cargo:warning={warning}");
+    }
+    let output_path = out_dir.join("component_symbols.rs");
+    fs::write(&output_path, generated.code).map_err(|e| {
+        format!(
+            "{}: cannot write generated symbols: {e}",
+            output_path.display()
         )
     })
 }

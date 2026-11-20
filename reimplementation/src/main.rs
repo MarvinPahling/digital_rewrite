@@ -7,7 +7,18 @@ mod components;
 mod domain;
 mod engine;
 mod formats;
+// The renderer and layout code that consume the symbol data are the next integration step.
+#[allow(
+    dead_code,
+    reason = "symbol data is not wired into the UI yet; exercised by tests"
+)]
+mod symbols;
 mod ui;
+
+// The component symbol pipeline is compiled into test builds so its diagnostics are tested.
+#[cfg(test)]
+#[path = "../build_support/component_symbols.rs"]
+mod component_symbol_pipeline;
 
 fn main() -> eframe::Result {
     eframe::run_native(
