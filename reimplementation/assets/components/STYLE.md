@@ -127,6 +127,6 @@ Drawing-lane checklist: names exact; anchors at the table coordinates; stroke 1.
 ## Provenance
 
 - Drawn with `vectorcraft-cli` 0.24.1 through its MCP server on 2026-11-20: `draw_shape`, `draw_path`, `add_text`, `type.createOutlines`, `object.group`, `object.setProps`, `transform`, `save_file`, `export`. Briefs: "rectangular AND box with outlined & glyph and pin leads" and "original curved AND body with leads", on the contract above.
-- Drawn so far: `rect-and`, `ieee-and`. The other masters are pending.
+- All eight masters are drawn. Per-asset briefs, tools and the decisions made while drawing (rect-not carries a glyph; polygon/circle elements in exports) are in `PROVENANCE.md` next to this file.
 - The `&` is Liberation Sans Bold outlined through VectorCraft (SIL OFL 1.1, permits embedding outlines). IEEE body and rectangular box are plain geometric primitives drawn from numbers, not from any reference outline.
 - This is not a clean-room claim: the authors had read access to the reference repositories; Digital source was consulted only for pin-grid semantics (20-unit pitch, 40-unit input separation, output midway). The rewrite's license is unresolved and the assets carry no license grant until the owner decides.

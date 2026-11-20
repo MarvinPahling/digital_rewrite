@@ -22,13 +22,13 @@ drawn = true
 id = "rect-or"
 src = "src/rect-or.svg"
 svg = "svg/rect-or.svg"
-drawn = false
+drawn = true
 
 [[master]]
 id = "rect-not"
 src = "src/rect-not.svg"
 svg = "svg/rect-not.svg"
-drawn = false
+drawn = true
 
 [[master]]
 id = "ieee-and"
@@ -40,25 +40,25 @@ drawn = true
 id = "ieee-or"
 src = "src/ieee-or.svg"
 svg = "svg/ieee-or.svg"
-drawn = false
+drawn = true
 
 [[master]]
 id = "ieee-not"
 src = "src/ieee-not.svg"
 svg = "svg/ieee-not.svg"
-drawn = false
+drawn = true
 
 [[master]]
 id = "shared-input"
 src = "src/shared-input.svg"
 svg = "svg/shared-input.svg"
-drawn = false
+drawn = true
 
 [[master]]
 id = "shared-output"
 src = "src/shared-output.svg"
 svg = "svg/shared-output.svg"
-drawn = false
+drawn = true
 
 [[binding]]
 id = "rect-and"
@@ -84,7 +84,7 @@ anchors = [
   { name = "pin-in-1", x = 0, y = 40, direction = "in" },
   { name = "pin-out-0", x = 60, y = 20, direction = "out" },
 ]
-drawn = false
+drawn = true
 
 [[binding]]
 id = "rect-not"
@@ -96,7 +96,7 @@ anchors = [
   { name = "pin-in-0", x = 0, y = 0, direction = "in" },
   { name = "pin-out-0", x = 40, y = 0, direction = "out" },
 ]
-drawn = false
+drawn = true
 
 [[binding]]
 id = "ieee-and"
@@ -122,7 +122,7 @@ anchors = [
   { name = "pin-in-1", x = 0, y = 40, direction = "in" },
   { name = "pin-out-0", x = 60, y = 20, direction = "out" },
 ]
-drawn = false
+drawn = true
 
 [[binding]]
 id = "ieee-not"
@@ -134,7 +134,7 @@ anchors = [
   { name = "pin-in-0", x = 0, y = 0, direction = "in" },
   { name = "pin-out-0", x = 40, y = 0, direction = "out" },
 ]
-drawn = false
+drawn = true
 
 # Input and Output use one shared master each for both styles.
 [[binding]]
@@ -146,7 +146,7 @@ origin = [60, 60]
 anchors = [
   { name = "pin-out-0", x = 0, y = 0, direction = "out" },
 ]
-drawn = false
+drawn = true
 
 [[binding]]
 id = "ieee-input"
@@ -157,7 +157,7 @@ origin = [60, 60]
 anchors = [
   { name = "pin-out-0", x = 0, y = 0, direction = "out" },
 ]
-drawn = false
+drawn = true
 
 [[binding]]
 id = "rect-output"
@@ -168,7 +168,7 @@ origin = [60, 60]
 anchors = [
   { name = "pin-in-0", x = 0, y = 0, direction = "in" },
 ]
-drawn = false
+drawn = true
 
 [[binding]]
 id = "ieee-output"
@@ -179,4 +179,4 @@ origin = [60, 60]
 anchors = [
   { name = "pin-in-0", x = 0, y = 0, direction = "in" },
 ]
-drawn = false
+drawn = true
