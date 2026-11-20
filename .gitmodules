@@ -4,3 +4,6 @@
 [submodule "references/materialcraft"]
 	path = references/materialcraft
 	url = https://github.com/storytold/materialcraft.git
+[submodule "references/photocraft"]
+	path = references/photocraft
+	url = https://github.com/storytold/photocraft.git
