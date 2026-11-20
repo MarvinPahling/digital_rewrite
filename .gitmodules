@@ -1,0 +1,6 @@
+[submodule "references/Digital"]
+	path = references/Digital
+	url = https://github.com/hneemann/Digital.git
+[submodule "references/materialcraft"]
+	path = references/materialcraft
+	url = https://github.com/storytold/materialcraft.git
