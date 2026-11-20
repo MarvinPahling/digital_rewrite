@@ -2,9 +2,9 @@
 
 ## Goal and current state
 
-Build a native Rust replacement for Digital with its complete user-facing feature set and compatible circuit workflows. Keep Digital's recognizable, canvas-first GUI layout, but give it modern typography, spacing, controls, themes and feedback. MaterialCraft is the architecture and native-UI reference, not the source of circuit semantics or branding.
+Build a native Rust replacement for Digital with its complete user-facing feature set and compatible circuit workflows. Keep Digital's recognizable, canvas-first GUI layout, but give it modern typography, spacing, controls, themes and feedback. PhotoCraft is the architectural source of truth; MaterialCraft inspires the UI, particularly its node editor. Digital is the behavioral compatibility authority.
 
-The current implementation is only a Rust 2024 `digital-rust` package with a Hello World binary and no dependencies. **Every implementation checkbox below is initially incomplete.** This document is a plan, not a claim of compatibility. Implementation belongs in `reimplementation/`; reference repositories remain read-only.
+The Rust 2024 `digital-rust` package already has a native component editor and editing history; see `reimplementation/docs/parity.md` for its supported subset. Unchecked milestones are not completion claims. This document is a plan, not a claim of compatibility. Implementation belongs in `reimplementation/`; reference repositories remain read-only.
 
 ### Reference baseline
 
@@ -12,7 +12,8 @@ The current implementation is only a Rust 2024 `digital-rust` package with a Hel
 | --- | --- | --- |
 | Digital source | `d118dce079b6b8867024d40f9b14dfa667e52106` | Behavioral source, tests, component catalog and desktop workflows |
 | Digital bundled distribution | `references/Digital_release/Version.txt`: `v0.31` | Runnable comparison, manuals, example circuits and libraries |
-| MaterialCraft source | `4ff5af9af7371613ee37b186e03caf49ee6dbd88` | Rust architecture, command/session patterns and native GUI approach |
+| PhotoCraft source | `877d58844029967b80e36a964902d309de1be158` | Architectural source of truth; image-processing behavior is not circuit semantics |
+| MaterialCraft source | `4ff5af9af7371613ee37b186e03caf49ee6dbd88` | UI inspiration, especially node-editor interaction |
 
 The source checkout is later than the bundled release. Record which target each test covers; never label a source-only result as v0.31 compatibility. When references change, update the inventory and rerun affected tests.
 
@@ -82,7 +83,7 @@ These are proposed improvements, not claims that Digital already has these contr
 
 ## Architecture and implementation rules
 
-Start with focused modules inside the existing package; extract crates only when actual boundaries justify them. Read `references/materialcraft/docs/architecture.md` before changing boundaries and `references/materialcraft/CODE_STYLE.md` for Rust organization. Before native UI work, inspect its desktop entrypoint and `crates/ui-egui/`.
+Start with focused modules inside the existing package; extract crates only when actual boundaries justify them. Read `references/photocraft/docs/architecture.md` and `references/photocraft/AGENTS.md` before changing boundaries. Before native UI work, inspect `references/photocraft/apps/photocraft/src/main.rs` and `references/photocraft/crates/ui-egui/`; consult `references/materialcraft/crates/ui-egui/src/graph/` for node-editor inspiration. PhotoCraft image-processing details are not circuit semantics.
 
 ```text
 Domain: document, IDs, ports, attributes, signals
@@ -132,7 +133,7 @@ Some investigation and independent adapters can proceed in parallel. Do not dela
 
 ### M0 — Establish the compatibility contract
 
-- [ ] Select the project's license/reuse policy with the owner before copying source, tests, fixtures, fonts, icons or documentation. Digital is GPLv3; MaterialCraft is MIT OR Apache-2.0 with additional notices. Reading either does not establish a clean-room implementation.
+- [ ] Select the project's license/reuse policy with the owner before copying source, tests, fixtures, fonts, icons or documentation. Digital is GPLv3; PhotoCraft and MaterialCraft are MIT OR Apache-2.0 with additional notices. Reading them does not establish a clean-room implementation.
 - [ ] Create a versioned feature ledger, for example `reimplementation/docs/parity.md`, covering registered component identifiers, variants, attributes/defaults, symbol styles, menu actions, shortcuts, settings, CLI options, file versions, protocols and exporters.
 - [ ] Inventory source registrations, all bundled libraries (including DIL/74xx chips and RAMs), examples, test fixtures and localized resources. Class files alone are not the user-visible catalog.
 - [ ] Give every ledger row a milestone, reference path/version, implementation location, test evidence and status: not started, partial, implemented, verified or blocked.
@@ -316,7 +317,7 @@ cargo clippy --manifest-path reimplementation/Cargo.toml --all-targets -- -D war
 cargo run --manifest-path reimplementation/Cargo.toml
 ```
 
-These currently exercise only the scaffold. Add focused simulator/codec/command tests, UI interaction and snapshot suites, differential comparisons and platform/tool integration jobs as those capabilities exist. Introduce reusable root `justfile` workflows without relabeling the current `just run`: it launches Java, not the Rust rewrite. MaterialCraft's `cargo xtask` commands do not exist here.
+These exercise the current editing subset, not full compatibility. Add focused simulator/codec/command tests, UI interaction and snapshot suites, differential comparisons and platform/tool integration jobs as those capabilities exist. Introduce reusable root `justfile` workflows without relabeling the current `just run`: it launches Java, not the Rust rewrite. MaterialCraft's `cargo xtask` commands do not exist here.
 
 For comparison, run the bundled application with `java -jar references/Digital_release/Digital.jar` when an appropriate Java runtime exists. Java source tests use `mvn -f references/Digital/pom.xml test`; their exclusions mean they do not prove GUI or external-HDL parity. Use only cleared fixtures for redistribution and report manual comparison separately.
 
@@ -332,7 +333,7 @@ For comparison, run the bundled application with `java -jar references/Digital_r
 | Analysis/synthesis/FSM | `references/Digital/src/main/java/de/neemann/digital/analyse/`, `references/Digital/src/main/java/de/neemann/digital/builder/`, `references/Digital/src/main/java/de/neemann/digital/fsm/` |
 | Tests/HDL/toolchains/CLI | `references/Digital/src/main/java/de/neemann/digital/testing/`, `references/Digital/src/main/java/de/neemann/digital/hdl/`, `references/Digital/src/main/java/de/neemann/digital/toolchain/`, `references/Digital/src/main/java/de/neemann/digital/cli/` |
 | High-risk regression tests | `references/Digital/src/test/java/de/neemann/digital/core/ObservableValueTest.java`, `references/Digital/src/test/java/de/neemann/digital/core/wiring/SplitterHighZTest.java`, `references/Digital/src/test/java/de/neemann/digital/draw/elements/CircuitTest.java` |
-| Rust architecture/UI | `references/materialcraft/docs/architecture.md`, `references/materialcraft/CODE_STYLE.md`, `references/materialcraft/apps/materialcraft/src/main.rs`, `references/materialcraft/crates/ui-egui/` |
+| Rust architecture/UI | `references/photocraft/docs/architecture.md`, `references/photocraft/AGENTS.md`, `references/photocraft/apps/photocraft/src/main.rs`, `references/photocraft/crates/ui-egui/`; node-editor inspiration: `references/materialcraft/crates/ui-egui/src/graph/` |
 
 ## Recommended first implementation issues
 

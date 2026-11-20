@@ -2,20 +2,20 @@
 
 ## Goal and scope
 
-Reimplement Digital's circuit editor and digital-logic simulator in Rust, using MaterialCraft as the reference for native GUI style and application architecture. Digital defines domain behavior and compatibility; MaterialCraft supplies architectural patterns, not circuit semantics.
+Reimplement Digital's circuit editor and digital-logic simulator in Rust, using PhotoCraft as the architectural source of truth. Digital defines behavior and compatibility; MaterialCraft is UI inspiration, especially its node editor.
 
 Implementation belongs in `reimplementation/`. Treat `references/` as read-only unless the task explicitly asks to update a reference. Do not change submodule revisions as part of implementation work. Reference repositories' agent files describe those projects; their organization-specific contribution policies are not this repository's policy.
 
 ## Current repository
 
-- `reimplementation/Cargo.toml`: package `digital-rust`, Rust edition 2024, currently no dependencies.
-- `reimplementation/src/main.rs`: currently a Hello World binary. No simulator, GUI, workspace, automation server or compatibility layer exists yet.
+- `reimplementation/Cargo.toml`: Rust 2024 package with an egui/eframe native editor. See `reimplementation/docs/parity.md` for the implemented editing subset and gaps.
 - `references/Digital/`: Java source submodule; the behavioral reference.
 - `references/Digital_release/`: runnable distribution, documentation PDFs, example circuits and component libraries.
-- `references/materialcraft/`: Rust source submodule; the native UI and code-organization reference.
+- `references/photocraft/`: architectural reference.
+- `references/materialcraft/`: UI inspiration, especially the node editor.
 - Root `justfile`: `just run` launches the bundled Java application, **not** the Rust rewrite. Its Java executable path is machine-specific.
 
-Baseline examined for this guide: Digital `d118dce079b6b8867024d40f9b14dfa667e52106`; MaterialCraft `4ff5af9af7371613ee37b186e03caf49ee6dbd88`. The bundled Digital release identifies itself as `v0.31` in `references/Digital_release/Version.txt`, whereas the source checkout is later. Record the source revision or release version used for each compatibility result; do not conflate them. Recheck manifests and source when reference revisions change.
+Baseline examined for this guide: Digital `d118dce079b6b8867024d40f9b14dfa667e52106`; PhotoCraft `877d58844029967b80e36a964902d309de1be158`; MaterialCraft `4ff5af9af7371613ee37b186e03caf49ee6dbd88`. The bundled Digital release identifies itself as `v0.31` in `references/Digital_release/Version.txt`, whereas the source checkout is later. Record the source revision or release version used for each compatibility result; do not conflate them. Recheck manifests and source when reference revisions change.
 
 ## Reference map and technology stacks
 
@@ -40,33 +40,17 @@ Read the relevant subsystem before implementing its counterpart:
 
 The feature surface extends beyond gates: buses, tri-state/weak signals, arithmetic, sequential elements, memory, hierarchical circuits, measurement, truth tables, test vectors, FSMs and HDL tooling. Implement these incrementally; a gate editor alone is not full Digital parity. External VHDL and Verilog simulation uses GHDL and Icarus Verilog respectively; those integrations are separate capabilities, not prerequisites for basic simulation.
 
-### MaterialCraft: architecture to adapt
+### PhotoCraft: architecture to adapt
 
-`references/materialcraft/Cargo.toml` defines a Rust 2024 Cargo workspace. Its layers are:
+Before changing boundaries, read `references/photocraft/docs/architecture.md` (its current-state summary supersedes its historical plan) and `references/photocraft/AGENTS.md`. PhotoCraft separates its document, engine, I/O and UI; command IDs connect UI and headless adapters. Before native UI work, inspect `references/photocraft/apps/photocraft/src/main.rs` and `references/photocraft/crates/ui-egui/`. For node-editor interaction inspiration, inspect `references/materialcraft/crates/ui-egui/src/graph/`.
 
-```text
-core + geom -> nodes -> eval + formats -> engine + render -> automation -> ui-egui
-apps: materialcraft (desktop), materialcraft-cli, materialcraft-web
-xtask: architecture and build checks
-```
-
-The arrows denote layer order, not a requirement that every crate depend on every preceding crate. The web app is excluded from default members.
-
-- Native UI: egui/eframe 0.37 with wgpu presentation, AccessKit, X11 and Wayland support. The manifest patches egui and winit to pinned Storytold forks. Check the complete dependency/patch combination before adopting Craft widgets; version numbers alone do not establish compatibility.
-- Computation: CPU material evaluation/rendering with Rayon. The wgpu UI backend does not imply GPU simulation or GPU material evaluation.
-- State: `Session` owns documents, selection, view state, history and caches. Transactional edits and snapshot undo live in `references/materialcraft/crates/engine/src/session.rs`.
-- Commands: IDs, parameters, enablement and handlers are registered in `references/materialcraft/crates/engine/src/commands.rs`; UI and automation share the command path.
-- Persistence: format handling and atomic-write paths live in `references/materialcraft/crates/formats/`.
-- Automation: headless CLI, JSON-lines RPC and MCP; uses rmcp, Tokio and capability-based filesystem access. See `references/materialcraft/crates/automation/`.
-- Browser: shared egui UI via Trunk and wasm-bindgen; desktop and browser have different scheduling and I/O constraints.
-
-Before designing module boundaries, read `references/materialcraft/docs/architecture.md`. Before implementing native UI, inspect `references/materialcraft/apps/materialcraft/src/main.rs` and `references/materialcraft/crates/ui-egui/`. For Rust naming, focused type files and formatting conventions, consult `references/materialcraft/CODE_STYLE.md`; adapt within the changed code rather than reorganizing unrelated files.
+Adapt architectural principles, not PhotoCraft's image-processing semantics, compositing, pixel tiles or formats. Digital determines circuit behavior, including feedback and simulation timing. PhotoCraft's workspace and dependencies are reference evidence, not a mandate to clone them.
 
 ## Target architecture (direction, not existing implementation)
 
 Use Rust with a native egui/eframe UI as the default direction. Keep the simulator CPU-based and toolkit-independent. Choose dependency versions when introducing the GUI; the reference's versions and forks are evidence, not dependencies already adopted here.
 
-Start with focused modules in the existing package. Extract crates when boundaries justify them; do not generate an empty copy of MaterialCraft's workspace. Preserve these responsibilities and dependency direction:
+Start with focused modules in the existing package. Extract crates when boundaries justify them; do not generate an empty copy of PhotoCraft's workspace. Preserve these responsibilities and dependency direction:
 
 1. **Domain:** circuit document, component identities, ports, wires, typed attributes and signal values. No GUI or filesystem dependencies.
 2. **Components and simulation:** component definitions and runtime behavior; circuit compilation/connectivity, event scheduling, clocks and diagnostics. Runtime state is separate from the editable document.
@@ -76,7 +60,7 @@ Start with focused modules in the existing package. Extract crates when boundari
 
 Keep document edits separate from transient selection/view changes and simulation ticks. Start with snapshot undo if appropriate, but measure memory cost before applying it to large circuit histories or RAM state. Long-running simulation must not block the UI; define cancellation, bounded work and stale-result rejection when adding workers.
 
-Reuse MaterialCraft's separation of concerns, not its SBS/MCMAT formats, PBR renderer, texture caches or material-node library. In particular, a topological material evaluator is not a circuit simulator: circuits include feedback and state. Browser support, MCP and GPU work are later decisions, not prerequisites for the first native slice. Keep core interfaces portable without claiming untested platform support.
+Reuse PhotoCraft's separation of concerns, not its image-processing implementation. In particular, a topological material evaluator is not a circuit simulator: circuits include feedback and state. Browser support, MCP and GPU work are later decisions, not prerequisites for the first native slice. Keep core interfaces portable without claiming untested platform support.
 
 ## Behavioral and file-compatibility guardrails
 
@@ -114,7 +98,7 @@ cargo test --manifest-path reimplementation/Cargo.toml
 cargo clippy --manifest-path reimplementation/Cargo.toml --all-targets -- -D warnings
 ```
 
-These currently validate only the scaffold. After a workspace exists, update commands and add a dependency-layer check. MaterialCraft's `cargo xtask layers`, `cargo xtask wasm` and snapshot tests exist only in that reference; do not present them as available here.
+These validate the current editing subset, not Digital compatibility. After a workspace exists, update commands and add a dependency-layer check. MaterialCraft's `cargo xtask layers`, `cargo xtask wasm` and snapshot tests exist only in that reference; do not present them as available here.
 
 For Java reference checks, use `mvn -f references/Digital/pom.xml test` with the required Java/Maven environment. Its Maven configuration excludes fragile GUI tests; passing unit tests is not full UI parity. `just run` is useful for manual comparison if its configured JDK exists; alternatively launch `java -jar references/Digital_release/Digital.jar` with an appropriate Java installation. Record manual observations separately from automated results.
 
@@ -134,6 +118,6 @@ Use the `vectorcraft` MCP server to generate icons and other vector assets (tool
 
 ## Licensing and provenance
 
-Digital's source is GPLv3 (`references/Digital/LICENSE`); MaterialCraft's code is MIT OR Apache-2.0, with additional asset/brand notices. This repository has not yet selected a rewrite license. Reading source for this investigation does not establish that a subsequent implementation is clean-room or that copied code can be distributed under a permissive license.
+Digital's source is GPLv3 (`references/Digital/LICENSE`); PhotoCraft and MaterialCraft code is MIT OR Apache-2.0, with additional asset/brand notices. This repository has not yet selected a rewrite license. Reading source for this investigation does not establish that a subsequent implementation is clean-room or that copied code can be distributed under a permissive license.
 
 Before copying code, tests, fixtures, icons, fonts or documentation into the rewrite, establish the intended license/reuse policy with the owner and record provenance plus applicable notices. Before distribution, resolve derivative-work and license obligations with appropriate review. Prefer original implementation and self-authored assets; do not transplant MaterialCraft's branding or its organization-wide clean-room policy as if it resolved this project's GPL questions.
