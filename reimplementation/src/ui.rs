@@ -151,7 +151,7 @@ impl DigitalApp {
                 self.placing = None;
                 self.wire_start = None;
             }
-            let pins: Vec<_> = self
+            let mut pins: Vec<_> = self
                 .session
                 .document()
                 .components
@@ -266,31 +266,25 @@ impl DigitalApp {
                 && let (Some((id, start, origin)), Some(p)) = (self.drag.take(), pointer)
             {
                 let [dx, dy] = transform.delta_to_world(p - origin);
-                if let Err(e) = self.session.move_component(
+                match self.session.move_component(
                     id,
                     Position {
                         x: start.x + dx,
                         y: start.y + dy,
                     },
                 ) {
-                    self.error = Some(e.to_string());
+                    Ok(()) => {
+                        // Keep committed wire anchors aligned with the symbol on the release frame.
+                        for (pin, pos) in &mut pins {
+                            if pin.component == id {
+                                pos[0] += dx;
+                                pos[1] += dy;
+                            }
+                        }
+                    }
+                    Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            // Rebuild anchors after a committed drag so this frame matches the symbols.
-            let pins: Vec<_> = pins
-                .into_iter()
-                .filter_map(|(pin, _)| {
-                    let c = self
-                        .session
-                        .document()
-                        .components
-                        .iter()
-                        .find(|c| c.id == pin.component)?;
-                    let layout =
-                        SymbolLayout::centered_on(style, c.kind, [c.position.x, c.position.y])?;
-                    Some((pin, layout.pin_position(pin.pin)?))
-                })
-                .collect();
             let palette = Palette::from_visuals(ui.visuals());
             // Use the same transient position for attached wires and symbols.
             let wire_pins: Vec<_> = pins
