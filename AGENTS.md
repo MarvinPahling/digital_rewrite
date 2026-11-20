@@ -122,6 +122,16 @@ Prioritize regression coverage for propagation order, feedback/startup, clocks, 
 
 Use typed errors for malformed documents and unsupported operations; avoid production panics on user input. Prefer safe Rust. Keep reusable commands in the root `justfile` as workflows stabilize. Report checks actually run, failures and checks skipped; preserve unrelated working-tree changes.
 
+## Icon generation (VectorCraft MCP)
+
+Use the `vectorcraft` MCP server to generate icons and other vector assets (toolbar, component and application icons). It is configured user-level in `~/.pi/agent/mcp.json` and runs `vectorcraft-cli mcp` (Homebrew `vectorcraft-cli`, 0.24.1). Docs: <https://craft.wiki/apps/vectorcraft/ai-agents/>.
+
+- Tools are reachable from `codemode` as `mcp__vectorcraft`. Main tools: `draw_shape`, `draw_path`, `add_text`, `set_paint`, `transform`, `pathfinder`, `render_preview`, `export`, `save_file`. The `icon-set` prompt draws matching icons on a grid.
+- Without a window the server works headless on documents. To watch it draw, quit VectorCraft, start it with `open -a VectorCraft --args --control 7979`, then restart the agent session.
+- Draw as live shapes on a fixed grid (for example 24×24 px). Check each icon with `render_preview` before export.
+- Save the editable `.svg` source and the exported assets in the rewrite's asset directory, for example `reimplementation/assets/icons/`. Do not write into `references/`.
+- Generated icons are self-authored assets. Do not copy or trace Digital's icons or fonts (GPLv3) or MaterialCraft's branding. Record provenance (VectorCraft MCP, prompt or brief) next to the asset.
+
 ## Licensing and provenance
 
 Digital's source is GPLv3 (`references/Digital/LICENSE`); MaterialCraft's code is MIT OR Apache-2.0, with additional asset/brand notices. This repository has not yet selected a rewrite license. Reading source for this investigation does not establish that a subsequent implementation is clean-room or that copied code can be distributed under a permissive license.
