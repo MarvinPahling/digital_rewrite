@@ -727,14 +727,117 @@ mod tests {
         );
         assert!(app.wire_start.is_none());
     }
-    fn frame(ctx: &egui::Context, app: &mut DigitalApp, events: Vec<egui::Event>, focused: bool) {
+    fn frame(
+        ctx: &egui::Context,
+        app: &mut DigitalApp,
+        events: Vec<egui::Event>,
+        focused: bool,
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
             focused,
             events,
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| app.show(ctx));
+        ctx.run(input, |ctx| app.show(ctx))
+    }
+    fn has_line(output: &egui::FullOutput, from: Pos2, to: Pos2, width: f32) -> bool {
+        output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::LineSegment { points, stroke } if *points == [from, to] && stroke.width == width))
+    }
+
+    #[test]
+    fn hover_preview_is_painted_without_a_pressed_button() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        app.session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        app.wiring = true;
+        frame(&ctx, &mut app, vec![], true);
+        let pin = PinId {
+            direction: PinDirection::Output,
+            index: 0,
+        };
+        let anchor = SymbolLayout::centered_on(app.style, ComponentKind::Input, [100., 100.])
+            .unwrap()
+            .pin_position(pin)
+            .unwrap();
+        let start = Pos2::new(anchor[0] + 208., anchor[1] + 8.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![button(start, false)], true);
+        assert!(app.wire_start.is_some());
+        let hover = Pos2::new(450., 180.);
+        let output = frame(&ctx, &mut app, vec![egui::Event::PointerMoved(hover)], true);
+        assert!(has_line(&output, start, Pos2::new(hover.x, start.y), 1.));
+        assert!(has_line(&output, Pos2::new(hover.x, start.y), hover, 1.));
+        assert!(app.session.document().wires.is_empty());
+    }
+
+    #[test]
+    fn drag_release_frame_paints_wire_at_committed_anchor() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let a = app
+            .session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        let b = app
+            .session
+            .place(ComponentKind::Output, Position { x: 200., y: 100. })
+            .unwrap();
+        let pin = |component, direction| PinRef {
+            component,
+            pin: PinId {
+                direction,
+                index: 0,
+            },
+        };
+        app.session
+            .connect([pin(a, PinDirection::Output), pin(b, PinDirection::Input)])
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let start = Pos2::new(308., 108.);
+        let end = Pos2::new(358., 158.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
+        let output = frame(&ctx, &mut app, vec![button(end, false)], true);
+        assert_eq!(
+            app.session.document().components[0].position,
+            Position { x: 150., y: 150. }
+        );
+        let input_pin = PinId {
+            direction: PinDirection::Output,
+            index: 0,
+        };
+        let output_pin = PinId {
+            direction: PinDirection::Input,
+            index: 0,
+        };
+        let anchor = |kind, center, pin| {
+            let p = SymbolLayout::centered_on(app.style, kind, center)
+                .unwrap()
+                .pin_position(pin)
+                .unwrap();
+            Pos2::new(p[0] + 208., p[1] + 8.)
+        };
+        let moved = anchor(ComponentKind::Input, [150., 150.], input_pin);
+        let old = anchor(ComponentKind::Input, [100., 100.], input_pin);
+        let target = anchor(ComponentKind::Output, [200., 100.], output_pin);
+        let corner = Pos2::new(target.x, moved.y);
+        assert!(has_line(&output, moved, corner, 2.));
+        assert!(has_line(&output, corner, target, 2.));
+        assert!(!has_line(&output, old, target, 2.));
     }
     fn button(pos: Pos2, pressed: bool) -> egui::Event {
         egui::Event::PointerButton {
