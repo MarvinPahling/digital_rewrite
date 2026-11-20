@@ -17,7 +17,7 @@
 //! buckets (ratio about 1.19) and geometry is built for the bucket's upper bound, so drawn
 //! curves stay within the error bound and the fringe is at most one pixel wide and no narrower
 //! than about 0.84 px inside a bucket. The cache is bounded; it is cleared when it overflows.
-use crate::domain::ComponentKind;
+use crate::domain::{ComponentKind, PinDirection, PinId};
 use crate::{
     canvas::CanvasTransform,
     symbol_tessellate::{PathLayer, TessellateError, tessellate_path},
@@ -117,6 +117,20 @@ impl SymbolLayout {
             ],
             direction: a.direction,
         })
+    }
+
+    /// Resolve a typed document pin to its artwork anchor.
+    #[allow(dead_code)]
+    pub fn pin_position(&self, pin: PinId) -> Option<Point> {
+        let name = match (pin.direction, pin.index) {
+            (PinDirection::Input, 0) => "pin-in-0",
+            (PinDirection::Input, 1) => "pin-in-1",
+            (PinDirection::Output, 0) => "pin-out-0",
+            _ => return None,
+        };
+        self.anchors()
+            .find(|anchor| anchor.name == name)
+            .map(|anchor| anchor.position)
     }
 
     /// Extent of the drawn symbol including strokes, in world units.

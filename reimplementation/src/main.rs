@@ -14,6 +14,7 @@ mod symbol_sheet;
 mod symbol_tessellate;
 mod symbols;
 mod ui;
+mod wire_geometry;
 
 // The component symbol pipeline is compiled into test builds so its diagnostics are tested.
 #[cfg(test)]
