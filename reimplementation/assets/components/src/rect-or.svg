@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="120" height="120" viewBox="0 0 120 120">
+  <title>rect-or</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <rect id="body" x="40" y="30" width="30" height="60" fill="none" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <line id="lead-in-0" x1="20" y1="40" x2="40" y2="40" fill="none" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <line id="lead-in-1" x1="20" y1="80" x2="40" y2="80" fill="none" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <line id="lead-out-0" x1="70" y1="60" x2="80" y2="60" fill="none" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <g id="glyph">
+      <path d="M44.469 64.097 L44.469 61.88 L52.584 59.155 L44.469 56.421 L44.469 54.204 L54.488 57.583 L54.488 60.718 Z M44.469 66.88 L44.469 64.702 L54.488 64.702 L54.488 66.88 Z" fill="#000000"/>
+      <polygon points="56.226,66.88 56.226,64.839 59.635,64.839 59.635,55.454 56.334,57.515 56.334,55.357 59.781,53.12 62.379,53.12 62.379,64.839 65.533,64.839 65.533,66.88" fill="#000000"/>
+    </g>
+    <g id="anchors" opacity="0">
+      <circle id="pin-in-0" cx="20" cy="40" r="1" fill="#ff00ff"/>
+      <circle id="pin-in-1" cx="20" cy="80" r="1" fill="#ff00ff"/>
+      <circle id="pin-out-0" cx="80" cy="60" r="1" fill="#ff00ff"/>
+    </g>
+  </g>
+</svg>
