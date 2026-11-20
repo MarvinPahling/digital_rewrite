@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="24" height="24" viewBox="0 0 24 24">
+  <title>file-new-subcircuit</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <path d="M4 21 L4 3 L14 3 L19 8 L19 11 M14 3 L14 8 L19 8" fill="none" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M13 13 L18 13 C19.105 13 20 13.895 20 15 L20 19 C20 20.105 19.105 21 18 21 L13 21 C11.895 21 11 20.105 11 19 L11 15 C11 13.895 11.895 13 13 13 Z" fill="none" stroke="#000000" stroke-width="2" stroke-linejoin="round"/>
+    <path d="M13 15 L13 19 M18 15 L18 19 M15.5 15 L15.5 19" fill="none" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-miterlimit="10"/>
+  </g>
+</svg>
