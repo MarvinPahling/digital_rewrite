@@ -1,0 +1,274 @@
+# Icon and brand manifest. Paths are relative to this file's directory (reimplementation/assets).
+# src = editable VectorCraft source; svg = delivery SVG that build.rs rasterizes.
+# PNGs are build outputs generated from the svg files and are never committed.
+# replaces = name of the Digital toolbar/menu resource this icon stands in for (name only, no art used).
+
+[[icon]]
+id = "file-new"
+group = "file"
+src = "icons/src/file-new.svg"
+svg = "icons/svg/file-new.svg"
+replaces = "document-new"
+meaning = "Create a new circuit document"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "file-new-subcircuit"
+group = "file"
+src = "icons/src/file-new-subcircuit.svg"
+svg = "icons/svg/file-new-subcircuit.svg"
+replaces = "document-new-sub"
+meaning = "Create a new embedded circuit (New Embedded Circuit)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "file-open"
+group = "file"
+src = "icons/src/file-open.svg"
+svg = "icons/svg/file-open.svg"
+replaces = "document-open"
+meaning = "Open a circuit"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "file-open-new-window"
+group = "file"
+src = "icons/src/file-open-new-window.svg"
+svg = "icons/svg/file-open-new-window.svg"
+replaces = "document-open-new"
+meaning = "Open a circuit in a new window"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "file-save"
+group = "file"
+src = "icons/src/file-save.svg"
+svg = "icons/svg/file-save.svg"
+replaces = "document-save"
+meaning = "Save the current circuit"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "file-save-as"
+group = "file"
+src = "icons/src/file-save-as.svg"
+svg = "icons/svg/file-save-as.svg"
+replaces = "document-save-as"
+meaning = "Save the circuit under another name"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "edit-copy"
+group = "edit-view"
+src = "icons/src/edit-copy.svg"
+svg = "icons/svg/edit-copy.svg"
+replaces = "edit-copy"
+meaning = "Copy the selection"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "edit-undo"
+group = "edit-view"
+src = "icons/src/edit-undo.svg"
+svg = "icons/svg/edit-undo.svg"
+replaces = "edit-undo"
+meaning = "Undo the last edit"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "edit-redo"
+group = "edit-view"
+src = "icons/src/edit-redo.svg"
+svg = "icons/svg/edit-redo.svg"
+replaces = "edit-redo"
+meaning = "Redo the undone edit"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "edit-delete"
+group = "edit-view"
+src = "icons/src/edit-delete.svg"
+svg = "icons/svg/edit-delete.svg"
+replaces = "delete"
+meaning = "Delete the selection"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "view-zoom-in"
+group = "edit-view"
+src = "icons/src/view-zoom-in.svg"
+svg = "icons/svg/view-zoom-in.svg"
+replaces = "View-zoom-in"
+meaning = "Enlarge the view"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "view-zoom-out"
+group = "edit-view"
+src = "icons/src/view-zoom-out.svg"
+svg = "icons/svg/view-zoom-out.svg"
+replaces = "View-zoom-out"
+meaning = "Reduce the view"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "view-fit-window"
+group = "edit-view"
+src = "icons/src/view-fit-window.svg"
+svg = "icons/svg/view-fit-window.svg"
+replaces = "View-zoom-fit"
+meaning = "Fit the circuit to the window (Fit to window)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "simulation-start"
+group = "simulation"
+src = "icons/src/simulation-start.svg"
+svg = "icons/svg/simulation-start.svg"
+replaces = "media-playback-start"
+meaning = "Run the simulation (Run)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "simulation-start-gate-stepping"
+group = "simulation"
+src = "icons/src/simulation-start-gate-stepping.svg"
+svg = "icons/svg/simulation-start-gate-stepping.svg"
+replaces = "media-playback-start-2"
+meaning = "Start in single-gate stepping mode (Single gate stepping)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "simulation-run-tests"
+group = "simulation"
+src = "icons/src/simulation-run-tests.svg"
+svg = "icons/svg/simulation-run-tests.svg"
+replaces = "media-playback-start-T"
+meaning = "Run the circuit tests (Run Tests)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "simulation-stop"
+group = "simulation"
+src = "icons/src/simulation-stop.svg"
+svg = "icons/svg/simulation-stop.svg"
+replaces = "media-playback-stop"
+meaning = "Stop the simulation (Stop Simulation)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "simulation-gate-step"
+group = "simulation"
+src = "icons/src/simulation-gate-step.svg"
+svg = "icons/svg/simulation-gate-step.svg"
+replaces = "media-seek-forward"
+meaning = "Advance the simulation by one gate step (Gate Step)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "simulation-run-to-break-gate-mode"
+group = "simulation"
+src = "icons/src/simulation-run-to-break-gate-mode.svg"
+svg = "icons/svg/simulation-run-to-break-gate-mode.svg"
+replaces = "media-seek-forward-f"
+meaning = "Run to a break in single-gate mode (Run To Break in Single Gate Mode)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "simulation-run-to-break"
+group = "simulation"
+src = "icons/src/simulation-run-to-break.svg"
+svg = "icons/svg/simulation-run-to-break.svg"
+replaces = "media-skip-forward"
+meaning = "Run until a break component triggers (Run to Break)"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "help"
+group = "status-tools"
+src = "icons/src/help.svg"
+svg = "icons/svg/help.svg"
+replaces = "help"
+meaning = "Show help"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "dialog-error"
+group = "status-tools"
+src = "icons/src/dialog-error.svg"
+svg = "icons/svg/dialog-error.svg"
+replaces = "dialog-error"
+meaning = "Report an error"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "measurement-graph"
+group = "status-tools"
+src = "icons/src/measurement-graph.svg"
+svg = "icons/svg/measurement-graph.svg"
+replaces = "measurement-graph"
+meaning = "Show the measurement graph"
+kind = "monochrome"
+colors = ["#000000"]
+
+[[icon]]
+id = "test-passed"
+group = "status-tools"
+src = "icons/src/test-passed.svg"
+svg = "icons/svg/test-passed.svg"
+replaces = "testPassed"
+meaning = "Indicate a passed test"
+kind = "colored"
+colors = ["#16803c", "#ffffff"]
+
+[[icon]]
+id = "test-failed"
+group = "status-tools"
+src = "icons/src/test-failed.svg"
+svg = "icons/svg/test-failed.svg"
+replaces = "testFailed"
+meaning = "Indicate a failed test"
+kind = "colored"
+colors = ["#c62828", "#ffffff"]
+
+[brand]
+
+[brand.app_icon]
+svg = "brand/svg/app-icon.svg"
+src = "brand/src/app-icon.svg"
+replaces = "icon16..icon128"
+sizes = [512, 256, 128, 64, 48]
+
+[brand.app_icon_small]
+svg = "brand/svg/app-icon-small.svg"
+src = "brand/src/app-icon-small.svg"
+replaces = "icon16..icon128"
+sizes = [32, 16]
+
+[brand.splash]
+svg = "brand/svg/app-splash.svg"
+src = "brand/src/app-splash.svg"
+replaces = "splash"
+sizes = [[512, 320], [1024, 640]]
