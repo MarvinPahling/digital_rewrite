@@ -6,6 +6,12 @@ edition = "2024"
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland", "accesskit"] }
 
+# Compound fills (non-zero and even-odd, with the holes of outlined glyphs) and caps/joins of
+# strokes cannot be expressed with epaint's convex-only path fills, so symbol vector data is
+# tessellated with lyon. Pinned to the current release; the `std` feature is the only default
+# and serde/debugger/profiling stay off.
+lyon_tessellation = { version = "=1.0.23", default-features = false, features = ["std"] }
+
 [build-dependencies]
 resvg = { version = "0.50.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }

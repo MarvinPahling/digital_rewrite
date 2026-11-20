@@ -33,3 +33,7 @@ assets-preview:
 # Check that preview generation keeps builds fresh and recreates a deleted preview directory.
 check-assets-preview:
     reimplementation/scripts/check-assets-preview.sh
+
+# Rasterize the meshes of all ten symbol bindings to reimplementation/target/symbol-sheet.png (git-ignored).
+symbol-sheet:
+    cargo test --locked --manifest-path reimplementation/Cargo.toml symbol_sheet::write_symbol_sheet -- --ignored --nocapture

@@ -28,6 +28,10 @@ pub enum PathOp {
     MoveTo(Point),
     LineTo(Point),
     /// Control point, end point.
+    #[allow(
+        dead_code,
+        reason = "supported by the data model and renderer; the current artwork does not use it"
+    )]
     QuadTo(Point, Point),
     /// Two control points, end point.
     CubicTo(Point, Point, Point),
@@ -37,6 +41,10 @@ pub enum PathOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FillRule {
     NonZero,
+    #[allow(
+        dead_code,
+        reason = "supported by the data model and renderer; the current artwork does not use it"
+    )]
     EvenOdd,
 }
 
@@ -44,6 +52,10 @@ pub enum FillRule {
 pub enum StrokeCap {
     Butt,
     Round,
+    #[allow(
+        dead_code,
+        reason = "supported by the data model and renderer; the current artwork does not use it"
+    )]
     Square,
 }
 
@@ -51,6 +63,10 @@ pub enum StrokeCap {
 pub enum StrokeJoin {
     Miter,
     Round,
+    #[allow(
+        dead_code,
+        reason = "supported by the data model and renderer; the current artwork does not use it"
+    )]
     Bevel,
 }
 
