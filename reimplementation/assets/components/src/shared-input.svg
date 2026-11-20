@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="120" height="120" viewBox="0 0 120 120">
+  <title>shared-input</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <rect id="body" x="24" y="50" width="20" height="20" fill="none" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <line id="lead-out-0" x1="44" y1="60" x2="60" y2="60" fill="none" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <g id="anchors" opacity="0">
+      <circle id="pin-out-0" cx="60" cy="60" r="1" fill="#ff00ff"/>
+    </g>
+  </g>
+</svg>
