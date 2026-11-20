@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="24" height="24" viewBox="0 0 24 24">
+  <title>simulation-run-to-break-gate-mode</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <path id="Run_chevrons" data-name="Run chevrons" d="M3 3 L8 8 L3 13 M9 3 L14 8 L9 13" fill="none" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <line id="Break_bar" data-name="Break bar" x1="19" y1="3" x2="19" y2="11" fill="none" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path id="Gate_badge_body" data-name="Gate badge body" d="M12.5 14.5 L15 14.5 C16.795 14.5 18.25 15.955 18.25 17.75 C18.25 19.545 16.795 21 15 21 L12.5 21 Z" fill="none" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path id="Gate_badge_stubs" data-name="Gate badge stubs" d="M10 16.25 L12.5 16.25 M10 19.25 L12.5 19.25 M18.25 17.75 L21 17.75" fill="none" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

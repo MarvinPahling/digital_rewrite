@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="24" height="24" viewBox="0 0 24 24">
+  <title>simulation-stop</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <path id="Simulation_stop" data-name="Simulation stop" d="M7 5 L17 5 C18.105 5 19 5.895 19 7 L19 17 C19 18.105 18.105 19 17 19 L7 19 C5.895 19 5 18.105 5 17 L5 7 C5 5.895 5.895 5 7 5 Z" fill="none" stroke="#000000" stroke-width="2" stroke-linejoin="round"/>
+  </g>
+</svg>
