@@ -1,5 +1,9 @@
 # Digital Rewrite
 
+<img src="reimplementation/assets/brand/svg/app-icon.svg" alt="Digital Rewrite app logo" width="128">
+
+![Digital Rewrite splash artwork](reimplementation/assets/brand/svg/app-splash.svg)
+
 An early Rust rewrite of [Digital](https://github.com/hneemann/Digital), using MaterialCraft as an architecture and UI reference. An early native component editor supports placing, selecting, moving and deleting five component kinds with undo/redo. Wires, simulation, `.dig` I/O, clipboard and compatibility are not implemented. See [parity notes](reimplementation/docs/parity.md).
 
 ## Quickstart
