@@ -9,5 +9,5 @@ Reference investigation: Digital source revision d118dce079b6b8867024d40f9b14dfa
 ## Vector assets
 
 - 25 UI icons and the application icon and splash are original SVGs made with the VectorCraft MCP (`reimplementation/assets/`, inventory in `icons/manifest.toml`, provenance in `assets/PROVENANCE.md`); no Digital artwork was copied or traced.
-- PNGs are generated at build time by `reimplementation/build.rs` using `resvg` (icons at 24 and 48 px, app icon at 16-512 px, splash at 512x320 and 1024x640) and are never committed. `just assets-preview` copies them to `target/asset-preview/`.
+- PNGs are generated at build time by `reimplementation/build.rs` using `resvg` (icons at 24 and 48 px, app icon at 16-512 px, splash at 512x320 and 1024x640) and are never committed. `just assets-preview` (outside `build.rs`, requires `jq`) copies them to `target/asset-preview/`.
 - Not yet done: the icons and brand images are exposed through `src/assets.rs` but are not wired into the UI; no toolbar, menu, window icon or splash screen uses them.

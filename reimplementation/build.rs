@@ -12,7 +12,6 @@ use serde::Deserialize;
 
 const ICON_PIXEL_SIZES: [u32; 2] = [24, 48];
 const SPLASH_SCALES: [u32; 2] = [1, 2];
-const PREVIEW_ENV: &str = "DIGITAL_ASSET_PREVIEW_DIR";
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -66,18 +65,11 @@ fn run() -> Result<(), String> {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
-    println!("cargo:rerun-if-env-changed={PREVIEW_ENV}");
 
     let manifest_text = fs::read_to_string(&manifest_path)
         .map_err(|e| format!("{}: cannot read manifest: {e}", manifest_path.display()))?;
     let manifest: Manifest = toml::from_str(&manifest_text)
         .map_err(|e| format!("{}: cannot parse manifest: {e}", manifest_path.display()))?;
-
-    let preview_dir = std::env::var_os(PREVIEW_ENV).map(PathBuf::from);
-    if let Some(dir) = &preview_dir {
-        // A missing preview directory makes Cargo rerun this script and recreate it.
-        println!("cargo:rerun-if-changed={}", dir.display());
-    }
 
     let png_root = out_dir.join("assets");
     let mut seen_ids = BTreeSet::new();
@@ -138,16 +130,6 @@ fn run() -> Result<(), String> {
             &png_root.join(&file),
         )?;
         splash_outputs.push(Output { file, key: scale });
-    }
-
-    if let Some(dir) = &preview_dir {
-        copy_previews(
-            &png_root,
-            dir,
-            &icon_outputs,
-            &app_icon_outputs,
-            &splash_outputs,
-        )?;
     }
 
     let generated = generate_tables(
@@ -231,28 +213,6 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|e| format!("{}: cannot create directory: {e}", parent.display()))?;
     }
     fs::write(path, bytes).map_err(|e| format!("{}: cannot write file: {e}", path.display()))
-}
-
-fn copy_previews(
-    png_root: &Path,
-    preview_dir: &Path,
-    icons: &[(String, u32, String)],
-    app_icons: &[Output],
-    splash: &[Output],
-) -> Result<(), String> {
-    let files = icons
-        .iter()
-        .map(|(_, _, file)| file)
-        .chain(app_icons.iter().map(|o| &o.file))
-        .chain(splash.iter().map(|o| &o.file));
-    for file in files {
-        let source = png_root.join(file);
-        let destination = preview_dir.join(file);
-        let bytes = fs::read(&source)
-            .map_err(|e| format!("{}: cannot read generated PNG: {e}", source.display()))?;
-        write_file(&destination, &bytes)?;
-    }
-    Ok(())
 }
 
 fn generate_tables(
