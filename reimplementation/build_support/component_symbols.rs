@@ -37,7 +37,7 @@ const ALLOWED_ELEMENTS: [&str; 10] = [
 const SHAPE_ELEMENTS: [&str; 7] = [
     "path", "rect", "line", "polyline", "polygon", "circle", "ellipse",
 ];
-const ALLOWED_ATTRIBUTES: [&str; 28] = [
+const ALLOWED_ATTRIBUTES: [&str; 27] = [
     "id",
     "data-name",
     "version",
@@ -64,7 +64,6 @@ const ALLOWED_ATTRIBUTES: [&str; 28] = [
     "stroke-linejoin",
     "stroke-miterlimit",
     "fill-rule",
-    "transform",
     "opacity",
 ];
 /// Element names that get a pointed diagnostic instead of the generic one.
@@ -1248,6 +1247,28 @@ drawn = {drawn}
         expect_error(&gradient, &["unsupported element <linearGradient>"]);
         let filter = replaced(r#"id="body""#, r#"id="body" filter="url(#f)""#);
         expect_error(&filter, &["unsupported attribute \"filter\""]);
+    }
+
+    #[test]
+    fn transforms_are_rejected_on_root_groups_shapes_and_markers() {
+        for (from, to) in [
+            ("<svg ", "<svg transform=\"translate(20)\" "),
+            (
+                r#"id="Layer_1""#,
+                r#"id="Layer_1" transform="translate(20)""#,
+            ),
+            (r#"id="body""#, r#"id="body" transform="translate(20)""#),
+            (
+                r#"id="anchors""#,
+                r#"id="anchors" transform="translate(20)""#,
+            ),
+            (
+                r#"id="pin-in-0""#,
+                r#"id="pin-in-0" transform="translate(20)""#,
+            ),
+        ] {
+            expect_error(&replaced(from, to), &["transform"]);
+        }
     }
 
     #[test]

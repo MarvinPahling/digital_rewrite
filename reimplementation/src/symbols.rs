@@ -328,6 +328,20 @@ mod tests {
     }
 
     #[test]
+    fn not_symbols_have_inversion_indicators() {
+        for style in [SymbolStyle::Rect, SymbolStyle::Ieee] {
+            let def = symbol(style, ComponentKind::Not).unwrap();
+            assert!(
+                def.paths
+                    .iter()
+                    .any(|path| path.role == SymbolRole::Indicator),
+                "{} lacks an inversion indicator",
+                def.id
+            );
+        }
+    }
+
+    #[test]
     fn leads_reach_their_anchors() {
         for def in symbols() {
             for anchor in def.anchors {
