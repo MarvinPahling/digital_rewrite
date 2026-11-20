@@ -25,3 +25,8 @@ check-rust:
     cargo check --locked --manifest-path reimplementation/Cargo.toml --all-targets
     cargo test --locked --manifest-path reimplementation/Cargo.toml
     cargo clippy --locked --manifest-path reimplementation/Cargo.toml --all-targets -- -D warnings
+
+# Build and copy the generated icon/brand PNGs to target/asset-preview (git-ignored).
+assets-preview:
+    DIGITAL_ASSET_PREVIEW_DIR="$PWD/target/asset-preview" cargo build --locked --manifest-path reimplementation/Cargo.toml
+    @echo "Asset previews: $PWD/target/asset-preview"
