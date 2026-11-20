@@ -92,7 +92,7 @@ Prototype ids produced by VectorCraft for `rect-and`: `Layer_1`, `body` (rect), 
 
 - Explicit rectangular is the default style; IEEE is a runtime option. Same anchors in both.
 - Box 30 wide x 60 tall (x 40..70, y 30..90), 1.5 stroke, round joins. Input leads (20,40)->(40,40), (20,80)->(40,80); output lead (70,60)->(80,60). Glyph centered at (55,60).
-- Rectangular NOT: Digital's narrow form omits the `1`; the drawing lane decides between a narrow box with no glyph and a glyph, and records the choice in the NOT master. Inversion bubbles are `indicator` parts.
+- Rectangular NOT: Digital's narrow form omits the `1`; the drawing lane decides between a narrow box with no glyph and a glyph, and records the choice in the NOT master. Inversion bubbles are `indicator` parts. `rect-not` keeps the `1` glyph and always draws the output inversion bubble (`indicator-0`, centre (54,60), r=4, stroked ring touching the box's right edge) followed by a short lead (58,60)->(60,60); without the bubble a NOT would look like a buffer.
 - Rect OR uses `≥1`.
 
 ## IEEE style
