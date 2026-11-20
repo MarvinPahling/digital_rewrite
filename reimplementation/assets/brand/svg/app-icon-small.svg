@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="32" height="32" viewBox="0 0 32 32">
+  <title>app-icon-small.svg</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <path d="M8.5 1.5 L23.5 1.5 C27.366 1.5 30.5 4.634 30.5 8.5 L30.5 23.5 C30.5 27.366 27.366 30.5 23.5 30.5 L8.5 30.5 C4.634 30.5 1.5 27.366 1.5 23.5 L1.5 8.5 C1.5 4.634 4.634 1.5 8.5 1.5 Z" fill="#112b46" stroke="#7dd9dd" stroke-width="1.5" stroke-miterlimit="10"/>
+    <circle cx="5.5" cy="16" r="1" fill="#f3c96a"/>
+    <circle cx="26.5" cy="16" r="1" fill="#f3c96a"/>
+    <polyline points="5.5,16 10,16 10,12 14,12 14,20 19,20 19,16 26.5,16" fill="none" stroke="#73e4ce" stroke-width="2" stroke-linecap="round" stroke-miterlimit="10"/>
+    <circle cx="5.5" cy="16" r="1" fill="#f3c96a"/>
+    <circle cx="26.5" cy="16" r="1" fill="#f3c96a"/>
+  </g>
+</svg>

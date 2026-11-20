@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="512" height="512" viewBox="0 0 512 512">
+  <title>app-icon.svg</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <path d="M136 24 L376 24 C437.856 24 488 74.144 488 136 L488 376 C488 437.856 437.856 488 376 488 L136 488 C74.144 488 24 437.856 24 376 L24 136 C24 74.144 74.144 24 136 24 Z" fill="#112b46" stroke="#7dd9dd" stroke-width="12" stroke-miterlimit="10"/>
+    <path d="M128 165 L128 126 L214 126 M384 347 L384 386 L298 386" fill="none" stroke="#78a9c7" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="214" cy="126" r="12" fill="#f3c96a"/>
+    <circle cx="298" cy="386" r="12" fill="#f3c96a"/>
+    <circle cx="90" cy="256" r="11" fill="#f3c96a"/>
+    <circle cx="422" cy="256" r="11" fill="#f3c96a"/>
+    <polyline points="90,256 152,256 152,198 214,198 214,314 298,314 298,256 422,256" fill="none" stroke="#73e4ce" stroke-width="24" stroke-linecap="round" stroke-miterlimit="10"/>
+    <circle cx="90" cy="256" r="11" fill="#f3c96a"/>
+    <circle cx="422" cy="256" r="11" fill="#f3c96a"/>
+  </g>
+</svg>
