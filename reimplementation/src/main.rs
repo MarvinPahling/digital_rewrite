@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+// Icons are not wired into the UI yet; the module is only exercised by its tests.
+#[allow(dead_code)]
+mod assets;
 mod components;
 mod domain;
 mod engine;
