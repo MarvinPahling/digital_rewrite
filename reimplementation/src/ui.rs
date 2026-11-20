@@ -251,7 +251,10 @@ impl DigitalApp {
             {
                 let [x, y] = transform.to_world(p);
                 match self.session.place(kind, Position { x, y }) {
-                    Ok(id) => self.selected = Some(id),
+                    Ok(id) => {
+                        self.selected = Some(id);
+                        self.selected_wire = None;
+                    }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -273,6 +276,21 @@ impl DigitalApp {
                     self.error = Some(e.to_string());
                 }
             }
+            // Rebuild anchors after a committed drag so this frame matches the symbols.
+            let pins: Vec<_> = pins
+                .into_iter()
+                .filter_map(|(pin, _)| {
+                    let c = self
+                        .session
+                        .document()
+                        .components
+                        .iter()
+                        .find(|c| c.id == pin.component)?;
+                    let layout =
+                        SymbolLayout::centered_on(style, c.kind, [c.position.x, c.position.y])?;
+                    Some((pin, layout.pin_position(pin.pin)?))
+                })
+                .collect();
             let palette = Palette::from_visuals(ui.visuals());
             // Use the same transient position for attached wires and symbols.
             let wire_pins: Vec<_> = pins
@@ -327,7 +345,7 @@ impl DigitalApp {
                 }
                 if let Some(start) = self.wire_start
                     && let Some(a) = wire_pins.iter().find(|v| v.0 == start)
-                    && let Some(p) = pointer
+                    && let Some(p) = response.hover_pos()
                 {
                     let b = (start, transform.to_world(p));
                     for segment in crate::wire_geometry::path(*a, b).windows(2) {
@@ -417,17 +435,23 @@ impl DigitalApp {
                 let forwards =
                     ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
                 if backwards || forwards {
-                    if self.wiring && !pins.is_empty() {
+                    let visible_pins: Vec<_> = pins
+                        .iter()
+                        .filter(|(_, p)| rect.contains(transform.to_screen(*p)))
+                        .collect();
+                    if self.wiring && !visible_pins.is_empty() {
                         let current = self
                             .focused_pin
-                            .and_then(|p| pins.iter().position(|v| v.0 == p));
+                            .and_then(|p| visible_pins.iter().position(|v| v.0 == p));
                         let next = match current {
-                            Some(i) if backwards => (i + pins.len() - 1) % pins.len(),
-                            Some(i) => (i + 1) % pins.len(),
-                            None if backwards => pins.len() - 1,
+                            Some(i) if backwards => {
+                                (i + visible_pins.len() - 1) % visible_pins.len()
+                            }
+                            Some(i) => (i + 1) % visible_pins.len(),
+                            None if backwards => visible_pins.len() - 1,
                             None => 0,
                         };
-                        self.focused_pin = Some(pins[next].0);
+                        self.focused_pin = Some(visible_pins[next].0);
                     } else if !self.wiring && !self.session.document().wires.is_empty() {
                         let wires = &self.session.document().wires;
                         let current = self
@@ -446,6 +470,7 @@ impl DigitalApp {
                 if self.wiring
                     && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                     && let Some(pin) = self.focused_pin
+                    && pins.iter().any(|v| v.0 == pin)
                 {
                     self.choose_pin(pin);
                 }
@@ -487,6 +512,7 @@ impl DigitalApp {
                 (false, false)
             };
             if undo {
+                self.focused_pin = None;
                 self.wire_start = None;
                 self.selected_wire = None;
                 self.session.undo();
@@ -494,6 +520,7 @@ impl DigitalApp {
                 self.drag = None;
             }
             if redo {
+                self.focused_pin = None;
                 self.wire_start = None;
                 self.selected_wire = None;
                 self.session.redo();
@@ -618,6 +645,87 @@ mod tests {
             true,
         );
         assert!(app.session.document().wires.is_empty());
+    }
+    #[test]
+    fn placement_replaces_wire_selection_before_delete() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let a = app
+            .session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        let b = app
+            .session
+            .place(ComponentKind::Output, Position { x: 200., y: 100. })
+            .unwrap();
+        let pin = |component, direction| PinRef {
+            component,
+            pin: PinId {
+                direction,
+                index: 0,
+            },
+        };
+        app.session
+            .connect([pin(a, PinDirection::Output), pin(b, PinDirection::Input)])
+            .unwrap();
+        app.selected_wire = Some(app.session.document().wires[0].id);
+        app.placing = Some(ComponentKind::And);
+        frame(&ctx, &mut app, vec![], true);
+        let p = Pos2::new(500., 300.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(p), button(p, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![button(p, false)], true);
+        assert!(app.selected_wire.is_none());
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Delete, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(app.session.document().components.len(), 2);
+        assert_eq!(app.session.document().wires.len(), 1);
+    }
+    #[test]
+    fn undo_clears_keyboard_pin_and_tab_skips_offscreen() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        app.session
+            .place(ComponentKind::Input, Position { x: -500., y: 100. })
+            .unwrap();
+        let visible = app
+            .session
+            .place(ComponentKind::Output, Position { x: 100., y: 100. })
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let p = Pos2::new(600., 300.);
+        frame(&ctx, &mut app, vec![button(p, true)], true);
+        frame(&ctx, &mut app, vec![button(p, false)], true);
+        app.wiring = true;
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(app.focused_pin.unwrap().component, visible);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Z, egui::Modifiers::COMMAND)],
+            true,
+        );
+        assert!(app.focused_pin.is_none());
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+            true,
+        );
+        assert!(app.wire_start.is_none());
     }
     fn frame(ctx: &egui::Context, app: &mut DigitalApp, events: Vec<egui::Event>, focused: bool) {
         let input = egui::RawInput {
