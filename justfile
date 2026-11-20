@@ -10,5 +10,18 @@ run:
 build_reference:
     echo "TODO"
 
-build_reimplemtation:
-    echo "TODO"
+# Run the native Rust scaffold (the `run` recipe remains the Java reference).
+run-rust:
+    cargo run --locked --manifest-path reimplementation/Cargo.toml
+
+build-rust:
+    cargo build --locked --manifest-path reimplementation/Cargo.toml
+
+# Compatibility with the original misspelled recipe.
+build_reimplemtation: build-rust
+
+check-rust:
+    cargo fmt --manifest-path reimplementation/Cargo.toml --all -- --check
+    cargo check --locked --manifest-path reimplementation/Cargo.toml --all-targets
+    cargo test --locked --manifest-path reimplementation/Cargo.toml
+    cargo clippy --locked --manifest-path reimplementation/Cargo.toml --all-targets -- -D warnings
