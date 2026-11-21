@@ -2,6 +2,8 @@
 # Builds a macOS app bundle for the native editor (host architecture only).
 # Usage: bundle-macos.sh [BUNDLE_DIR]   (default: <repo>/target/bundle/digital-rust.app)
 # Environment: CODESIGN_IDENTITY  signing identity for codesign (default "-" = ad-hoc).
+#   BUNDLE_MACOS_TEST_FAIL_INSTALL  test hook, inert unless set to a non-empty value: makes the final
+#   install step fail after the previous bundle was moved aside, to exercise the rollback.
 # The app icon is derived here from the build-generated app-icon PNGs (never committed) via
 # an .iconset and `iconutil`. Cargo writes to reimplementation/target; the paths of the binary
 # and the generated assets are taken from Cargo's JSON build messages, not guessed. Requires jq.
@@ -23,7 +25,26 @@ identifier=io.github.digital-rust.editor
 min_macos=11.0
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+# Installation transaction directory: a temporary sibling of the destination (same filesystem, so the
+# moves below are atomic renames). It holds the staged bundle and, while installing, the previous one.
+txn=
+cleanup() {
+    trap - EXIT INT TERM HUP
+    # The previous bundle was moved aside but the replacement was not installed: put it back.
+    if [ -n "$txn" ] && [ -e "$txn/previous" ] && [ ! -e "$bundle" ] && [ ! -L "$bundle" ]; then
+        if ! mv "$txn/previous" "$bundle"; then
+            echo "error: could not restore the previous bundle; it remains at $txn/previous" >&2
+            rm -rf "$work"
+            return
+        fi
+    fi
+    [ -z "$txn" ] || rm -rf "$txn"
+    rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 version=$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$manifest" |
     jq -r --arg n "$name" '.packages[] | select(.name == $n) | .version')
@@ -57,7 +78,8 @@ iconutil -c icns "$iconset" -o "$work/AppIcon.icns"
 
 # Assemble next to the destination, then swap, so a failed run keeps the previous bundle.
 mkdir -p "$(dirname "$bundle")"
-staged="$work/$name.app"
+txn=$(mktemp -d "$(dirname "$bundle")/.$name-install.XXXXXX")
+staged="$txn/$(basename "$bundle")"
 mkdir -p "$staged/Contents/MacOS" "$staged/Contents/Resources"
 cp "$binary" "$staged/Contents/MacOS/$name"
 chmod 755 "$staged/Contents/MacOS/$name"
@@ -86,6 +108,14 @@ plutil -lint "$staged/Contents/Info.plist" >/dev/null
 codesign --force --deep --sign "$identity" "$staged"
 codesign --verify --deep --strict "$staged"
 
-rm -rf "$bundle"
+# Install: move the previous bundle aside, move the staged one in; cleanup restores the previous
+# bundle if either step fails or the run is interrupted, and discards it only after success.
+if [ -e "$bundle" ] || [ -L "$bundle" ]; then
+    mv "$bundle" "$txn/previous"
+fi
+if [ -n "${BUNDLE_MACOS_TEST_FAIL_INSTALL:-}" ]; then
+    echo "error: injected install failure (BUNDLE_MACOS_TEST_FAIL_INSTALL)" >&2
+    exit 1
+fi
 mv "$staged" "$bundle"
 echo "App bundle: $bundle (signed with identity '$identity', host architecture only)"

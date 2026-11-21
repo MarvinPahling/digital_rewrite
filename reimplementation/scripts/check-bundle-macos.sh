@@ -1,5 +1,6 @@
 #!/bin/bash
-# Regression check: builds the macOS bundle twice and asserts its structure and signature.
+# Regression check: builds the macOS bundle, asserts its structure and signature, and that a failed
+# install keeps the previous bundle and leaves no staging directory behind.
 set -euo pipefail
 
 [ "$(uname -s)" = Darwin ] || { echo "error: check-bundle-macos.sh only runs on macOS" >&2; exit 1; }
@@ -17,6 +18,21 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 touch "$bundle/Contents/stale"
 "$script" "$bundle" >/dev/null
 [ ! -e "$bundle/Contents/stale" ] || fail "second run did not replace the previous bundle"
+
+# A failing final install step must roll back: the previous bundle stays intact and nothing is left over.
+echo previous >"$bundle/Contents/rollback-marker"
+if BUNDLE_MACOS_TEST_FAIL_INSTALL=1 "$script" "$bundle" >/dev/null 2>"$tmp/fail.log"; then
+    fail "injected install failure did not fail the script"
+fi
+grep -q 'injected install failure' "$tmp/fail.log" || fail "install failure was not the injected one"
+[ "$(cat "$bundle/Contents/rollback-marker" 2>/dev/null)" = previous ] || fail "previous bundle was not restored"
+[ -x "$bundle/Contents/MacOS/digital-rust" ] || fail "restored bundle lost its executable"
+rm -f "$tmp/fail.log"
+[ "$(ls -A "$tmp")" = digital-rust.app ] || fail "leftover staging or backup entries: $(ls -A "$tmp")"
+# A successful run afterwards replaces it and leaves nothing behind either.
+"$script" "$bundle" >/dev/null
+[ ! -e "$bundle/Contents/rollback-marker" ] || fail "run after the failed install did not replace the bundle"
+[ "$(ls -A "$tmp")" = digital-rust.app ] || fail "leftover entries after success: $(ls -A "$tmp")"
 
 exe="$bundle/Contents/MacOS/digital-rust"
 [ -x "$exe" ] || fail "executable bit missing on $exe"
