@@ -34,6 +34,18 @@ assets-preview:
 check-assets-preview:
     reimplementation/scripts/check-assets-preview.sh
 
+# Build target/bundle/digital-rust.app (macOS only, host architecture, ad-hoc signed unless CODESIGN_IDENTITY is set); needs jq.
+bundle-macos:
+    reimplementation/scripts/bundle-macos.sh
+
+# Open the macOS app bundle built by bundle-macos.
+open-macos: bundle-macos
+    open target/bundle/digital-rust.app
+
+# Build the macOS bundle twice and assert its structure, icon, signature and Mach-O binary.
+check-bundle-macos:
+    reimplementation/scripts/check-bundle-macos.sh
+
 # Rasterize the meshes of all ten symbol bindings to reimplementation/target/symbol-sheet.png (git-ignored).
 symbol-sheet:
     cargo test --locked --manifest-path reimplementation/Cargo.toml symbol_sheet::write_symbol_sheet -- --ignored --nocapture
