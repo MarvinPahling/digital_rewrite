@@ -3,6 +3,8 @@
 use crate::domain::{
     Component, ComponentId, ComponentKind, Document, PinRef, Position, Wire, WireId,
 };
+use crate::runtime::{InputChange, Runtime, RuntimeError, SettleOutcome, StepOutcome};
+use crate::simulation::CompileError;
 #[derive(Default)]
 pub struct Session {
     document: Document,
@@ -11,9 +13,13 @@ pub struct Session {
     saved: Document,
     next_id: u64,
     next_wire_id: u64,
+    /// Transient simulation state. Never part of the document or its history.
+    runtime: Option<Runtime>,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditError {
+    /// Editing is locked while a simulation is active; stop it first.
+    SimulationActive,
     InvalidPosition,
     UnknownComponent,
     IdExhausted,
@@ -26,6 +32,7 @@ pub enum EditError {
 impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::SimulationActive => "Stop the simulation before editing",
             Self::InvalidPosition => "Invalid position",
             Self::UnknownComponent => "Unknown component",
             Self::IdExhausted => "No component IDs remaining",
@@ -38,6 +45,24 @@ impl std::fmt::Display for EditError {
     }
 }
 impl std::error::Error for EditError {}
+#[derive(Debug, PartialEq, Eq)]
+pub enum SimulationError {
+    AlreadyActive,
+    NotActive,
+    Compile(CompileError),
+    Runtime(RuntimeError),
+}
+impl std::fmt::Display for SimulationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyActive => f.write_str("Simulation is already running"),
+            Self::NotActive => f.write_str("Simulation is not running"),
+            Self::Compile(error) => write!(f, "Circuit cannot be simulated: {error:?}"),
+            Self::Runtime(error) => write!(f, "Simulation input rejected: {error:?}"),
+        }
+    }
+}
+impl std::error::Error for SimulationError {}
 impl Session {
     pub fn document(&self) -> &Document {
         &self.document
@@ -45,6 +70,49 @@ impl Session {
 
     pub fn dirty(&self) -> bool {
         self.document != self.saved
+    }
+    pub fn simulation_active(&self) -> bool {
+        self.runtime.is_some()
+    }
+    /// Read-only view of the running simulation, if any.
+    pub fn inspect(&self) -> Option<&Runtime> {
+        self.runtime.as_ref()
+    }
+    /// Compiles and starts a runtime. On failure nothing changes and no simulation is active.
+    pub fn start_simulation(&mut self) -> Result<(), SimulationError> {
+        if self.runtime.is_some() {
+            return Err(SimulationError::AlreadyActive);
+        }
+        self.runtime = Some(Runtime::start(&self.document).map_err(SimulationError::Compile)?);
+        Ok(())
+    }
+    /// Discards the runtime; the document, history, dirty state and ids were never touched.
+    pub fn stop_simulation(&mut self) -> Result<(), SimulationError> {
+        self.runtime
+            .take()
+            .map(drop)
+            .ok_or(SimulationError::NotActive)
+    }
+    fn runtime_mut(&mut self) -> Result<&mut Runtime, SimulationError> {
+        self.runtime.as_mut().ok_or(SimulationError::NotActive)
+    }
+    pub fn step_simulation(&mut self) -> Result<StepOutcome, SimulationError> {
+        Ok(self.runtime_mut()?.step())
+    }
+    pub fn settle_simulation(&mut self, budget: usize) -> Result<SettleOutcome, SimulationError> {
+        Ok(self.runtime_mut()?.settle(budget))
+    }
+    pub fn toggle_input(&mut self, id: ComponentId) -> Result<InputChange, SimulationError> {
+        self.runtime_mut()?
+            .toggle_input(id)
+            .map_err(SimulationError::Runtime)
+    }
+    fn ensure_editable(&self) -> Result<(), EditError> {
+        if self.runtime.is_some() {
+            Err(EditError::SimulationActive)
+        } else {
+            Ok(())
+        }
     }
     fn edit(&mut self, next: Document) {
         self.undo.push(std::mem::replace(&mut self.document, next));
@@ -55,6 +123,7 @@ impl Session {
         kind: ComponentKind,
         position: Position,
     ) -> Result<ComponentId, EditError> {
+        self.ensure_editable()?;
         if !position.valid() {
             return Err(EditError::InvalidPosition);
         }
@@ -71,6 +140,7 @@ impl Session {
         Ok(id)
     }
     pub fn move_component(&mut self, id: ComponentId, position: Position) -> Result<(), EditError> {
+        self.ensure_editable()?;
         if !position.valid() {
             return Err(EditError::InvalidPosition);
         }
@@ -87,6 +157,7 @@ impl Session {
         Ok(())
     }
     pub fn delete(&mut self, id: ComponentId) -> Result<(), EditError> {
+        self.ensure_editable()?;
         let mut next = self.document.clone();
         let index = next
             .components
@@ -100,6 +171,7 @@ impl Session {
         Ok(())
     }
     pub fn connect(&mut self, endpoints: [PinRef; 2]) -> Result<WireId, EditError> {
+        self.ensure_editable()?;
         for endpoint in endpoints {
             let component = self
                 .document
@@ -134,6 +206,7 @@ impl Session {
         Ok(id)
     }
     pub fn delete_wire(&mut self, id: WireId) -> Result<(), EditError> {
+        self.ensure_editable()?;
         let mut next = self.document.clone();
         let index = next
             .wires
@@ -144,16 +217,20 @@ impl Session {
         self.edit(next);
         Ok(())
     }
-    pub fn undo(&mut self) {
+    pub fn undo(&mut self) -> Result<(), EditError> {
+        self.ensure_editable()?;
         if let Some(previous) = self.undo.pop() {
             self.redo
                 .push(std::mem::replace(&mut self.document, previous));
         }
+        Ok(())
     }
-    pub fn redo(&mut self) {
+    pub fn redo(&mut self) -> Result<(), EditError> {
+        self.ensure_editable()?;
         if let Some(next) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.document, next));
         }
+        Ok(())
     }
 }
 #[cfg(test)]
@@ -190,22 +267,22 @@ mod tests {
         assert_eq!(s.document, snapshot);
         s.delete(b).unwrap();
         assert!(s.document.wires.is_empty());
-        s.undo();
+        s.undo().unwrap();
         assert_eq!(s.document, snapshot);
-        s.redo();
-        s.undo();
+        s.redo().unwrap();
+        s.undo().unwrap();
         s.delete_wire(first).unwrap();
-        s.undo();
-        s.undo();
+        s.undo().unwrap();
+        s.undo().unwrap();
         s.next_wire_id = u64::MAX;
         assert_eq!(s.connect([x, z]), Err(EditError::WireIdExhausted));
-        s.redo();
+        s.redo().unwrap();
         assert_eq!(s.document, snapshot);
-        s.undo();
+        s.undo().unwrap();
         s.next_wire_id = 2;
         let third = s.connect([y, z]).unwrap();
         assert_ne!(third, second);
-        s.redo();
+        s.redo().unwrap();
         assert_eq!(s.document.wires.len(), 2);
     }
     #[test]
@@ -251,9 +328,9 @@ mod tests {
             Err(EditError::IdExhausted)
         );
         assert_eq!(*session.document(), snapshot);
-        session.undo();
+        session.undo().unwrap();
         assert!(!session.dirty());
-        session.redo();
+        session.redo().unwrap();
         assert_eq!(*session.document(), snapshot);
     }
     #[test]
@@ -262,16 +339,16 @@ mod tests {
         let p = Position { x: 1., y: 2. };
         let id = s.place(ComponentKind::And, p).unwrap();
         assert!(s.dirty());
-        s.undo();
+        s.undo().unwrap();
         assert!(!s.dirty());
         assert!(s.move_component(id, p).is_err());
-        s.redo();
+        s.redo().unwrap();
         assert_eq!(s.document.components[0].id, id);
         s.move_component(id, p).unwrap();
-        s.undo();
+        s.undo().unwrap();
         let other = s.place(ComponentKind::Or, p).unwrap();
         assert_ne!(id, other);
-        s.redo();
+        s.redo().unwrap();
         assert_eq!(s.document.components.len(), 1);
     }
     #[test]
@@ -286,7 +363,7 @@ mod tests {
             session.delete(id).unwrap();
         }
         assert!(session.document.components.is_empty());
-        session.undo();
+        session.undo().unwrap();
         let previous = session.document.clone();
         let id = previous.components[0].id;
         assert!(
@@ -305,7 +382,208 @@ mod tests {
             .move_component(id, previous.components[0].position)
             .unwrap();
         assert_eq!(session.document, previous);
-        session.redo();
+        session.redo().unwrap();
         assert!(session.document.components.is_empty());
+    }
+    /// Input -> Not -> Output, wired with explicit pins.
+    fn wired_not(s: &mut Session) -> (ComponentId, ComponentId, ComponentId) {
+        use crate::domain::{PinDirection, PinId};
+        let p = Position { x: 0.0, y: 0.0 };
+        let input = s.place(ComponentKind::Input, p).unwrap();
+        let not = s.place(ComponentKind::Not, p).unwrap();
+        let output = s.place(ComponentKind::Output, p).unwrap();
+        let pin = |component, direction, index| PinRef {
+            component,
+            pin: PinId { direction, index },
+        };
+        s.connect([
+            pin(input, PinDirection::Output, 0),
+            pin(not, PinDirection::Input, 0),
+        ])
+        .unwrap();
+        s.connect([
+            pin(not, PinDirection::Output, 0),
+            pin(output, PinDirection::Input, 0),
+        ])
+        .unwrap();
+        (input, not, output)
+    }
+    struct Snapshot {
+        document: Document,
+        saved: Document,
+        undo: Vec<Document>,
+        redo: Vec<Document>,
+        next_id: u64,
+        next_wire_id: u64,
+        dirty: bool,
+    }
+    fn snapshot(s: &Session) -> Snapshot {
+        Snapshot {
+            document: s.document.clone(),
+            saved: s.saved.clone(),
+            undo: s.undo.clone(),
+            redo: s.redo.clone(),
+            next_id: s.next_id,
+            next_wire_id: s.next_wire_id,
+            dirty: s.dirty(),
+        }
+    }
+    fn assert_unchanged(s: &Session, before: &Snapshot) {
+        assert_eq!(s.document, before.document);
+        assert_eq!(s.saved, before.saved);
+        assert_eq!(s.undo, before.undo);
+        assert_eq!(s.redo, before.redo);
+        assert_eq!(s.next_id, before.next_id);
+        assert_eq!(s.next_wire_id, before.next_wire_id);
+        assert_eq!(s.dirty(), before.dirty);
+    }
+    #[test]
+    fn failed_start_preserves_everything_and_does_not_activate() {
+        let mut s = Session::default();
+        let p = Position { x: 0.0, y: 0.0 };
+        s.place(ComponentKind::Not, p).unwrap(); // unconnected input: missing driver
+        s.undo().unwrap();
+        s.redo().unwrap();
+        let before = snapshot(&s);
+        assert!(matches!(
+            s.start_simulation(),
+            Err(SimulationError::Compile(CompileError::MissingDriver { .. }))
+        ));
+        assert!(!s.simulation_active());
+        assert!(s.inspect().is_none());
+        assert_unchanged(&s, &before);
+        assert_eq!(s.stop_simulation(), Err(SimulationError::NotActive));
+        assert_eq!(s.step_simulation(), Err(SimulationError::NotActive));
+        assert_eq!(s.settle_simulation(8), Err(SimulationError::NotActive));
+        assert_eq!(
+            s.toggle_input(ComponentId(0)),
+            Err(SimulationError::NotActive)
+        );
+        s.place(ComponentKind::And, p).unwrap(); // editing still works
+    }
+    #[test]
+    fn every_mutating_entry_point_is_locked_without_side_effects() {
+        use crate::domain::{PinDirection, PinId};
+        let mut s = Session::default();
+        let (input, not, _) = wired_not(&mut s);
+        let wire = s.document.wires[0].id;
+        let spare = s
+            .place(ComponentKind::Input, Position { x: 9.0, y: 9.0 })
+            .unwrap();
+        s.undo().unwrap(); // leaves a redo entry; the document still compiles
+        s.start_simulation().unwrap();
+        let before = snapshot(&s);
+        assert!(s.dirty());
+        let endpoints = [
+            PinRef {
+                component: input,
+                pin: PinId {
+                    direction: PinDirection::Output,
+                    index: 0,
+                },
+            },
+            PinRef {
+                component: not,
+                pin: PinId {
+                    direction: PinDirection::Input,
+                    index: 0,
+                },
+            },
+        ];
+        let p = Position { x: 5.0, y: 5.0 };
+        let locked = EditError::SimulationActive;
+        assert_eq!(s.place(ComponentKind::And, p), Err(locked));
+        assert_eq!(s.move_component(input, p), Err(EditError::SimulationActive));
+        assert_eq!(s.delete(input), Err(EditError::SimulationActive));
+        assert_eq!(s.connect(endpoints), Err(EditError::SimulationActive));
+        assert_eq!(s.delete_wire(wire), Err(EditError::SimulationActive));
+        assert_eq!(s.undo(), Err(EditError::SimulationActive));
+        assert_eq!(s.redo(), Err(EditError::SimulationActive));
+        // Locked even when the operation would otherwise be invalid.
+        assert_eq!(s.delete(ComponentId(999)), Err(EditError::SimulationActive));
+        assert_eq!(
+            s.place(
+                ComponentKind::And,
+                Position {
+                    x: f32::NAN,
+                    y: 0.0
+                }
+            ),
+            Err(EditError::SimulationActive)
+        );
+        assert_unchanged(&s, &before);
+        assert_eq!(before.redo.len(), 1);
+        assert!(s.simulation_active());
+        s.stop_simulation().unwrap();
+        s.redo().unwrap();
+        assert!(s.document.components.iter().any(|c| c.id == spare));
+    }
+    #[test]
+    fn locked_redo_history_is_preserved() {
+        let mut s = Session::default();
+        wired_not(&mut s);
+        s.undo().unwrap();
+        s.undo().unwrap();
+        s.undo().unwrap();
+        s.undo().unwrap();
+        s.undo().unwrap();
+        s.start_simulation().unwrap(); // empty document compiles
+        let before = snapshot(&s);
+        assert_eq!(before.redo.len(), 5);
+        assert_eq!(s.redo(), Err(EditError::SimulationActive));
+        assert_eq!(s.undo(), Err(EditError::SimulationActive));
+        assert_unchanged(&s, &before);
+        s.stop_simulation().unwrap();
+        s.redo().unwrap();
+        assert_eq!(s.document.components.len(), 1);
+    }
+    #[test]
+    fn stop_restores_editing_exactly_and_runtime_activity_is_not_history() {
+        let mut s = Session::default();
+        let (input, _, output) = wired_not(&mut s);
+        let before = snapshot(&s);
+        s.start_simulation().unwrap();
+        assert_eq!(s.start_simulation(), Err(SimulationError::AlreadyActive));
+        assert_eq!(
+            s.settle_simulation(1000),
+            Ok(SettleOutcome::Settled { work: 2 })
+        );
+        let runtime = s.inspect().unwrap();
+        assert_eq!(
+            runtime.output_value(output),
+            Some(crate::runtime::Level::High)
+        );
+        assert_eq!(s.toggle_input(input), Ok(InputChange::Changed));
+        assert!(matches!(
+            s.step_simulation(),
+            Ok(StepOutcome::Stepped { .. })
+        ));
+        assert_eq!(
+            s.toggle_input(ComponentId(999)),
+            Err(SimulationError::Runtime(RuntimeError::UnknownComponent(
+                ComponentId(999)
+            )))
+        );
+        s.settle_simulation(1000).unwrap();
+        assert_eq!(
+            s.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::Low)
+        );
+        assert_unchanged(&s, &before);
+        s.stop_simulation().unwrap();
+        assert!(!s.simulation_active());
+        assert_unchanged(&s, &before);
+        let id = s
+            .place(ComponentKind::And, Position { x: 1.0, y: 1.0 })
+            .unwrap();
+        assert_eq!(id, ComponentId(before.next_id));
+        s.undo().unwrap();
+        assert_eq!(s.document, before.document);
+        // A fresh start begins from the initial state, not the discarded one.
+        s.start_simulation().unwrap();
+        assert_eq!(
+            s.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::Unavailable)
+        );
     }
 }

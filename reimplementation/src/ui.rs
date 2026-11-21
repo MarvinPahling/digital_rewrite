@@ -509,17 +509,19 @@ impl DigitalApp {
                 self.focused_pin = None;
                 self.wire_start = None;
                 self.selected_wire = None;
-                self.session.undo();
-                self.selected = None;
-                self.drag = None;
+                if self.session.undo().is_ok() {
+                    self.selected = None;
+                    self.drag = None;
+                }
             }
             if redo {
                 self.focused_pin = None;
                 self.wire_start = None;
                 self.selected_wire = None;
-                self.session.redo();
-                self.selected = None;
-                self.drag = None;
+                if self.session.redo().is_ok() {
+                    self.selected = None;
+                    self.drag = None;
+                }
             }
         });
     }
@@ -874,12 +876,12 @@ mod tests {
             app.session.document().components[0].position,
             Position { x: 200., y: 150. }
         );
-        app.session.undo();
+        app.session.undo().unwrap();
         assert_eq!(
             app.session.document().components[0].position,
             Position { x: 100., y: 100. }
         );
-        app.session.redo();
+        app.session.redo().unwrap();
         let snapshot = app.session.document().clone();
         frame(
             &ctx,
@@ -1126,7 +1128,7 @@ mod tests {
         frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
         frame(&ctx, &mut app, vec![button(end, false)], true);
         assert_eq!(app.session.document().components[0].position.x, 220.);
-        app.session.undo();
+        app.session.undo().unwrap();
         let before = app.session.document().clone();
         frame(
             &ctx,
@@ -1143,7 +1145,7 @@ mod tests {
         frame(&ctx, &mut app, vec![egui::Event::PointerMoved(p)], true);
         frame(&ctx, &mut app, vec![button(p, false)], true);
         assert_eq!(*app.session.document(), before);
-        app.session.redo();
+        app.session.redo().unwrap();
         assert_eq!(app.session.document().components[0].position.x, 220.);
     }
     #[test]

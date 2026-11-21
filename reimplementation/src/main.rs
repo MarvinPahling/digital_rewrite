@@ -6,6 +6,8 @@ mod assets;
 mod canvas;
 use digital_rust::components;
 use digital_rust::domain;
+use digital_rust::runtime;
+use digital_rust::simulation;
 mod engine;
 mod formats;
 mod symbol_render;
