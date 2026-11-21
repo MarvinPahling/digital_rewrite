@@ -266,47 +266,76 @@ impl DigitalApp {
             if let Some(runtime) = self.session.inspect() {
                 let document = self.session.document();
                 ui.separator();
-                ui.label("Inputs (toggle when settled)");
-                for component in &document.components {
-                    if component.kind != ComponentKind::Input {
-                        continue;
-                    }
-                    let level = runtime
-                        .pin_value(PinRef {
-                            component: component.id,
-                            pin: PinId {
-                                direction: PinDirection::Output,
-                                index: 0,
-                            },
-                        })
-                        .unwrap_or(Level::Unavailable);
-                    let text = format!(
-                        "{} #{}: {}",
-                        component.label,
-                        component.id.0,
-                        level_text(level)
-                    );
-                    if ui
-                        .add_enabled(!runtime.is_pending(), egui::Button::new(text))
-                        .clicked()
-                    {
-                        action = Some(SimAction::Toggle(component.id));
-                    }
-                }
-                ui.separator();
-                ui.label("Outputs");
-                for component in &document.components {
-                    if component.kind == ComponentKind::Output {
-                        ui.label(format!(
-                            "{} #{}: {}",
-                            component.label,
-                            component.id.0,
-                            runtime
-                                .output_value(component.id)
-                                .map_or("? (unavailable)", level_text)
-                        ));
-                    }
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("simulation_values")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label("Inputs (toggle when settled)");
+                        for component in &document.components {
+                            if component.kind != ComponentKind::Input {
+                                continue;
+                            }
+                            let level = runtime
+                                .pin_value(PinRef {
+                                    component: component.id,
+                                    pin: PinId {
+                                        direction: PinDirection::Output,
+                                        index: 0,
+                                    },
+                                })
+                                .unwrap_or(Level::Unavailable);
+                            let text = format!(
+                                "{} #{}: {}",
+                                component.label,
+                                component.id.0,
+                                level_text(level)
+                            );
+                            if ui
+                                .add_enabled(!runtime.is_pending(), egui::Button::new(text))
+                                .clicked()
+                            {
+                                action = Some(SimAction::Toggle(component.id));
+                            }
+                        }
+                        ui.separator();
+                        ui.label("Outputs");
+                        for component in &document.components {
+                            if component.kind == ComponentKind::Output {
+                                ui.label(format!(
+                                    "{} #{}: {}",
+                                    component.label,
+                                    component.id.0,
+                                    runtime
+                                        .output_value(component.id)
+                                        .map_or("? (unavailable)", level_text)
+                                ));
+                            }
+                        }
+                        ui.separator();
+                        ui.label("Gates");
+                        for component in &document.components {
+                            if matches!(
+                                component.kind,
+                                ComponentKind::And | ComponentKind::Or | ComponentKind::Not
+                            ) {
+                                let level = runtime
+                                    .pin_value(PinRef {
+                                        component: component.id,
+                                        pin: PinId {
+                                            direction: PinDirection::Output,
+                                            index: 0,
+                                        },
+                                    })
+                                    .unwrap_or(Level::Unavailable);
+                                ui.label(format!(
+                                    "{} gate id {}: {}",
+                                    component.kind.name(),
+                                    component.id.0,
+                                    level_text(level)
+                                ));
+                            }
+                        }
+                    });
             }
             if let Some(action) = action {
                 self.apply_simulation_action(action);
@@ -1715,6 +1744,135 @@ mod tests {
         press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
         assert_eq!(*app.session.document(), wired);
         assert_eq!(input, app.session.document().components[0].id);
+    }
+
+    #[test]
+    fn gate_values_are_exposed_as_labelled_widgets() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = DigitalApp::default();
+        let (_, output) = inverter_chain(&mut app, 2);
+        click_text(&ctx, &mut app, "Start");
+        let shown = frame(&ctx, &mut app, vec![], true);
+        let gates: Vec<_> = app
+            .session
+            .document()
+            .components
+            .iter()
+            .filter(|c| c.kind == ComponentKind::Not)
+            .map(|c| c.id.0)
+            .collect();
+        assert_eq!(gates.len(), 2);
+        // Input is low, so the first NOT is high and the second low.
+        assert!(has_text(
+            &shown,
+            &format!("NOT gate id {}: 1 (high)", gates[0])
+        ));
+        assert!(has_text(
+            &shown,
+            &format!("NOT gate id {}: 0 (low)", gates[1])
+        ));
+        assert_eq!(output_level(&app, output), Some(Level::Low));
+        // Standard widgets, unlike painted badges, reach the AccessKit tree.
+        let accessible: Vec<String> = shown
+            .platform_output
+            .accesskit_update
+            .iter()
+            .flat_map(|update| update.nodes.iter())
+            .filter_map(|(_, node)| node.value().or_else(|| node.label()).map(str::to_owned))
+            .collect();
+        for (gate, expected) in gates.iter().zip(["1 (high)", "0 (low)"]) {
+            let label = format!("NOT gate id {gate}: {expected}");
+            assert!(
+                accessible.contains(&label),
+                "{label:?} not in {accessible:?}"
+            );
+        }
+    }
+
+    /// Position of the first text shape equal to `label` and whether it lies inside its clip.
+    fn text_position(output: &egui::FullOutput, label: &str) -> Option<(Pos2, bool)> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                Some((text.pos, shape.clip_rect.contains(text.pos)))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn overflowing_simulation_lists_scroll_and_keep_controls_fixed() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let inputs: Vec<_> = (0..30)
+            .map(|n| {
+                app.session
+                    .place(
+                        ComponentKind::Input,
+                        Position {
+                            x: 100.,
+                            y: 20. * n as f32,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let last = inputs[29];
+        let last_label = format!("Input #{}: 0 (low)", last.0);
+        click_text(&ctx, &mut app, "Start");
+        let shown = frame(&ctx, &mut app, vec![], true);
+        // egui culls shapes outside the clip rectangle, so "absent" also means not visible.
+        assert!(
+            !text_position(&shown, &last_label).is_some_and(|(_, visible)| visible),
+            "30 inputs must overflow the 600-point viewport"
+        );
+        let (start, start_visible) = text_position(&shown, "Start").unwrap();
+        assert!(start_visible);
+        // Wheel over the panel scrolls the list; the controls stay where they were.
+        let over_panel = Pos2::new(700., 300.);
+        let mut events = vec![
+            egui::Event::PointerMoved(over_panel),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0., -2_000.),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let mut shown = frame(&ctx, &mut app, std::mem::take(&mut events), true);
+        for _ in 0..30 {
+            shown = frame(&ctx, &mut app, vec![], true);
+        }
+        let (_, visible) = text_position(&shown, &last_label).unwrap();
+        assert!(visible, "last input scrolled into view");
+        assert_eq!(text_position(&shown, "Start"), Some((start, true)));
+        assert!(!app.session.inspect().unwrap().is_pending());
+        // Hover first: a pointer that moves while pressing would drag-scroll the list.
+        let shown = frame(&ctx, &mut app, vec![], true);
+        let (label_pos, visible) = text_position(&shown, &last_label).unwrap();
+        assert!(visible);
+        let target = label_pos + Vec2::new(4., 4.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(target)],
+            true,
+        );
+        click_at(&ctx, &mut app, target);
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(
+            has_text(&shown, &format!("Input #{}: 1 (high)", last.0)),
+            "{:?}",
+            texts(&shown)
+        );
+        let runtime = app.session.inspect().unwrap();
+        assert_eq!(
+            runtime.pin_value(pin_ref(last, PinDirection::Output, 0)),
+            Some(Level::High)
+        );
+        assert_eq!(
+            runtime.pin_value(pin_ref(inputs[0], PinDirection::Output, 0)),
+            Some(Level::Low)
+        );
     }
 
     #[test]
