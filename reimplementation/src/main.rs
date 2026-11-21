@@ -10,6 +10,7 @@ use digital_rust::runtime;
 use digital_rust::simulation;
 mod engine;
 mod formats;
+mod sim_text;
 mod symbol_render;
 #[cfg(test)]
 mod symbol_sheet;

@@ -6,8 +6,10 @@
 use crate::{
     canvas::CanvasTransform,
     components::KINDS,
-    domain::{ComponentId, ComponentKind, PinDirection, PinId, PinRef, Position, WireId},
-    engine::Session,
+    domain::{ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position, WireId},
+    engine::{EditError, Session, SimulationError},
+    runtime::{InputChange, Level, SettleOutcome},
+    sim_text::{describe_simulation_error, level_badge, level_text},
     symbol_render::{PaintState, Palette, SymbolLayout, SymbolRenderer},
     symbols::{DEFAULT_STYLE, GRID_UNIT, STROKE_WIDTH, SymbolStyle},
 };
@@ -22,6 +24,33 @@ const PICK_TOLERANCE: f32 = 2.0;
 const SELECTION_MARGIN: f32 = 2.0;
 /// Gap between a symbol's bounds and its label, in screen points.
 const LABEL_GAP: f32 = 4.0;
+/// Work units (gate evaluations plus microsteps) settled per frame. Small enough that a frame
+/// stays short and Stop is handled between chunks, however large the circuit.
+const SETTLE_BUDGET_PER_FRAME: usize = 2_048;
+/// Shown wherever editing is disabled.
+const EDIT_LOCK_NOTE: &str =
+    "Editing is locked while the simulation is running. Stop it (Shift+F5) to edit.";
+
+/// A simulation command from a button, shortcut or canvas click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SimAction {
+    Start,
+    Stop,
+    Step,
+    Settle,
+    Toggle(ComponentId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SimState {
+    Idle,
+    /// The last start failed and the document has not changed since.
+    Error,
+    Pending {
+        settling: bool,
+    },
+    Settled,
+}
 
 pub struct DigitalApp {
     session: Session,
@@ -33,6 +62,13 @@ pub struct DigitalApp {
     placing: Option<ComponentKind>,
     drag: Option<(ComponentId, Position, Pos2)>,
     error: Option<String>,
+    /// Work units settled per frame while `settling`.
+    settle_budget: usize,
+    /// Whether frames keep settling in bounded chunks. Step pauses it; Settle, Start and an
+    /// input toggle resume it.
+    settling: bool,
+    /// The document whose compilation last failed; the error state ends when it changes.
+    failed_start: Option<Document>,
     style: SymbolStyle,
     renderer: SymbolRenderer,
 }
@@ -48,6 +84,9 @@ impl Default for DigitalApp {
             placing: None,
             drag: None,
             error: None,
+            settle_budget: SETTLE_BUDGET_PER_FRAME,
+            settling: false,
+            failed_start: None,
             style: DEFAULT_STYLE,
             renderer: SymbolRenderer::default(),
         }
@@ -101,19 +140,203 @@ impl DigitalApp {
             self.wire_start = Some(pin);
         }
     }
+    fn sim_state(&self) -> SimState {
+        match self.session.inspect() {
+            Some(runtime) if runtime.is_pending() => SimState::Pending {
+                settling: self.settling,
+            },
+            Some(_) => SimState::Settled,
+            None if self.failed_start.as_ref() == Some(self.session.document()) => SimState::Error,
+            None => SimState::Idle,
+        }
+    }
+    fn report_simulation_error(&mut self, error: &SimulationError) {
+        self.error = Some(describe_simulation_error(self.session.document(), error));
+    }
+    /// Applies a simulation command through the engine. Starting cancels every transient
+    /// editing gesture; a failed start leaves the editor exactly as it was.
+    fn apply_simulation_action(&mut self, action: SimAction) {
+        match action {
+            SimAction::Start => match self.session.start_simulation() {
+                Ok(()) => {
+                    self.placing = None;
+                    self.wiring = false;
+                    self.wire_start = None;
+                    self.focused_pin = None;
+                    self.drag = None;
+                    self.failed_start = None;
+                    self.error = None;
+                    self.settling = true;
+                }
+                Err(error) => {
+                    if matches!(error, SimulationError::Compile(_)) {
+                        self.failed_start = Some(self.session.document().clone());
+                    }
+                    self.report_simulation_error(&error);
+                }
+            },
+            SimAction::Stop => match self.session.stop_simulation() {
+                Ok(()) => {
+                    self.settling = false;
+                    self.error = None;
+                }
+                Err(error) => self.report_simulation_error(&error),
+            },
+            SimAction::Step => {
+                self.settling = false;
+                if let Err(error) = self.session.step_simulation() {
+                    self.report_simulation_error(&error);
+                }
+            }
+            SimAction::Settle => {
+                if self.session.simulation_active() {
+                    self.settling = true;
+                }
+            }
+            SimAction::Toggle(id) => match self.session.toggle_input(id) {
+                Ok(InputChange::Changed) => {
+                    self.settling = true;
+                    self.error = None;
+                }
+                Ok(InputChange::Unchanged) => {}
+                Err(error) => self.report_simulation_error(&error),
+            },
+        }
+    }
+    /// Runs one bounded settle chunk. While work remains a repaint is requested, so the next
+    /// frame continues and Stop is handled in between.
+    fn advance_simulation(&mut self, ctx: &egui::Context) {
+        if !self.settling {
+            return;
+        }
+        match self.session.settle_simulation(self.settle_budget) {
+            Ok(SettleOutcome::BudgetExhausted { .. }) => {}
+            Ok(SettleOutcome::Settled { .. }) | Err(_) => self.settling = false,
+        }
+        // One more frame also after the last chunk, so the settled state is displayed.
+        ctx.request_repaint();
+    }
+    fn simulation_shortcuts(&mut self, ctx: &egui::Context) {
+        let action = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F5) {
+                Some(SimAction::Stop)
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F5) {
+                Some(SimAction::Start)
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F10) {
+                Some(SimAction::Step)
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F6) {
+                Some(SimAction::Settle)
+            } else {
+                None
+            }
+        });
+        if let Some(action) = action {
+            self.apply_simulation_action(action);
+        }
+    }
+    fn simulation_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("simulation").show(ctx, |ui| {
+            ui.heading("Simulation");
+            let active = self.session.simulation_active();
+            let mut action = None;
+            ui.horizontal_wrapped(|ui| {
+                for (label, enabled, hint, command) in [
+                    ("Start", !active, "Start (F5)", SimAction::Start),
+                    ("Stop", active, "Stop (Shift+F5)", SimAction::Stop),
+                    ("Step", active, "One microstep (F10)", SimAction::Step),
+                    ("Settle", active, "Run until stable (F6)", SimAction::Settle),
+                ] {
+                    if ui
+                        .add_enabled(enabled, egui::Button::new(label))
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        action = Some(command);
+                    }
+                }
+            });
+            ui.label(match self.sim_state() {
+                SimState::Idle => "State: idle (not simulating)",
+                SimState::Error => "State: error (cannot start, see message)",
+                SimState::Pending { settling: true } => "State: pending (settling)",
+                SimState::Pending { settling: false } => "State: pending (paused; Step or Settle)",
+                SimState::Settled => "State: settled",
+            });
+            ui.label("F5 start, Shift+F5 stop, F10 step, F6 settle.");
+            if let Some(runtime) = self.session.inspect() {
+                let document = self.session.document();
+                ui.separator();
+                ui.label("Inputs (toggle when settled)");
+                for component in &document.components {
+                    if component.kind != ComponentKind::Input {
+                        continue;
+                    }
+                    let level = runtime
+                        .pin_value(PinRef {
+                            component: component.id,
+                            pin: PinId {
+                                direction: PinDirection::Output,
+                                index: 0,
+                            },
+                        })
+                        .unwrap_or(Level::Unavailable);
+                    let text = format!(
+                        "{} #{}: {}",
+                        component.label,
+                        component.id.0,
+                        level_text(level)
+                    );
+                    if ui
+                        .add_enabled(!runtime.is_pending(), egui::Button::new(text))
+                        .clicked()
+                    {
+                        action = Some(SimAction::Toggle(component.id));
+                    }
+                }
+                ui.separator();
+                ui.label("Outputs");
+                for component in &document.components {
+                    if component.kind == ComponentKind::Output {
+                        ui.label(format!(
+                            "{} #{}: {}",
+                            component.label,
+                            component.id.0,
+                            runtime
+                                .output_value(component.id)
+                                .map_or("? (unavailable)", level_text)
+                        ));
+                    }
+                }
+            }
+            if let Some(action) = action {
+                self.apply_simulation_action(action);
+            }
+        });
+    }
     fn palette_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("palette").show(ctx, |ui| {
             ui.heading("Components");
-            for kind in KINDS {
-                if ui
-                    .selectable_label(self.placing == Some(kind), kind.name())
-                    .clicked()
-                {
-                    self.placing = Some(kind); self.wiring = false; self.wire_start = None;
+            let locked = self.session.simulation_active();
+            ui.add_enabled_ui(!locked, |ui| {
+                for kind in KINDS {
+                    if ui
+                        .selectable_label(self.placing == Some(kind), kind.name())
+                        .clicked()
+                    {
+                        self.placing = Some(kind);
+                        self.wiring = false;
+                        self.wire_start = None;
+                    }
                 }
-            }
-            if ui.selectable_label(self.wiring, "Wire (W)").clicked() {
-                self.wiring = !self.wiring; self.wire_start = None; self.placing = None; self.drag = None;
+                if ui.selectable_label(self.wiring, "Wire (W)").clicked() {
+                    self.wiring = !self.wiring;
+                    self.wire_start = None;
+                    self.placing = None;
+                    self.drag = None;
+                }
+            });
+            if locked {
+                ui.label(EDIT_LOCK_NOTE);
             }
             ui.separator();
             ui.label("Shape style");
@@ -128,8 +351,11 @@ impl DigitalApp {
         });
     }
     fn show(&mut self, ctx: &egui::Context) {
+        self.simulation_shortcuts(ctx);
         self.palette_panel(ctx);
+        self.simulation_panel(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
+            let locked = self.session.simulation_active();
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
             let painter = ui.painter_at(rect);
@@ -193,7 +419,7 @@ impl DigitalApp {
                 && rect.contains(p)
             {
                 response.request_focus();
-                if self.wiring {
+                if self.wiring && !locked {
                     let hit = pins
                         .iter()
                         .filter_map(|(pin, pos)| {
@@ -241,10 +467,22 @@ impl DigitalApp {
                         None
                     };
                     self.selected = hit.map(|v| v.0);
-                    self.drag = hit.map(|(id, pos)| (id, pos, p));
+                    self.drag = hit.filter(|_| !locked).map(|(id, pos)| (id, pos, p));
+                    if locked
+                        && let Some((id, _)) = hit
+                        && self
+                            .session
+                            .document()
+                            .components
+                            .iter()
+                            .any(|c| c.id == id && c.kind == ComponentKind::Input)
+                    {
+                        self.apply_simulation_action(SimAction::Toggle(id));
+                    }
                 }
             }
             if !cancelled
+                && !locked
                 && response.clicked()
                 && let Some(kind) = self.placing.take()
                 && let Some(p) = pointer
@@ -262,6 +500,7 @@ impl DigitalApp {
                 self.drag = None;
             }
             if !cancelled
+                && !locked
                 && response.drag_stopped()
                 && let (Some((id, start, origin)), Some(p)) = (self.drag.take(), pointer)
             {
@@ -402,6 +641,33 @@ impl DigitalApp {
                     egui::FontId::proportional(14.),
                     palette.color(state),
                 );
+                if let Some(runtime) = self.session.inspect() {
+                    let pin = if c.kind == ComponentKind::Output {
+                        PinId {
+                            direction: PinDirection::Input,
+                            index: 0,
+                        }
+                    } else {
+                        PinId {
+                            direction: PinDirection::Output,
+                            index: 0,
+                        }
+                    };
+                    let level = runtime
+                        .pin_value(PinRef {
+                            component: c.id,
+                            pin,
+                        })
+                        .unwrap_or(Level::Unavailable);
+                    painter.text(
+                        transform.to_screen([(bounds.min[0] + bounds.max[0]) / 2., bounds.max[1]])
+                            + Vec2::new(0., SELECTION_MARGIN * transform.zoom() + LABEL_GAP + 16.),
+                        egui::Align2::CENTER_TOP,
+                        level_badge(level),
+                        egui::FontId::monospace(14.),
+                        palette.color(state),
+                    );
+                }
             }
             let owns_keyboard = response.has_focus();
             if owns_keyboard {
@@ -415,7 +681,43 @@ impl DigitalApp {
                     )
                 });
             }
+            if owns_keyboard && locked {
+                // Edit shortcuts are refused here, before the engine would refuse them.
+                let command = egui::Modifiers::COMMAND;
+                let shifted = egui::Modifiers {
+                    shift: true,
+                    ..command
+                };
+                let attempted = ctx.input_mut(|i| {
+                    [
+                        (egui::Modifiers::NONE, egui::Key::W),
+                        (egui::Modifiers::NONE, egui::Key::Delete),
+                        (command, egui::Key::Z),
+                        (shifted, egui::Key::Z),
+                        (command, egui::Key::Y),
+                    ]
+                    .into_iter()
+                    .fold(false, |any, (modifiers, key)| {
+                        i.consume_key(modifiers, key) | any
+                    })
+                });
+                if attempted {
+                    self.error = Some(EditError::SimulationActive.to_string());
+                }
+                if self.selected.is_some_and(|id| {
+                    self.session
+                        .document()
+                        .components
+                        .iter()
+                        .any(|c| c.id == id && c.kind == ComponentKind::Input)
+                }) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+                    && let Some(id) = self.selected
+                {
+                    self.apply_simulation_action(SimAction::Toggle(id));
+                }
+            }
             if owns_keyboard
+                && !locked
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W))
             {
                 self.wiring = !self.wiring;
@@ -469,6 +771,7 @@ impl DigitalApp {
                     self.choose_pin(pin);
                 }
                 if self.selected_wire.is_some()
+                    && !locked
                     && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
                     && let Some(id) = self.selected_wire.take()
                     && let Err(e) = self.session.delete_wire(id)
@@ -477,6 +780,7 @@ impl DigitalApp {
                 }
             }
             if owns_keyboard
+                && !locked
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
                 && let Some(id) = self.selected
             {
@@ -488,7 +792,7 @@ impl DigitalApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            let (undo, redo) = if owns_keyboard {
+            let (undo, redo) = if owns_keyboard && !locked {
                 ctx.input_mut(|i| {
                     let command = egui::Modifiers::COMMAND;
                     let shifted = egui::Modifiers {
@@ -524,6 +828,7 @@ impl DigitalApp {
                 }
             }
         });
+        self.advance_simulation(ctx);
     }
 }
 impl eframe::App for DigitalApp {
@@ -588,7 +893,7 @@ mod tests {
             .place(ComponentKind::Output, Position { x: 200., y: 100. })
             .unwrap();
         frame(&ctx, &mut app, vec![], true);
-        let p = Pos2::new(600., 300.);
+        let p = Pos2::new(400., 300.);
         frame(&ctx, &mut app, vec![button(p, true)], true);
         frame(&ctx, &mut app, vec![button(p, false)], true);
         frame(
@@ -697,7 +1002,7 @@ mod tests {
             .place(ComponentKind::Output, Position { x: 100., y: 100. })
             .unwrap();
         frame(&ctx, &mut app, vec![], true);
-        let p = Pos2::new(600., 300.);
+        let p = Pos2::new(400., 300.);
         frame(&ctx, &mut app, vec![button(p, true)], true);
         frame(&ctx, &mut app, vec![button(p, false)], true);
         app.wiring = true;
@@ -1278,5 +1583,358 @@ mod tests {
         );
         frame(&ctx, &mut app, vec![button(p, false)], true);
         assert!(app.selected.is_some());
+    }
+    fn pin_ref(component: ComponentId, direction: PinDirection, index: u8) -> PinRef {
+        PinRef {
+            component,
+            pin: PinId { direction, index },
+        }
+    }
+    /// Input (100,100) -> `nots` NOT gates -> Output, wired through the engine.
+    fn inverter_chain(app: &mut DigitalApp, nots: usize) -> (ComponentId, ComponentId) {
+        let input = app
+            .session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        let mut source = input;
+        for n in 0..nots {
+            let not = app
+                .session
+                .place(
+                    ComponentKind::Not,
+                    Position {
+                        x: 200. + 20. * n as f32,
+                        y: 100.,
+                    },
+                )
+                .unwrap();
+            app.session
+                .connect([
+                    pin_ref(source, PinDirection::Output, 0),
+                    pin_ref(not, PinDirection::Input, 0),
+                ])
+                .unwrap();
+            source = not;
+        }
+        let output = app
+            .session
+            .place(ComponentKind::Output, Position { x: 300., y: 100. })
+            .unwrap();
+        app.session
+            .connect([
+                pin_ref(source, PinDirection::Output, 0),
+                pin_ref(output, PinDirection::Input, 0),
+            ])
+            .unwrap();
+        (input, output)
+    }
+    fn texts(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn has_text(output: &egui::FullOutput, needle: &str) -> bool {
+        texts(output).iter().any(|text| text.contains(needle))
+    }
+    fn click_at(ctx: &egui::Context, app: &mut DigitalApp, p: Pos2) {
+        frame(
+            ctx,
+            app,
+            vec![egui::Event::PointerMoved(p), button(p, true)],
+            true,
+        );
+        frame(ctx, app, vec![button(p, false)], true);
+    }
+    /// Clicks the widget whose text is exactly `label`, as found in a freshly painted frame.
+    fn click_text(ctx: &egui::Context, app: &mut DigitalApp, label: &str) {
+        let output = frame(ctx, app, vec![], true);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => Some(text.pos),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no text {label:?} in {:?}", texts(&output)));
+        click_at(ctx, app, pos + Vec2::new(4., 4.));
+    }
+    fn press(
+        ctx: &egui::Context,
+        app: &mut DigitalApp,
+        key_: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        frame(ctx, app, vec![key(key_, modifiers)], true);
+    }
+    fn output_level(app: &DigitalApp, output: ComponentId) -> Option<Level> {
+        app.session.inspect()?.output_value(output)
+    }
+    fn wants_immediate_repaint(output: &egui::FullOutput) -> bool {
+        output
+            .viewport_output
+            .values()
+            .any(|viewport| viewport.repaint_delay.is_zero())
+    }
+
+    #[test]
+    fn start_toggle_step_settle_inspect_stop_then_edit_and_undo() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let (input, output) = inverter_chain(&mut app, 1);
+        let wired = app.session.document().clone();
+        click_text(&ctx, &mut app, "Start");
+        assert!(app.session.simulation_active());
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "State: settled"), "{:?}", texts(&shown));
+        assert_eq!(output_level(&app, output), Some(Level::High));
+        assert!(has_text(&shown, "= 1"));
+        assert!(has_text(&shown, "1 (high)"));
+        // Toggle the input from the keyboard-reachable list; the inverter follows.
+        click_text(&ctx, &mut app, "Input #0: 0 (low)");
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert_eq!(output_level(&app, output), Some(Level::Low));
+        assert!(has_text(&shown, "Input #0: 1 (high)"));
+        assert!(has_text(&shown, "= 0"));
+        // Toggling creates no history and does not touch the document.
+        assert_eq!(*app.session.document(), wired);
+        assert!(app.session.dirty());
+        click_text(&ctx, &mut app, "Stop");
+        assert!(!app.session.simulation_active());
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "State: idle"));
+        assert!(!has_text(&shown, "= 0"));
+        // Editing works again, and undo removes exactly the edit.
+        app.placing = Some(ComponentKind::And);
+        click_at(&ctx, &mut app, Pos2::new(408., 300.));
+        assert_eq!(app.session.document().components.len(), 4);
+        press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(*app.session.document(), wired);
+        assert_eq!(input, app.session.document().components[0].id);
+    }
+
+    #[test]
+    fn step_runs_one_microstep_and_settle_resumes_with_the_same_result() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let (_, output) = inverter_chain(&mut app, 2);
+        app.settle_budget = 1;
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
+        assert!(app.session.inspect().unwrap().is_pending());
+        assert_eq!(output_level(&app, output), Some(Level::Unavailable));
+        press(&ctx, &mut app, egui::Key::F10, egui::Modifiers::NONE);
+        assert!(!app.settling);
+        let paused = app.session.inspect().unwrap().pending_gate_count();
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "paused"));
+        assert_eq!(
+            app.session.inspect().unwrap().pending_gate_count(),
+            paused,
+            "a paused simulation must not advance"
+        );
+        // One microstep cannot carry the value through both gates.
+        assert_eq!(output_level(&app, output), Some(Level::Unavailable));
+        press(&ctx, &mut app, egui::Key::F6, egui::Modifiers::NONE);
+        for _ in 0..50 {
+            frame(&ctx, &mut app, vec![], true);
+        }
+        assert_eq!(output_level(&app, output), Some(Level::Low));
+        assert!(!app.session.inspect().unwrap().is_pending());
+    }
+
+    #[test]
+    fn invalid_circuit_shows_a_located_diagnostic_and_stays_editable() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let input = app
+            .session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        let and = app
+            .session
+            .place(ComponentKind::And, Position { x: 200., y: 100. })
+            .unwrap();
+        app.session
+            .connect([
+                pin_ref(input, PinDirection::Output, 0),
+                pin_ref(and, PinDirection::Input, 0),
+            ])
+            .unwrap();
+        let before = app.session.document().clone();
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
+        assert!(!app.session.simulation_active());
+        assert_eq!(*app.session.document(), before);
+        let message = app.error.clone().unwrap();
+        assert!(message.contains("input pin 2 of AND #1"), "{message}");
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "input pin 2 of AND #1"));
+        assert!(has_text(&shown, "State: error"));
+        // Still editable; the error state ends once the document changes.
+        app.session
+            .place(ComponentKind::Input, Position { x: 50., y: 50. })
+            .unwrap();
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "State: idle"));
+    }
+
+    #[test]
+    fn pointer_and_keyboard_edits_are_blocked_while_active() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let (input, output) = inverter_chain(&mut app, 1);
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
+        frame(&ctx, &mut app, vec![], true);
+        assert!(app.session.simulation_active());
+        let before = app.session.document().clone();
+        let history_probe = before.wires.len();
+        // Drag the NOT gate (canvas origin is at 208, 8).
+        let start = Pos2::new(308. + 100., 108.);
+        let end = start + Vec2::new(50., 50.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            true,
+        );
+        assert!(app.drag.is_none());
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
+        frame(&ctx, &mut app, vec![button(end, false)], true);
+        assert_eq!(*app.session.document(), before);
+        // Keyboard edit paths: delete, undo, redo and wiring mode.
+        for (key_, modifiers) in [
+            (egui::Key::Delete, egui::Modifiers::NONE),
+            (egui::Key::Z, egui::Modifiers::COMMAND),
+            (
+                egui::Key::Z,
+                egui::Modifiers {
+                    shift: true,
+                    ..egui::Modifiers::COMMAND
+                },
+            ),
+            (egui::Key::Y, egui::Modifiers::COMMAND),
+            (egui::Key::W, egui::Modifiers::NONE),
+        ] {
+            app.error = None;
+            press(&ctx, &mut app, key_, modifiers);
+            assert_eq!(*app.session.document(), before, "{key_:?}");
+            assert!(!app.wiring);
+            assert_eq!(
+                app.error.as_deref(),
+                Some("Stop the simulation before editing"),
+                "{key_:?}"
+            );
+        }
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "Editing is locked"));
+        // A click on an Input component toggles it instead of selecting for a drag.
+        click_at(&ctx, &mut app, Pos2::new(308., 108.));
+        frame(&ctx, &mut app, vec![], true);
+        assert_eq!(output_level(&app, output), Some(Level::Low));
+        assert_eq!(*app.session.document(), before);
+        // Space on the selected Input toggles it back from the keyboard.
+        app.selected = Some(input);
+        press(&ctx, &mut app, egui::Key::Space, egui::Modifiers::NONE);
+        frame(&ctx, &mut app, vec![], true);
+        assert_eq!(output_level(&app, output), Some(Level::High));
+        // The history survived untouched: after Stop, undo removes the last wire only.
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::SHIFT);
+        assert!(!app.session.simulation_active());
+        press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(app.session.document().wires.len(), history_probe - 1);
+        assert_eq!(app.session.document().components.len(), 3);
+    }
+
+    #[test]
+    fn starting_cancels_placement_wiring_and_drag_gestures() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        inverter_chain(&mut app, 1);
+        let before = app.session.document().clone();
+        // A pointer drag in progress when the simulation starts must not move anything later.
+        let start = Pos2::new(408., 108.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            true,
+        );
+        assert!(app.drag.is_some());
+        app.placing = Some(ComponentKind::And);
+        app.wiring = true;
+        app.wire_start = Some(pin_ref(ComponentId(1), PinDirection::Output, 0));
+        app.focused_pin = app.wire_start;
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
+        assert!(app.session.simulation_active());
+        assert!(app.drag.is_none());
+        assert!(app.placing.is_none());
+        assert!(!app.wiring);
+        assert!(app.wire_start.is_none());
+        assert!(app.focused_pin.is_none());
+        let end = start + Vec2::new(60., 0.);
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
+        frame(&ctx, &mut app, vec![button(end, false)], true);
+        assert_eq!(*app.session.document(), before);
+    }
+
+    #[test]
+    fn bounded_chunks_span_frames_keep_stop_responsive_and_do_not_change_the_result() {
+        let ctx = egui::Context::default();
+        let chain = 6;
+        let mut reference = DigitalApp::default();
+        let (_, reference_output) = inverter_chain(&mut reference, chain);
+        press(&ctx, &mut reference, egui::Key::F5, egui::Modifiers::NONE);
+        frame(&ctx, &mut reference, vec![], true);
+        let expected = output_level(&reference, reference_output);
+        assert_eq!(expected, Some(Level::Low));
+
+        let mut app = DigitalApp::default();
+        let (_, output) = inverter_chain(&mut app, chain);
+        app.settle_budget = 2;
+        let started = frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::F5, egui::Modifiers::NONE)],
+            true,
+        );
+        assert!(app.session.inspect().unwrap().is_pending());
+        assert!(wants_immediate_repaint(&started));
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "State: pending"));
+        assert!(has_text(&shown, "= ?"));
+        assert!(has_text(&shown, "? (unavailable)"));
+        let mut frames = 1;
+        while app.session.inspect().unwrap().is_pending() {
+            let shown = frame(&ctx, &mut app, vec![], true);
+            frames += 1;
+            assert!(frames < 200, "settling did not finish");
+            if app.session.inspect().unwrap().is_pending() {
+                assert!(wants_immediate_repaint(&shown));
+            }
+        }
+        assert!(frames > 3, "the small budget must need several frames");
+        assert_eq!(output_level(&app, output), expected);
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "State: settled"));
+        // Stop while chunks are still pending: the click is handled between chunks.
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::SHIFT);
+        let before = app.session.document().clone();
+        app.settle_budget = 1;
+        click_text(&ctx, &mut app, "Start");
+        assert!(app.session.inspect().unwrap().is_pending());
+        click_text(&ctx, &mut app, "Stop");
+        assert!(!app.session.simulation_active());
+        assert!(!app.settling);
+        assert_eq!(*app.session.document(), before);
+        frame(&ctx, &mut app, vec![], true);
+        let idle = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&idle, "State: idle"));
+        assert!(
+            !wants_immediate_repaint(&idle),
+            "an idle editor must not spin repaints"
+        );
     }
 }
