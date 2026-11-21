@@ -22,6 +22,18 @@ just check-rust
 
 Without just, use `cargo run --locked --manifest-path reimplementation/Cargo.toml`. The existing `just run` still launches the bundled Java reference using its machine-specific Java path. `build_reimplemtation` remains an alias for `build-rust`.
 
+## macOS app bundle
+
+```sh
+just bundle-macos     # builds target/bundle/digital-rust.app
+just open-macos       # builds if needed, then opens it
+just check-bundle-macos
+```
+
+`reimplementation/scripts/bundle-macos.sh` (macOS only; requires `jq`, `iconutil`, `codesign`, `plutil`) runs `cargo build --release --locked` (Cargo itself writes to `reimplementation/target`; the script takes the binary and generated-asset paths from Cargo's JSON build messages) and assembles `Contents/MacOS/digital-rust`, `Contents/Info.plist` (version from `reimplementation/Cargo.toml`) and `Contents/Resources/AppIcon.icns`. The icon is derived at bundle time from the build-generated app-icon PNGs through an `.iconset` and `iconutil`; neither PNGs nor `.icns` files are committed. The 512@2x slot is omitted because no 1024 px image is generated. Rerunning replaces the previous bundle. `check-bundle-macos` builds the bundle twice and asserts the executable bit, `plutil -lint`, an `iconutil` round trip of the icon, `codesign --verify`, and that the binary is a Mach-O linking libSystem; no GUI is launched.
+
+The bundle is ad-hoc signed (`codesign --sign -`) so it runs locally; set `CODESIGN_IDENTITY` to use a real identity. It is not notarized, so Gatekeeper may block a copy downloaded or transferred to another Mac. There is no DMG, and the binary targets the host architecture only (no universal binary). The bundle identifier `io.github.digital-rust.editor` and the name `digital-rust` are provisional working names, and `LSMinimumSystemVersion` (11.0) is declared, not tested on older systems.
+
 ## Structure and dependencies
 
 The single package in `reimplementation/` contains `domain` (documents and signals), `components` (definitions and simulation), `formats` (file I/O), and `engine` (sessions and commands); component documents, editing history, a pin-net compiler (`simulation`) and a bounded one-bit runtime (`runtime`) are implemented; `sim_text` renders diagnostics for the UI. `ui` is the native adapter and `main.rs` bootstraps it; `symbols` (generated vector data), `symbol_tessellate`, `symbol_render` and `canvas` draw and pick components without involving the engine. Toolkit-independent layers must not depend on the UI.
