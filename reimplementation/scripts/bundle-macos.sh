@@ -31,7 +31,8 @@ txn=
 cleanup() {
     trap - EXIT INT TERM HUP
     # The previous bundle was moved aside but the replacement was not installed: put it back.
-    if [ -n "$txn" ] && [ -e "$txn/previous" ] && [ ! -e "$bundle" ] && [ ! -L "$bundle" ]; then
+    # -L as well as -e: a relative symlink bundle dangles once moved into $txn.
+    if [ -n "$txn" ] && { [ -e "$txn/previous" ] || [ -L "$txn/previous" ]; } && [ ! -e "$bundle" ] && [ ! -L "$bundle" ]; then
         if ! mv "$txn/previous" "$bundle"; then
             echo "error: could not restore the previous bundle; it remains at $txn/previous" >&2
             rm -rf "$work"

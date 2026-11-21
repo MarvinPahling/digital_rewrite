@@ -34,6 +34,21 @@ rm -f "$tmp/fail.log"
 [ ! -e "$bundle/Contents/rollback-marker" ] || fail "run after the failed install did not replace the bundle"
 [ "$(ls -A "$tmp")" = digital-rust.app ] || fail "leftover entries after success: $(ls -A "$tmp")"
 
+# A previous bundle that is a relative symlink dangles while moved aside; rollback must still restore it.
+linkdir="$tmp/linkdest"
+mkdir -p "$linkdir/releases/current.app"
+echo target >"$linkdir/releases/current.app/marker"
+ln -s releases/current.app "$linkdir/digital-rust.app"
+if BUNDLE_MACOS_TEST_FAIL_INSTALL=1 "$script" "$linkdir/digital-rust.app" >/dev/null 2>"$tmp/fail.log"; then
+    fail "injected install failure did not fail the script (symlink bundle)"
+fi
+rm -f "$tmp/fail.log"
+[ -L "$linkdir/digital-rust.app" ] || fail "symlink bundle was not restored"
+[ "$(readlink "$linkdir/digital-rust.app")" = releases/current.app ] || fail "restored symlink target changed"
+[ "$(cat "$linkdir/digital-rust.app/marker" 2>/dev/null)" = target ] || fail "restored symlink does not resolve"
+[ "$(ls -A "$linkdir" | sort | tr '\n' ' ')" = "digital-rust.app releases " ] || fail "leftover entries beside symlink bundle: $(ls -A "$linkdir")"
+rm -rf "$linkdir"
+
 exe="$bundle/Contents/MacOS/digital-rust"
 [ -x "$exe" ] || fail "executable bit missing on $exe"
 plutil -lint "$bundle/Contents/Info.plist" >/dev/null || fail "Info.plist is invalid"
