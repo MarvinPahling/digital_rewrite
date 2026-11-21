@@ -4,8 +4,8 @@
 #[allow(dead_code)]
 mod assets;
 mod canvas;
-mod components;
-mod domain;
+use digital_rust::components;
+use digital_rust::domain;
 mod engine;
 mod formats;
 mod symbol_render;
