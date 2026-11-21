@@ -144,10 +144,11 @@ impl Runtime {
                         net_of(id, PinDirection::Input, 1)
                     };
                     let gate = gates.len();
-                    for net in [first, second] {
-                        if !consumers[net].contains(&gate) {
-                            consumers[net].push(gate);
-                        }
+                    // `gate` is newly allocated, so the only possible duplicate is the
+                    // previous push when both inputs share a net.
+                    consumers[first].push(gate);
+                    if second != first {
+                        consumers[second].push(gate);
                     }
                     gates.push(Gate {
                         kind,
@@ -467,6 +468,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn binary_gates_are_strictly_unavailable_with_unavailable_operand() {
+        use Level::*;
+        for kind in [ComponentKind::And, ComponentKind::Or] {
+            let gate = Gate {
+                kind,
+                inputs: [0, 1],
+                output: 2,
+            };
+            for known in [Low, High, Unavailable] {
+                assert_eq!(
+                    gate.evaluate(&[Unavailable, known, Unavailable]),
+                    Unavailable
+                );
+                assert_eq!(
+                    gate.evaluate(&[known, Unavailable, Unavailable]),
+                    Unavailable
+                );
+            }
+        }
+    }
+
+    /// Input 1 -> NOT 2 -> NOT 3. Gate 4 reads NOT 2 and NOT 3, so its second microstep reads
+    /// a known High beside the still unavailable NOT 3, and output 5 shows the result.
+    fn known_beside_unavailable(kind: ComponentKind, swapped: bool) -> Document {
+        let (first, second) = if swapped { (3, 2) } else { (2, 3) };
+        document(
+            &[
+                (1, ComponentKind::Input),
+                (2, ComponentKind::Not),
+                (3, ComponentKind::Not),
+                (4, kind),
+                (5, ComponentKind::Output),
+            ],
+            &[
+                (out(1), inp(2, 0)),
+                (out(2), inp(3, 0)),
+                (out(first), inp(4, 0)),
+                (out(second), inp(4, 1)),
+                (out(4), inp(5, 0)),
+            ],
+        )
+    }
+
+    #[test]
+    fn controlling_value_does_not_short_circuit_unavailable() {
+        for (kind, final_value) in [(ComponentKind::And, Low), (ComponentKind::Or, High)] {
+            for swapped in [false, true] {
+                let mut runtime = Runtime::start(&known_beside_unavailable(kind, swapped)).unwrap();
+                assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 3 });
+                assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 2 });
+                // Gate 4 read High beside Unavailable (NOT 3 publishes only now), so
+                // OR(High, U) must not have become High.
+                assert_eq!(runtime.pin_value(out(2)), Some(High));
+                assert_eq!(runtime.pin_value(out(3)), Some(Low));
+                assert_eq!(runtime.output_value(ComponentId(5)), Some(Unavailable));
+                settled(&mut runtime);
+                assert_eq!(runtime.output_value(ComponentId(5)), Some(final_value));
+            }
+        }
+    }
+
+    #[test]
+    fn low_beside_unavailable_stays_unavailable_for_and_or() {
+        // Input 1 (Low) feeds gate 3 beside NOT 2, which is unavailable at start.
+        for kind in [ComponentKind::And, ComponentKind::Or] {
+            for swapped in [false, true] {
+                let (first, second) = if swapped { (2, 1) } else { (1, 2) };
+                let document = document(
+                    &[
+                        (1, ComponentKind::Input),
+                        (2, ComponentKind::Not),
+                        (3, kind),
+                        (4, ComponentKind::Output),
+                    ],
+                    &[
+                        (out(1), inp(2, 0)),
+                        (out(first), inp(3, 0)),
+                        (out(second), inp(3, 1)),
+                        (out(3), inp(4, 0)),
+                    ],
+                );
+                let mut runtime = Runtime::start(&document).unwrap();
+                assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 2 });
+                assert_eq!(runtime.pin_value(out(2)), Some(High));
+                assert_eq!(runtime.output_value(ComponentId(4)), Some(Unavailable));
+                settled(&mut runtime);
+                let expected = if kind == ComponentKind::And {
+                    Low
+                } else {
+                    High
+                };
+                assert_eq!(runtime.output_value(ComponentId(4)), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn wide_fanout_registers_consumers_in_linear_time() {
+        const FANOUT: u64 = 3_000;
+        let mut kinds = vec![(1, ComponentKind::Input)];
+        let mut wires = Vec::new();
+        for id in 2..FANOUT + 2 {
+            kinds.push((id, ComponentKind::Not));
+            wires.push((out(1), inp(id, 0)));
+        }
+        let document = document(&kinds, &wires);
+        let started = std::time::Instant::now();
+        let mut runtime = Runtime::start(&document).unwrap();
+        settled(&mut runtime);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(runtime.pin_value(out(2)), Some(High));
+        assert_eq!(runtime.pin_value(out(FANOUT + 1)), Some(High));
+        runtime.toggle_input(ComponentId(1)).unwrap();
+        settled(&mut runtime);
+        assert_eq!(runtime.pin_value(out(2)), Some(Low));
+        assert_eq!(runtime.pin_value(out(FANOUT + 1)), Some(Low));
+        // Each NOT is registered exactly once on the Input net, so one microstep evaluates all.
+        runtime.toggle_input(ComponentId(1)).unwrap();
+        assert_eq!(runtime.pending_gate_count(), FANOUT as usize);
     }
 
     #[test]
