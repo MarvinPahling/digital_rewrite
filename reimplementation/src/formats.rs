@@ -609,7 +609,8 @@ impl<'a> XmlParser<'a> {
     }
 
     fn parse(mut self) -> Result<Node, DigReadError> {
-        if self.bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        let consumed_bom = self.bytes.starts_with(&[0xef, 0xbb, 0xbf]);
+        if consumed_bom {
             self.at = 3;
         }
         while self.at < self.bytes.len() {
@@ -640,7 +641,7 @@ impl<'a> XmlParser<'a> {
             } else if self.starts("<!--") {
                 self.skip_comment()?;
             } else if self.starts("<?xml") && self.stack.is_empty() && self.root.is_none() {
-                if self.at != 0 && self.at != 3
+                if self.at != 0 && !(consumed_bom && self.at == 3)
                     || self
                         .bytes
                         .get(self.at + 5)
@@ -1331,6 +1332,19 @@ mod tests {
         let error = parse_v2(over_budget.as_bytes()).unwrap_err();
         assert_eq!(error.kind, DigReadErrorKind::Limit);
         assert!(error.message.contains("attribute"), "{error:?}");
+    }
+
+    #[test]
+    fn xml_declaration_must_follow_document_start_or_consumed_bom() {
+        for whitespace in [" ", "  ", "   "] {
+            let xml = format!("{whitespace}<?xml version=\"1.0\"?>{EMPTY}");
+            let error = parse_v2(xml.as_bytes()).unwrap_err();
+            assert_eq!(error.kind, DigReadErrorKind::Xml, "{whitespace:?}");
+            assert!(error.message.contains("start of the document"), "{error:?}");
+        }
+
+        let bom_declaration = format!("\u{feff}<?xml version=\"1.0\"?>{EMPTY}");
+        assert!(parse_v2(bom_declaration.as_bytes()).is_ok());
     }
 
     #[test]
