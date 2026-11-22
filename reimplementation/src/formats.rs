@@ -68,6 +68,197 @@ impl std::fmt::Display for DigReadError {
 
 impl std::error::Error for DigReadError {}
 
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigWriteErrorKind {
+    InvalidXmlCharacter,
+    Limit,
+    OutputLimit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DigWriteError {
+    pub kind: DigWriteErrorKind,
+    pub context: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for DigWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({}): {}", self.kind, self.context, self.message)
+    }
+}
+
+impl std::error::Error for DigWriteError {}
+
+impl std::fmt::Display for DigWriteErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidXmlCharacter => "invalid XML character",
+            Self::Limit => "resource limit",
+            Self::OutputLimit => "output limit",
+        })
+    }
+}
+
+/// Serialize the supported `.dig` v2 subset as deterministic UTF-8 XML.
+/// Measurement ordering is deliberately omitted because it is not represented by `DigV2`.
+pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
+    if document.elements.len() > MAX_ELEMENTS {
+        return Err(write_error(
+            DigWriteErrorKind::Limit,
+            "elements",
+            "element count exceeds 10,000",
+        ));
+    }
+    if document.wires.len() > MAX_WIRES {
+        return Err(write_error(
+            DigWriteErrorKind::Limit,
+            "wires",
+            "wire count exceeds 30,000",
+        ));
+    }
+    for (index, element) in document.elements.iter().enumerate() {
+        validate_write_string(&element.name, &format!("elements[{index}].name"))?;
+        if let Some(label) = &element.label {
+            validate_write_string(label, &format!("elements[{index}].label"))?;
+        }
+    }
+
+    let mut output = Vec::new();
+    write_bytes(&mut output, b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<circuit><version>2</version><attributes/><visualElements", "document")?;
+    write_bytes(
+        &mut output,
+        if document.elements.is_empty() {
+            b"/>"
+        } else {
+            b">"
+        },
+        "visualElements",
+    )?;
+    for (index, element) in document.elements.iter().enumerate() {
+        let context = format!("elements[{index}]");
+        write_bytes(&mut output, b"<visualElement><elementName>", &context)?;
+        write_text(&mut output, &element.name, &format!("{context}.name"))?;
+        write_bytes(&mut output, b"</elementName><elementAttributes", &context)?;
+        if let Some(label) = &element.label {
+            write_bytes(
+                &mut output,
+                b"><entry><string>Label</string><string>",
+                &context,
+            )?;
+            write_text(&mut output, label, &format!("{context}.label"))?;
+            write_bytes(
+                &mut output,
+                b"</string></entry></elementAttributes>",
+                &context,
+            )?;
+        } else {
+            write_bytes(&mut output, b"/>", &context)?;
+        }
+        write_bytes(&mut output, b"<pos x=\"", &context)?;
+        write_bytes(&mut output, element.x.to_string().as_bytes(), &context)?;
+        write_bytes(&mut output, b"\" y=\"", &context)?;
+        write_bytes(&mut output, element.y.to_string().as_bytes(), &context)?;
+        write_bytes(&mut output, b"\"/></visualElement>", &context)?;
+    }
+    if !document.elements.is_empty() {
+        write_bytes(&mut output, b"</visualElements>", "visualElements")?;
+    }
+    write_bytes(&mut output, b"<wires", "wires")?;
+    write_bytes(
+        &mut output,
+        if document.wires.is_empty() {
+            b"/>"
+        } else {
+            b">"
+        },
+        "wires",
+    )?;
+    for (index, wire) in document.wires.iter().enumerate() {
+        let context = format!("wires[{index}]");
+        write_bytes(&mut output, b"<wire><p1 x=\"", &context)?;
+        write_point(&mut output, wire.p1, &context)?;
+        write_bytes(&mut output, b"/><p2 x=\"", &context)?;
+        write_point(&mut output, wire.p2, &context)?;
+        write_bytes(&mut output, b"/></wire>", &context)?;
+    }
+    if !document.wires.is_empty() {
+        write_bytes(&mut output, b"</wires>", "wires")?;
+    }
+    write_bytes(&mut output, b"</circuit>", "document")?;
+    Ok(output)
+}
+
+fn write_point(output: &mut Vec<u8>, point: DigPoint, context: &str) -> Result<(), DigWriteError> {
+    write_bytes(output, point.x.to_string().as_bytes(), context)?;
+    write_bytes(output, b"\" y=\"", context)?;
+    write_bytes(output, point.y.to_string().as_bytes(), context)?;
+    write_bytes(output, b"\"", context)
+}
+
+fn write_bytes(output: &mut Vec<u8>, bytes: &[u8], context: &str) -> Result<(), DigWriteError> {
+    if output
+        .len()
+        .checked_add(bytes.len())
+        .is_none_or(|length| length > MAX_OUTPUT_BYTES)
+    {
+        return Err(write_error(
+            DigWriteErrorKind::OutputLimit,
+            context,
+            "serialized output exceeds 4 MiB",
+        ));
+    }
+    output.reserve_exact(bytes.len());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_text(output: &mut Vec<u8>, value: &str, context: &str) -> Result<(), DigWriteError> {
+    for ch in value.chars() {
+        let escaped: &[u8] = match ch {
+            '&' => b"&amp;",
+            '<' => b"&lt;",
+            '>' => b"&gt;",
+            '\r' => b"&#13;",
+            _ => {
+                let mut utf8 = [0; 4];
+                write_bytes(output, ch.encode_utf8(&mut utf8).as_bytes(), context)?;
+                continue;
+            }
+        };
+        write_bytes(output, escaped, context)?;
+    }
+    Ok(())
+}
+
+fn validate_write_string(value: &str, context: &str) -> Result<(), DigWriteError> {
+    if value.len() > MAX_STRING_BYTES {
+        return Err(write_error(
+            DigWriteErrorKind::Limit,
+            context,
+            "decoded string exceeds 4 KiB",
+        ));
+    }
+    if value.chars().any(|ch| !matches!(ch as u32, 0x9 | 0xa | 0xd | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)) {
+        return Err(write_error(DigWriteErrorKind::InvalidXmlCharacter, context, "string contains a character forbidden by XML 1.0"));
+    }
+    Ok(())
+}
+
+fn write_error(
+    kind: DigWriteErrorKind,
+    context: impl Into<String>,
+    message: impl Into<String>,
+) -> DigWriteError {
+    DigWriteError {
+        kind,
+        context: context.into(),
+        message: message.into(),
+    }
+}
+
 impl std::fmt::Display for DigReadErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -627,15 +818,18 @@ impl<'a> XmlParser<'a> {
                         "']]>' is forbidden in XML character data",
                     ));
                 }
-                let decoded = decode_entities(&self.source[start..self.at], start)?;
                 if let Some(parent) = self.stack.last_mut() {
+                    let decoded = decode_entities(&self.source[start..self.at], start)?;
                     parent.text.push_str(&decoded);
-                } else if !all_xml_space(&decoded) {
+                } else if let Some((relative, _)) = self.source[start..self.at]
+                    .char_indices()
+                    .find(|(_, ch)| !matches!(ch, '\t' | '\n' | '\r' | ' '))
+                {
                     return Err(error(
                         DigReadErrorKind::Xml,
-                        start,
+                        start + relative,
                         "document",
-                        "text outside root element",
+                        "text outside root element must be literal XML whitespace",
                     ));
                 }
             } else if self.starts("<!--") {
@@ -1546,6 +1740,294 @@ mod tests {
         assert_eq!(
             parse_v2(over.as_bytes()).unwrap_err().kind,
             DigReadErrorKind::Limit
+        );
+    }
+
+    #[test]
+    fn serializer_exact_empty_document_and_semantic_roundtrip() {
+        let empty = DigV2 {
+            elements: vec![],
+            wires: vec![],
+        };
+        let xml = serialize_v2(&empty).unwrap();
+        assert_eq!(xml, b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<circuit><version>2</version><attributes/><visualElements/><wires/></circuit>");
+        assert_eq!(parse_v2(&xml).unwrap(), empty);
+
+        let full = DigV2 {
+            elements: vec![
+                DigElement {
+                    name: "arbitrary & <λ>".into(),
+                    x: i32::MIN,
+                    y: i32::MAX,
+                    label: None,
+                },
+                DigElement {
+                    name: "second".into(),
+                    x: -7,
+                    y: 8,
+                    label: Some(String::new()),
+                },
+                DigElement {
+                    name: "third".into(),
+                    x: 9,
+                    y: -10,
+                    label: Some("ordered".into()),
+                },
+            ],
+            wires: vec![
+                DigWire {
+                    p1: DigPoint {
+                        x: i32::MAX,
+                        y: i32::MIN,
+                    },
+                    p2: DigPoint { x: -5, y: 6 },
+                },
+                DigWire {
+                    p1: DigPoint { x: 6, y: -5 },
+                    p2: DigPoint { x: 6, y: -5 },
+                },
+            ],
+        };
+        let bytes = serialize_v2(&full).unwrap();
+        assert_eq!(parse_v2(&bytes).unwrap(), full);
+        assert_eq!(serialize_v2(&parse_v2(&bytes).unwrap()).unwrap(), bytes);
+        assert_eq!(serialize_v2(&full).unwrap(), bytes);
+        let noncanonical = String::from_utf8(bytes.clone())
+            .unwrap()
+            .replace("<circuit>", "<circuit>\n")
+            .replace("<visualElements>", "<visualElements>\n")
+            .replace("<wires>", "<wires>\n");
+        assert_eq!(
+            serialize_v2(&parse_v2(noncanonical.as_bytes()).unwrap()).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn serializer_preserves_xml_text_characters_and_rejects_invalid_values() {
+        let value = "λ\tline\nreturn\r\r\n &amp; ]]> <";
+        let model = DigV2 {
+            elements: vec![DigElement {
+                name: "N\t\n\r".into(),
+                x: 0,
+                y: 1,
+                label: Some(value.into()),
+            }],
+            wires: vec![],
+        };
+        let bytes = serialize_v2(&model).unwrap();
+        let xml = std::str::from_utf8(&bytes).unwrap();
+        assert!(xml.contains("&#13;"));
+        assert!(xml.contains("]]&gt;"));
+        assert!(xml.contains("&amp;amp;"));
+        assert_eq!(parse_v2(&bytes).unwrap(), model);
+        for invalid in ["bad\u{1}", "bad\u{0}"] {
+            let model = DigV2 {
+                elements: vec![DigElement {
+                    name: invalid.into(),
+                    x: 0,
+                    y: 0,
+                    label: None,
+                }],
+                wires: vec![],
+            };
+            assert_eq!(
+                serialize_v2(&model).unwrap_err().context,
+                "elements[0].name"
+            );
+            let model = DigV2 {
+                elements: vec![DigElement {
+                    name: "ok".into(),
+                    x: 0,
+                    y: 0,
+                    label: Some(invalid.into()),
+                }],
+                wires: vec![],
+            };
+            assert_eq!(
+                serialize_v2(&model).unwrap_err().context,
+                "elements[0].label"
+            );
+        }
+    }
+
+    #[test]
+    fn serializer_enforces_each_model_budget_and_output_during_build() {
+        let element = DigElement {
+            name: "x".into(),
+            x: 0,
+            y: 0,
+            label: None,
+        };
+        let wire = DigWire {
+            p1: DigPoint { x: 0, y: 0 },
+            p2: DigPoint { x: 1, y: 1 },
+        };
+        assert!(
+            serialize_v2(&DigV2 {
+                elements: vec![element.clone(); MAX_ELEMENTS],
+                wires: vec![]
+            })
+            .is_ok()
+        );
+        assert!(
+            serialize_v2(&DigV2 {
+                elements: vec![],
+                wires: vec![wire.clone(); MAX_WIRES]
+            })
+            .is_ok()
+        );
+        assert_eq!(
+            serialize_v2(&DigV2 {
+                elements: vec![element.clone(); MAX_ELEMENTS + 1],
+                wires: vec![]
+            })
+            .unwrap_err()
+            .kind,
+            DigWriteErrorKind::Limit
+        );
+        assert_eq!(
+            serialize_v2(&DigV2 {
+                elements: vec![],
+                wires: vec![wire.clone(); MAX_WIRES + 1]
+            })
+            .unwrap_err()
+            .kind,
+            DigWriteErrorKind::Limit
+        );
+        assert_eq!(
+            serialize_v2(&DigV2 {
+                elements: vec![DigElement {
+                    name: "λ".repeat(MAX_STRING_BYTES / 2 + 1),
+                    ..element.clone()
+                }],
+                wires: vec![]
+            })
+            .unwrap_err()
+            .kind,
+            DigWriteErrorKind::Limit
+        );
+        assert!(
+            serialize_v2(&DigV2 {
+                elements: vec![DigElement {
+                    name: "λ".repeat(MAX_STRING_BYTES / 2),
+                    ..element.clone()
+                }],
+                wires: vec![]
+            })
+            .is_ok()
+        );
+        assert!(
+            serialize_v2(&DigV2 {
+                elements: vec![DigElement {
+                    label: Some("a".repeat(MAX_STRING_BYTES)),
+                    ..element.clone()
+                }],
+                wires: vec![]
+            })
+            .is_ok()
+        );
+        assert_eq!(
+            serialize_v2(&DigV2 {
+                elements: vec![DigElement {
+                    label: Some("a".repeat(MAX_STRING_BYTES + 1)),
+                    ..element.clone()
+                }],
+                wires: vec![]
+            })
+            .unwrap_err()
+            .context,
+            "elements[0].label"
+        );
+
+        let empty_suffix = DigElement {
+            label: Some(String::new()),
+            ..element.clone()
+        };
+        let base_empty = serialize_v2(&DigV2 {
+            elements: vec![empty_suffix.clone()],
+            wires: vec![],
+        })
+        .unwrap()
+        .len();
+        let base_full = serialize_v2(&DigV2 {
+            elements: vec![
+                DigElement {
+                    label: Some("x".repeat(MAX_STRING_BYTES)),
+                    ..element.clone()
+                },
+                empty_suffix.clone(),
+            ],
+            wires: vec![],
+        })
+        .unwrap()
+        .len();
+        let per_full = base_full - base_empty;
+        let full_labels = (MAX_OUTPUT_BYTES - base_empty) / per_full;
+        let mut elements = vec![
+            DigElement {
+                label: Some("x".repeat(MAX_STRING_BYTES)),
+                ..element.clone()
+            };
+            full_labels
+        ];
+        elements.push(empty_suffix);
+        let base = serialize_v2(&DigV2 {
+            elements: elements.clone(),
+            wires: vec![],
+        })
+        .unwrap();
+        let fill = MAX_OUTPUT_BYTES - base.len();
+        assert!(fill <= MAX_STRING_BYTES);
+        if let Some(last) = elements.last_mut() {
+            last.label = Some("z".repeat(fill));
+        }
+        assert_eq!(
+            serialize_v2(&DigV2 {
+                elements,
+                wires: vec![]
+            })
+            .unwrap()
+            .len(),
+            MAX_OUTPUT_BYTES
+        );
+        let huge = DigV2 {
+            elements: vec![
+                DigElement {
+                    name: "&".repeat(MAX_STRING_BYTES),
+                    x: 0,
+                    y: 0,
+                    label: Some("&".repeat(MAX_STRING_BYTES))
+                };
+                MAX_ELEMENTS
+            ],
+            wires: vec![],
+        };
+        assert_eq!(
+            serialize_v2(&huge).unwrap_err().kind,
+            DigWriteErrorKind::OutputLimit
+        );
+    }
+
+    #[test]
+    fn outside_root_requires_raw_xml_whitespace_but_inside_entities_are_decoded() {
+        for prefix in ["&#32;", "&#x9;"] {
+            let xml = format!("{prefix}{EMPTY}");
+            let error = parse_v2(xml.as_bytes()).unwrap_err();
+            assert_eq!(error.kind, DigReadErrorKind::Xml);
+            assert_eq!(error.offset, 0);
+            let xml = format!("{EMPTY}{prefix}");
+            let error = parse_v2(xml.as_bytes()).unwrap_err();
+            assert_eq!(error.kind, DigReadErrorKind::Xml);
+            assert_eq!(error.offset, EMPTY.len());
+        }
+        assert!(parse_v2(format!(" \t\r\n{EMPTY}\n ").as_bytes()).is_ok());
+        let label = EMPTY.replace("<visualElements/>", "<visualElements><visualElement><elementName>A</elementName><elementAttributes><entry><string>Label</string><string>&#32;&#x9;</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement></visualElements>");
+        assert_eq!(
+            parse_v2(label.as_bytes()).unwrap().elements[0]
+                .label
+                .as_deref(),
+            Some(" \t")
         );
     }
 
