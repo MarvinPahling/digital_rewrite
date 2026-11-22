@@ -3,6 +3,7 @@
 use crate::domain::{
     Component, ComponentId, ComponentKind, Document, PinRef, Position, Wire, WireId,
 };
+use crate::formats::{self, DigReadError, DigWriteError};
 use crate::runtime::{InputChange, Runtime, RuntimeError, SettleOutcome, StepOutcome};
 use crate::simulation::CompileError;
 #[derive(Default)]
@@ -46,6 +47,24 @@ impl std::fmt::Display for EditError {
 }
 impl std::error::Error for EditError {}
 #[derive(Debug, PartialEq, Eq)]
+pub enum SessionDigError {
+    SimulationActive,
+    Read(DigReadError),
+    Domain(formats::DomainCodecError),
+    Write(DigWriteError),
+}
+impl std::fmt::Display for SessionDigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SimulationActive => f.write_str("Stop the simulation before opening a document"),
+            Self::Read(e) => e.fmt(f),
+            Self::Domain(e) => e.fmt(f),
+            Self::Write(e) => e.fmt(f),
+        }
+    }
+}
+impl std::error::Error for SessionDigError {}
+#[derive(Debug, PartialEq, Eq)]
 pub enum SimulationError {
     AlreadyActive,
     NotActive,
@@ -66,6 +85,34 @@ impl std::error::Error for SimulationError {}
 impl Session {
     pub fn document(&self) -> &Document {
         &self.document
+    }
+    /// Parse and convert completely before replacing session state.
+    pub fn open_dig_bytes(&mut self, bytes: &[u8]) -> Result<(), SessionDigError> {
+        if self.runtime.is_some() {
+            return Err(SessionDigError::SimulationActive);
+        }
+        let parsed = formats::parse_v2(bytes).map_err(SessionDigError::Read)?;
+        let document = formats::to_domain(&parsed).map_err(SessionDigError::Domain)?;
+        let next_id = u64::try_from(document.components.len()).map_err(|_| {
+            SessionDigError::Domain(formats::DomainCodecError(
+                "component ID counter overflow".into(),
+            ))
+        })?;
+        let next_wire_id = u64::try_from(document.wires.len()).map_err(|_| {
+            SessionDigError::Domain(formats::DomainCodecError("wire ID counter overflow".into()))
+        })?;
+        self.document = document.clone();
+        self.saved = document;
+        self.undo.clear();
+        self.redo.clear();
+        self.next_id = next_id;
+        self.next_wire_id = next_wire_id;
+        Ok(())
+    }
+    /// Export is read-only and never marks the session saved.
+    pub fn export_dig_bytes(&self) -> Result<Vec<u8>, SessionDigError> {
+        let dig = formats::from_domain(&self.document).map_err(SessionDigError::Domain)?;
+        formats::serialize_v2(&dig).map_err(SessionDigError::Write)
     }
 
     pub fn dirty(&self) -> bool {
@@ -236,6 +283,84 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn open_is_transactional_and_success_resets_history_ids_and_dirty_state() {
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::Input, Position { x: 7.0, y: -9.0 })
+            .unwrap();
+        session.undo().unwrap();
+        session.redo().unwrap();
+        let before = snapshot(&session);
+        assert!(session.open_dig_bytes(b"not xml").is_err());
+        assert_unchanged(&session, &before);
+        let xml=b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>";
+        session.open_dig_bytes(xml).unwrap();
+        assert!(!session.dirty());
+        assert!(session.undo.is_empty());
+        assert!(session.redo.is_empty());
+        let new = session
+            .place(ComponentKind::Output, Position { x: 1.0, y: 2.0 })
+            .unwrap();
+        assert_eq!(new, ComponentId(1));
+        assert_ne!(new, id);
+    }
+    #[test]
+    fn export_is_read_only_and_open_refuses_simulation_without_mutation() {
+        let mut session = Session::default();
+        session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let before = snapshot(&session);
+        let bytes = session.export_dig_bytes().unwrap();
+        assert_eq!(bytes,b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes><entry><string>Label</string><string>Input</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>");
+        assert_unchanged(&session, &before);
+        session.start_simulation().unwrap();
+        let active = snapshot(&session);
+        assert_eq!(
+            session.open_dig_bytes(b"bad"),
+            Err(SessionDigError::SimulationActive)
+        );
+        assert_unchanged(&session, &active);
+        session.stop_simulation().unwrap();
+    }
+    #[test]
+    fn imported_geometric_netlist_roundtrips_and_simulates_truth_table() {
+        let xml=b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement><visualElement><elementName>Not</elementName><elementAttributes/><pos x=\"100\" y=\"0\"/></visualElement><visualElement><elementName>Out</elementName><elementAttributes/><pos x=\"200\" y=\"0\"/></visualElement></visualElements><wires><wire><p1 x=\"0\" y=\"0\"/><p2 x=\"100\" y=\"0\"/></wire><wire><p1 x=\"140\" y=\"0\"/><p2 x=\"200\" y=\"0\"/></wire></wires></circuit>";
+        let mut session = Session::default();
+        session.open_dig_bytes(xml).unwrap();
+        let output = ComponentId(2);
+        let input = ComponentId(0);
+        session.start_simulation().unwrap();
+        session.settle_simulation(100).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::High)
+        );
+        session.toggle_input(input).unwrap();
+        session.settle_simulation(100).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::Low)
+        );
+        session.stop_simulation().unwrap();
+        let exported = session.export_dig_bytes().unwrap();
+        let reopened =
+            crate::formats::to_domain(&crate::formats::parse_v2(&exported).unwrap()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .iter()
+                .map(|c| (c.kind, c.position))
+                .collect::<Vec<_>>(),
+            session
+                .document()
+                .components
+                .iter()
+                .map(|c| (c.kind, c.position))
+                .collect::<Vec<_>>()
+        );
+    }
     #[test]
     fn wiring_validation_history_and_cascade() {
         use crate::domain::{PinDirection, PinId};

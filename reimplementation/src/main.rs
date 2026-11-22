@@ -9,6 +9,7 @@ use digital_rust::domain;
 use digital_rust::runtime;
 use digital_rust::simulation;
 mod engine;
+mod formats;
 mod sim_text;
 mod symbol_render;
 #[cfg(test)]

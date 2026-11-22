@@ -3,6 +3,12 @@
 //! This module intentionally returns a format-specific representation; it does not
 //! resolve component names, mutate the editor document, or perform file I/O.
 
+use crate::domain::{
+    Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position, Wire,
+    WireId,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DEPTH: usize = 32;
 const MAX_ELEMENTS: usize = 10_000;
@@ -1329,6 +1335,515 @@ fn decode_entities(value: &str, offset: usize) -> Result<String, DigReadError> {
     Ok(output)
 }
 
+/// Resource cap for geometry topology/intersection validation (bounded O(n²)).
+const GEOMETRY_WORK_LIMIT: usize = 80_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainCodecError(pub String);
+impl std::fmt::Display for DomainCodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for DomainCodecError {}
+fn invalid(message: impl Into<String>) -> DomainCodecError {
+    DomainCodecError(message.into())
+}
+type Coord = (i32, i32);
+
+fn kind_from_name(name: &str) -> Option<ComponentKind> {
+    match name {
+        "In" => Some(ComponentKind::Input),
+        "Out" => Some(ComponentKind::Output),
+        "And" => Some(ComponentKind::And),
+        "Or" => Some(ComponentKind::Or),
+        "Not" => Some(ComponentKind::Not),
+        _ => None,
+    }
+}
+fn name_from_kind(kind: ComponentKind) -> &'static str {
+    match kind {
+        ComponentKind::Input => "In",
+        ComponentKind::Output => "Out",
+        ComponentKind::And => "And",
+        ComponentKind::Or => "Or",
+        ComponentKind::Not => "Not",
+    }
+}
+// Domain editor positions denote the symbol center. Digital stores its logical origin.
+fn center_offset(kind: ComponentKind) -> (i32, i32) {
+    match kind {
+        ComponentKind::And | ComponentKind::Or => (30, 20),
+        ComponentKind::Not => (20, 0),
+        ComponentKind::Input | ComponentKind::Output => (0, 0),
+    }
+}
+fn pin_offsets(kind: ComponentKind, pin: PinId) -> Option<Coord> {
+    match (kind, pin.direction, pin.index) {
+        (ComponentKind::And | ComponentKind::Or, PinDirection::Input, 0) => Some((0, 0)),
+        (ComponentKind::And | ComponentKind::Or, PinDirection::Input, 1) => Some((0, 40)),
+        (ComponentKind::And | ComponentKind::Or, PinDirection::Output, 0) => Some((60, 20)),
+        (ComponentKind::Not, PinDirection::Input, 0) => Some((0, 0)),
+        (ComponentKind::Not, PinDirection::Output, 0) => Some((40, 0)),
+        (ComponentKind::Input, PinDirection::Output, 0)
+        | (ComponentKind::Output, PinDirection::Input, 0) => Some((0, 0)),
+        _ => None,
+    }
+}
+fn exact_i32(value: f32, what: &str) -> Result<i32, DomainCodecError> {
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || (value as f64) < i32::MIN as f64
+        || (value as f64) > i32::MAX as f64
+    {
+        return Err(invalid(format!("{what} is not an exact i32 coordinate")));
+    }
+    let integer = value as i32;
+    if integer as f32 != value {
+        return Err(invalid(format!("{what} loses f32 precision")));
+    }
+    Ok(integer)
+}
+fn pin_coord(component: &Component, pin: PinId) -> Result<Coord, DomainCodecError> {
+    let x = exact_i32(component.position.x, "component x")?;
+    let y = exact_i32(component.position.y, "component y")?;
+    let offset = center_offset(component.kind);
+    let pin = pin_offsets(component.kind, pin).ok_or_else(|| invalid("invalid pin reference"))?;
+    Ok((
+        x.checked_sub(offset.0)
+            .and_then(|n| n.checked_add(pin.0))
+            .ok_or_else(|| invalid("pin x overflow"))?,
+        y.checked_sub(offset.1)
+            .and_then(|n| n.checked_add(pin.1))
+            .ok_or_else(|| invalid("pin y overflow"))?,
+    ))
+}
+fn domain_pin_coord(component: &Component, pin: PinId) -> Result<Coord, DomainCodecError> {
+    pin_coord(component, pin)
+}
+
+/// Convert a supported `.dig` v2 document to editable domain data. No simulator compilation is performed.
+pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
+    if dig.elements.len() > MAX_ELEMENTS || dig.wires.len() > MAX_WIRES {
+        return Err(invalid("document exceeds element/wire limit"));
+    }
+    let mut components = Vec::with_capacity(dig.elements.len());
+    for (index, element) in dig.elements.iter().enumerate() {
+        let kind = kind_from_name(&element.name)
+            .ok_or_else(|| invalid(format!("unsupported component {:?}", element.name)))?;
+        let (dx, dy) = center_offset(kind);
+        let x = element
+            .x
+            .checked_add(dx)
+            .ok_or_else(|| invalid("component center x overflow"))?;
+        let y = element
+            .y
+            .checked_add(dy)
+            .ok_or_else(|| invalid("component center y overflow"))?;
+        let position = Position {
+            x: x as f32,
+            y: y as f32,
+        };
+        if exact_i32(position.x, "component center x")? != x
+            || exact_i32(position.y, "component center y")? != y
+        {
+            return Err(invalid("component position loses f32 precision"));
+        }
+        components.push(Component {
+            id: ComponentId(index as u64),
+            kind,
+            position,
+            label: element.label.clone().unwrap_or_default(),
+        });
+    }
+    let mut document = Document {
+        components,
+        wires: Vec::new(),
+    };
+    let pins = all_pins(&document)?;
+    let pin_at = unique_pin_coordinates(&pins)?;
+    let groups = geometry_groups(&dig.wires, &pin_at)?;
+    let mut edges = BTreeSet::new();
+    for group in groups {
+        if group.len() < 2 {
+            return Err(invalid("wire net must connect at least two pins"));
+        }
+        let first = group[0];
+        for &other in &group[1..] {
+            edges.insert(canonical_pair(first, other));
+        }
+    }
+    if edges.len() > MAX_WIRES {
+        return Err(invalid("normalized wire limit exceeded"));
+    }
+    document.wires = edges
+        .into_iter()
+        .enumerate()
+        .map(|(index, endpoints)| Wire {
+            id: WireId(index as u64),
+            endpoints,
+        })
+        .collect();
+    Ok(document)
+}
+fn canonical_pair(a: PinRef, b: PinRef) -> [PinRef; 2] {
+    if a <= b { [a, b] } else { [b, a] }
+}
+fn all_pins(doc: &Document) -> Result<Vec<(PinRef, Coord)>, DomainCodecError> {
+    let mut ids = BTreeSet::new();
+    let mut pins = Vec::new();
+    for c in &doc.components {
+        if !ids.insert(c.id) {
+            return Err(invalid("duplicate component ID"));
+        }
+        if !c.position.valid() {
+            return Err(invalid("non-finite component position"));
+        }
+        for direction in [PinDirection::Input, PinDirection::Output] {
+            for index in 0..3 {
+                let pin = PinId { direction, index };
+                if c.kind.has_pin(pin) {
+                    pins.push((
+                        PinRef {
+                            component: c.id,
+                            pin,
+                        },
+                        domain_pin_coord(c, pin)?,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(pins)
+}
+fn unique_pin_coordinates(
+    pins: &[(PinRef, Coord)],
+) -> Result<BTreeMap<Coord, PinRef>, DomainCodecError> {
+    let mut map = BTreeMap::new();
+    for &(pin, coord) in pins {
+        if map.insert(coord, pin).is_some() {
+            return Err(invalid("coincident component pins are unsupported"));
+        }
+    }
+    Ok(map)
+}
+fn geometry_groups(
+    wires: &[DigWire],
+    pin_at: &BTreeMap<Coord, PinRef>,
+) -> Result<Vec<Vec<PinRef>>, DomainCodecError> {
+    if wires.len() > MAX_WIRES {
+        return Err(invalid("wire count exceeds limit"));
+    }
+    let work = wires
+        .len()
+        .checked_mul(wires.len().saturating_sub(1))
+        .and_then(|n| n.checked_div(2))
+        .and_then(|n| n.checked_add(wires.len().checked_mul(pin_at.len())?))
+        .ok_or_else(|| invalid("geometry work overflow"))?;
+    if work > GEOMETRY_WORK_LIMIT {
+        return Err(invalid("wire geometry validation work budget exceeded"));
+    }
+    let mut adj: BTreeMap<Coord, Vec<Coord>> = BTreeMap::new();
+    for w in wires {
+        let a = (w.p1.x, w.p1.y);
+        let b = (w.p2.x, w.p2.y);
+        if a == b {
+            return Err(invalid("zero-length wire"));
+        }
+        if a.0 != b.0 && a.1 != b.1 {
+            return Err(invalid("diagonal wire"));
+        }
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
+    }
+    // Reject collinear overlap and endpoint-on-segment normalization cases; proper crossings stay disconnected.
+    for i in 0..wires.len() {
+        for j in i + 1..wires.len() {
+            let a = &wires[i];
+            let b = &wires[j];
+            let (a1, a2) = ((a.p1.x, a.p1.y), (a.p2.x, a.p2.y));
+            let (b1, b2) = ((b.p1.x, b.p1.y), (b.p2.x, b.p2.y));
+            let ah = a1.1 == a2.1;
+            let bh = b1.1 == b2.1;
+            if ah == bh {
+                if ah && a1.1 == b1.1 && ranges_overlap(a1.0, a2.0, b1.0, b2.0)
+                    || !ah && a1.0 == b1.0 && ranges_overlap(a1.1, a2.1, b1.1, b2.1)
+                {
+                    let common = [a1, a2]
+                        .into_iter()
+                        .filter(|p| *p == b1 || *p == b2)
+                        .count();
+                    if common != 1 {
+                        return Err(invalid("overlapping or duplicate wire segments"));
+                    }
+                }
+            } else {
+                let (h1, h2, v1, v2) = if ah {
+                    (a1, a2, b1, b2)
+                } else {
+                    (b1, b2, a1, a2)
+                };
+                let cross = (v1.0, h1.1);
+                if between(cross.0, h1.0, h2.0) && between(cross.1, v1.1, v2.1) {
+                    let on_h_endpoint = cross == h1 || cross == h2;
+                    let on_v_endpoint = cross == v1 || cross == v2;
+                    if on_h_endpoint != on_v_endpoint {
+                        return Err(invalid(
+                            "wire endpoint or pin on segment interior requires normalization",
+                        ));
+                    }
+                    // Interior crossings deliberately do not connect.
+                }
+            }
+        }
+    }
+    // Every geometric junction is explicit at a shared endpoint. Non-pin bends must have degree 2.
+    for (point, neighbors) in &adj {
+        if !pin_at.contains_key(point) && neighbors.len() != 2 {
+            return Err(invalid(
+                "dangling endpoint or non-pin branch in wire geometry",
+            ));
+        }
+    }
+    for point in pin_at.keys() {
+        if wires.iter().any(|w| point_on_interior(*point, w)) {
+            return Err(invalid("pin on segment interior requires normalization"));
+        }
+    }
+    // Reject loops and routed pin-to-pin paths with more than one bend.
+    let mut graph_seen = BTreeSet::new();
+    for start in adj.keys().copied() {
+        if graph_seen.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![(start, None)];
+        graph_seen.insert(start);
+        while let Some((point, parent)) = stack.pop() {
+            for next in &adj[&point] {
+                if Some(*next) == parent {
+                    continue;
+                }
+                if !graph_seen.insert(*next) {
+                    return Err(invalid("wire loops are unsupported"));
+                }
+                stack.push((*next, Some(point)));
+            }
+        }
+    }
+    for start in pin_at.keys() {
+        if let Some(firsts) = adj.get(start) {
+            for first in firsts {
+                let mut previous = *start;
+                let mut current = *first;
+                let mut prior_horizontal = previous.1 == current.1;
+                let mut turns = 0;
+                while !pin_at.contains_key(&current) {
+                    let nexts = &adj[&current];
+                    let next = if nexts[0] == previous {
+                        nexts[1]
+                    } else {
+                        nexts[0]
+                    };
+                    let horizontal = current.1 == next.1;
+                    if horizontal != prior_horizontal {
+                        turns += 1;
+                        prior_horizontal = horizontal;
+                    }
+                    if turns > 1 {
+                        return Err(invalid("wire path has more than one bend"));
+                    }
+                    previous = current;
+                    current = next;
+                }
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut groups = Vec::new();
+    for start in adj.keys().copied() {
+        if seen.contains(&start) {
+            continue;
+        }
+        let mut queue = VecDeque::from([start]);
+        let mut pins = Vec::new();
+        seen.insert(start);
+        while let Some(p) = queue.pop_front() {
+            if let Some(pin) = pin_at.get(&p) {
+                pins.push(*pin)
+            }
+            for next in &adj[&p] {
+                if seen.insert(*next) {
+                    queue.push_back(*next)
+                }
+            }
+        }
+        pins.sort();
+        groups.push(pins);
+    }
+    groups.sort();
+    Ok(groups)
+}
+fn ranges_overlap(a: i32, b: i32, c: i32, d: i32) -> bool {
+    a.min(b) < c.max(d) && c.min(d) < a.max(b)
+}
+fn between(v: i32, a: i32, b: i32) -> bool {
+    v >= a.min(b) && v <= a.max(b)
+}
+fn point_on_interior(p: Coord, w: &DigWire) -> bool {
+    if w.p1.x == w.p2.x {
+        p.0 == w.p1.x && between(p.1, w.p1.y, w.p2.y) && p.1 != w.p1.y && p.1 != w.p2.y
+    } else {
+        p.1 == w.p1.y && between(p.0, w.p1.x, w.p2.x) && p.0 != w.p1.x && p.0 != w.p2.x
+    }
+}
+
+/// Convert editable data to the supported Digital v2 representation, validating resulting geometric nets.
+pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
+    if doc.components.len() > MAX_ELEMENTS || doc.wires.len() > MAX_WIRES {
+        return Err(invalid("document exceeds element/wire limit"));
+    }
+    let mut ids = BTreeSet::new();
+    let mut elements = Vec::with_capacity(doc.components.len());
+    for c in &doc.components {
+        if !ids.insert(c.id) {
+            return Err(invalid("duplicate component ID"));
+        }
+        let x = exact_i32(c.position.x, "component center x")?;
+        let y = exact_i32(c.position.y, "component center y")?;
+        let (dx, dy) = center_offset(c.kind);
+        let ox = x
+            .checked_sub(dx)
+            .ok_or_else(|| invalid("component origin x overflow"))?;
+        let oy = y
+            .checked_sub(dy)
+            .ok_or_else(|| invalid("component origin y overflow"))?;
+        if ox as f32 + dx as f32 != c.position.x || oy as f32 + dy as f32 != c.position.y {
+            return Err(invalid("component coordinate loses f32 precision"));
+        }
+        elements.push(DigElement {
+            name: name_from_kind(c.kind).into(),
+            x: ox,
+            y: oy,
+            label: if c.label.is_empty() {
+                None
+            } else {
+                Some(c.label.clone())
+            },
+        });
+    }
+    let pins = all_pins(doc)?;
+    let pin_at = unique_pin_coordinates(&pins)?;
+    let pin_coords: BTreeMap<PinRef, Coord> =
+        pins.iter().map(|(pin, coord)| (*pin, *coord)).collect();
+    let components_by_id: BTreeMap<ComponentId, &Component> = doc
+        .components
+        .iter()
+        .map(|component| (component.id, component))
+        .collect();
+    let mut seen_wire_ids = BTreeSet::new();
+    let mut seen_edges = BTreeSet::new();
+    let mut wires = Vec::with_capacity(doc.wires.len());
+    for w in &doc.wires {
+        if !seen_wire_ids.insert(w.id.0) {
+            return Err(invalid("duplicate wire ID"));
+        }
+        let [a, b] = w.endpoints;
+        if a == b {
+            return Err(invalid("self-connected wire"));
+        }
+        for p in [a, b] {
+            if !ids.contains(&p.component) {
+                return Err(invalid("wire references missing component"));
+            }
+            let c = components_by_id
+                .get(&p.component)
+                .ok_or_else(|| invalid("wire references missing component"))?;
+            if !c.kind.has_pin(p.pin) {
+                return Err(invalid("wire references invalid pin"));
+            }
+        }
+        let pair = canonical_pair(a, b);
+        if !seen_edges.insert(pair) {
+            return Err(invalid("duplicate wire edge"));
+        }
+        let a = *pin_coords.get(&a).ok_or_else(|| invalid("unknown pin"))?;
+        let b = *pin_coords.get(&b).ok_or_else(|| invalid("unknown pin"))?;
+        let bend = (b.0, a.1);
+        let points = if bend == a || bend == b {
+            vec![a, b]
+        } else {
+            vec![a, bend, b]
+        };
+        for pair in points.windows(2) {
+            wires.push(DigWire {
+                p1: DigPoint {
+                    x: pair[0].0,
+                    y: pair[0].1,
+                },
+                p2: DigPoint {
+                    x: pair[1].0,
+                    y: pair[1].1,
+                },
+            });
+        }
+    }
+    let groups = geometry_groups(&wires, &pin_at)?;
+    let mut expected: BTreeMap<PinRef, usize> = pins
+        .iter()
+        .enumerate()
+        .map(|(i, (p, _))| (*p, groups.len() + i))
+        .collect();
+    for (n, g) in groups.iter().enumerate() {
+        for p in g {
+            expected.insert(*p, n);
+        }
+    }
+    let mut actual: BTreeMap<PinRef, PinRef> = BTreeMap::new();
+    let mut parent: BTreeMap<PinRef, PinRef> = pins.iter().map(|(p, _)| (*p, *p)).collect();
+    fn root(parent: &mut BTreeMap<PinRef, PinRef>, p: PinRef) -> PinRef {
+        let mut current = p;
+        while parent[&current] != current {
+            current = parent[&current];
+        }
+        let representative = current;
+        let mut current = p;
+        while parent[&current] != current {
+            let next = parent[&current];
+            parent.insert(current, representative);
+            current = next;
+        }
+        representative
+    }
+    for w in &doc.wires {
+        let a = root(&mut parent, w.endpoints[0]);
+        let b = root(&mut parent, w.endpoints[1]);
+        parent.insert(a, b);
+    }
+    for (p, _) in &pins {
+        actual.insert(*p, root(&mut parent, *p));
+    }
+    let mut expected_to_actual = BTreeMap::new();
+    let mut actual_to_expected = BTreeMap::new();
+    for (pin, _) in &pins {
+        let e = expected[pin];
+        let a = actual[pin];
+        if expected_to_actual
+            .insert(e, a)
+            .is_some_and(|previous| previous != a)
+            || actual_to_expected
+                .insert(a, e)
+                .is_some_and(|previous| previous != e)
+        {
+            return Err(invalid(
+                "wire geometry changes explicit pin-net connectivity",
+            ));
+        }
+    }
+    let dig = DigV2 { elements, wires };
+    serialize_v2(&dig).map_err(|e| invalid(e.to_string()))?;
+    Ok(dig)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1347,6 +1862,383 @@ mod tests {
         assert_eq!(err.kind, kind, "{err:?}");
         assert!(err.context.contains(context), "{err:?}");
         err
+    }
+
+    #[test]
+    fn domain_conversion_supports_all_kinds_offsets_negative_positions_and_unicode_labels() {
+        let source = DigV2 {
+            elements: vec![
+                DigElement {
+                    name: "In".into(),
+                    x: -31,
+                    y: -12,
+                    label: Some("λ input".into()),
+                },
+                DigElement {
+                    name: "Out".into(),
+                    x: 18,
+                    y: -2,
+                    label: Some(String::new()),
+                },
+                DigElement {
+                    name: "And".into(),
+                    x: -100,
+                    y: 40,
+                    label: None,
+                },
+                DigElement {
+                    name: "Or".into(),
+                    x: 3,
+                    y: 7,
+                    label: Some("OR".into()),
+                },
+                DigElement {
+                    name: "Not".into(),
+                    x: -20,
+                    y: -4,
+                    label: None,
+                },
+            ],
+            wires: vec![],
+        };
+        let domain = to_domain(&source).unwrap();
+        assert_eq!(
+            domain.components.iter().map(|c| c.id.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            domain
+                .components
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["λ input", "", "", "OR", ""]
+        );
+        assert_eq!(
+            from_domain(&domain).unwrap(),
+            DigV2 {
+                elements: source
+                    .elements
+                    .iter()
+                    .cloned()
+                    .map(|mut e| {
+                        if e.label.as_deref() == Some("") {
+                            e.label = None
+                        }
+                        e
+                    })
+                    .collect(),
+                wires: vec![]
+            }
+        );
+    }
+    #[test]
+    fn geometry_roundtrips_simple_segments_and_rejects_bad_geometry() {
+        use crate::domain::*;
+        let input = Component {
+            id: ComponentId(1),
+            kind: ComponentKind::Input,
+            position: Position { x: 0., y: 0. },
+            label: String::new(),
+        };
+        let output = Component {
+            id: ComponentId(2),
+            kind: ComponentKind::Output,
+            position: Position { x: 100., y: 0. },
+            label: String::new(),
+        };
+        let doc = Document {
+            components: vec![input.clone(), output.clone()],
+            wires: vec![Wire {
+                id: WireId(5),
+                endpoints: [
+                    PinRef {
+                        component: input.id,
+                        pin: PinId {
+                            direction: PinDirection::Output,
+                            index: 0,
+                        },
+                    },
+                    PinRef {
+                        component: output.id,
+                        pin: PinId {
+                            direction: PinDirection::Input,
+                            index: 0,
+                        },
+                    },
+                ],
+            }],
+        };
+        let xml = serialize_v2(&from_domain(&doc).unwrap()).unwrap();
+        let reopened = to_domain(&parse_v2(&xml).unwrap()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .iter()
+                .map(|c| (c.kind, c.position, c.label.as_str()))
+                .collect::<Vec<_>>(),
+            doc.components
+                .iter()
+                .map(|c| (c.kind, c.position, c.label.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reopened.wires.len(), 1);
+        for geometry in [
+            vec![DigWire {
+                p1: DigPoint { x: 0, y: 0 },
+                p2: DigPoint { x: 0, y: 0 },
+            }],
+            vec![DigWire {
+                p1: DigPoint { x: 0, y: 0 },
+                p2: DigPoint { x: 1, y: 1 },
+            }],
+            vec![DigWire {
+                p1: DigPoint { x: 0, y: 0 },
+                p2: DigPoint { x: 100, y: 0 },
+            }],
+        ] {
+            assert!(
+                geometry_groups(
+                    &geometry,
+                    &BTreeMap::from([(
+                        (0, 0),
+                        PinRef {
+                            component: ComponentId(0),
+                            pin: PinId {
+                                direction: PinDirection::Output,
+                                index: 0
+                            }
+                        }
+                    )])
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn fanout_and_disconnected_crossings_follow_endpoint_topology() {
+        let pin = |id| PinRef {
+            component: crate::domain::ComponentId(id),
+            pin: crate::domain::PinId {
+                direction: crate::domain::PinDirection::Output,
+                index: 0,
+            },
+        };
+        let fanout = vec![
+            DigWire {
+                p1: DigPoint { x: 0, y: 0 },
+                p2: DigPoint { x: 10, y: 0 },
+            },
+            DigWire {
+                p1: DigPoint { x: 10, y: 0 },
+                p2: DigPoint { x: 10, y: 10 },
+            },
+            DigWire {
+                p1: DigPoint { x: 10, y: 0 },
+                p2: DigPoint { x: 20, y: 0 },
+            },
+        ];
+        let fan_pins = BTreeMap::from([
+            ((0, 0), pin(1)),
+            ((10, 0), pin(2)),
+            ((10, 10), pin(3)),
+            ((20, 0), pin(4)),
+        ]);
+        assert_eq!(
+            geometry_groups(&fanout, &fan_pins).unwrap(),
+            vec![vec![pin(1), pin(2), pin(3), pin(4)]]
+        );
+        let crossing = vec![
+            DigWire {
+                p1: DigPoint { x: 0, y: 5 },
+                p2: DigPoint { x: 10, y: 5 },
+            },
+            DigWire {
+                p1: DigPoint { x: 5, y: 0 },
+                p2: DigPoint { x: 5, y: 10 },
+            },
+        ];
+        let crossing_pins = BTreeMap::from([
+            ((0, 5), pin(1)),
+            ((10, 5), pin(2)),
+            ((5, 0), pin(3)),
+            ((5, 10), pin(4)),
+        ]);
+        assert_eq!(geometry_groups(&crossing, &crossing_pins).unwrap().len(), 2);
+        let reversed_bend = vec![
+            DigWire {
+                p1: DigPoint { x: 0, y: 10 },
+                p2: DigPoint { x: 0, y: 0 },
+            },
+            DigWire {
+                p1: DigPoint { x: 10, y: 10 },
+                p2: DigPoint { x: 0, y: 10 },
+            },
+        ];
+        let bend_pins = BTreeMap::from([((0, 0), pin(5)), ((10, 10), pin(6))]);
+        assert_eq!(
+            geometry_groups(&reversed_bend, &bend_pins).unwrap(),
+            vec![vec![pin(5), pin(6)]]
+        );
+        let t = vec![
+            DigWire {
+                p1: DigPoint { x: 0, y: 0 },
+                p2: DigPoint { x: 10, y: 0 },
+            },
+            DigWire {
+                p1: DigPoint { x: 5, y: 0 },
+                p2: DigPoint { x: 5, y: 5 },
+            },
+        ];
+        assert!(geometry_groups(&t, &BTreeMap::new()).is_err());
+        let over_budget = (0..401)
+            .map(|i| DigWire {
+                p1: DigPoint { x: i * 2, y: 0 },
+                p2: DigPoint { x: i * 2 + 1, y: 0 },
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            geometry_groups(&over_budget, &BTreeMap::new())
+                .unwrap_err()
+                .0
+                .contains("budget")
+        );
+    }
+    #[test]
+    fn export_and_import_canonical_one_bend_wire() {
+        use crate::domain::*;
+        let a = Component {
+            id: ComponentId(1),
+            kind: ComponentKind::Input,
+            position: Position { x: 0., y: 0. },
+            label: String::new(),
+        };
+        let b = Component {
+            id: ComponentId(2),
+            kind: ComponentKind::Output,
+            position: Position { x: 100., y: 80. },
+            label: String::new(),
+        };
+        let doc = Document {
+            components: vec![a.clone(), b.clone()],
+            wires: vec![Wire {
+                id: WireId(9),
+                endpoints: [
+                    PinRef {
+                        component: a.id,
+                        pin: PinId {
+                            direction: PinDirection::Output,
+                            index: 0,
+                        },
+                    },
+                    PinRef {
+                        component: b.id,
+                        pin: PinId {
+                            direction: PinDirection::Input,
+                            index: 0,
+                        },
+                    },
+                ],
+            }],
+        };
+        let dig = from_domain(&doc).unwrap();
+        assert_eq!(dig.wires.len(), 2);
+        let restored = to_domain(&dig).unwrap();
+        assert_eq!(restored.wires.len(), 1);
+        assert_eq!(restored.components[1].position, b.position);
+    }
+    #[test]
+    fn export_refuses_geometry_that_accidentally_joins_explicit_nets() {
+        use crate::domain::*;
+        let component = |id, kind, x, y| Component {
+            id: ComponentId(id),
+            kind,
+            position: Position { x, y },
+            label: String::new(),
+        };
+        let input = |id| PinRef {
+            component: ComponentId(id),
+            pin: PinId {
+                direction: PinDirection::Output,
+                index: 0,
+            },
+        };
+        let output = |id| PinRef {
+            component: ComponentId(id),
+            pin: PinId {
+                direction: PinDirection::Input,
+                index: 0,
+            },
+        };
+        let doc = Document {
+            components: vec![
+                component(1, ComponentKind::Input, 0., 0.),
+                component(2, ComponentKind::Output, 100., 0.),
+                component(3, ComponentKind::Input, 50., 0.),
+                component(4, ComponentKind::Output, 50., 50.),
+            ],
+            wires: vec![
+                Wire {
+                    id: WireId(0),
+                    endpoints: [input(1), output(2)],
+                },
+                Wire {
+                    id: WireId(1),
+                    endpoints: [input(3), output(4)],
+                },
+            ],
+        };
+        assert!(from_domain(&doc).unwrap_err().0.contains("interior"));
+    }
+    #[test]
+    fn exact_coordinate_and_bad_reference_validation() {
+        use crate::domain::*;
+        let fractional = Document {
+            components: vec![Component {
+                id: ComponentId(1),
+                kind: ComponentKind::Input,
+                position: Position { x: 0.5, y: 0.0 },
+                label: String::new(),
+            }],
+            wires: vec![],
+        };
+        assert!(from_domain(&fractional).is_err());
+        let f32_i32_overflow = Document {
+            components: vec![Component {
+                id: ComponentId(2),
+                kind: ComponentKind::Input,
+                position: Position {
+                    x: i32::MAX as f32,
+                    y: 0.0,
+                },
+                label: String::new(),
+            }],
+            wires: vec![],
+        };
+        assert!(from_domain(&f32_i32_overflow).is_err());
+        let bad = Document {
+            components: vec![],
+            wires: vec![Wire {
+                id: WireId(1),
+                endpoints: [
+                    PinRef {
+                        component: ComponentId(8),
+                        pin: PinId {
+                            direction: PinDirection::Input,
+                            index: 0,
+                        },
+                    },
+                    PinRef {
+                        component: ComponentId(9),
+                        pin: PinId {
+                            direction: PinDirection::Input,
+                            index: 0,
+                        },
+                    },
+                ],
+            }],
+        };
+        assert!(from_domain(&bad).is_err());
     }
 
     #[test]
