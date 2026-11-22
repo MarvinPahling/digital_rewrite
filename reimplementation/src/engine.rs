@@ -313,7 +313,7 @@ mod tests {
             .unwrap();
         let before = snapshot(&session);
         let bytes = session.export_dig_bytes().unwrap();
-        assert_eq!(bytes,b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes><entry><string>Label</string><string>Input</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>");
+        assert_eq!(bytes,b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes><entry><string>Label</string><string>Input</string></entry></elementAttributes><pos x=\"18\" y=\"0\"/></visualElement></visualElements><wires/></circuit>");
         assert_unchanged(&session, &before);
         session.start_simulation().unwrap();
         let active = snapshot(&session);

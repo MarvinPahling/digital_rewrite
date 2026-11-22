@@ -148,6 +148,25 @@ pub fn symbol(style: SymbolStyle, kind: ComponentKind) -> Option<&'static Symbol
         .find(|def| def.style == style && def.kind == kind)
 }
 
+/// Origin offset from the editor's component position, which denotes the artwork-bounds center.
+/// Kept toolkit-neutral so drawing and document-format adapters place pins identically.
+pub fn origin_from_center(style: SymbolStyle, kind: ComponentKind, center: Point) -> Option<Point> {
+    let bounds = symbol(style, kind)?.bounds;
+    Some([
+        center[0] - (bounds.min[0] + bounds.max[0]) * 0.5,
+        center[1] - (bounds.min[1] + bounds.max[1]) * 0.5,
+    ])
+}
+
+/// Center offset from the logical symbol origin used by Digital's element position.
+pub fn center_from_origin_offset(style: SymbolStyle, kind: ComponentKind) -> Option<Point> {
+    let bounds = symbol(style, kind)?.bounds;
+    Some([
+        (bounds.min[0] + bounds.max[0]) * 0.5,
+        (bounds.min[1] + bounds.max[1]) * 0.5,
+    ])
+}
+
 /// Iterates all symbol definitions in manifest order.
 #[cfg(test)]
 pub fn symbols() -> impl Iterator<Item = &'static SymbolDef> {

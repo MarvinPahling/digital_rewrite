@@ -1370,13 +1370,15 @@ fn name_from_kind(kind: ComponentKind) -> &'static str {
         ComponentKind::Not => "Not",
     }
 }
-// Domain editor positions denote the symbol center. Digital stores its logical origin.
-fn center_offset(kind: ComponentKind) -> (i32, i32) {
-    match kind {
-        ComponentKind::And | ComponentKind::Or => (30, 20),
-        ComponentKind::Not => (20, 0),
-        ComponentKind::Input | ComponentKind::Output => (0, 0),
-    }
+// Domain editor positions denote the artwork bounds center. Digital stores its logical origin;
+// share the renderer's toolkit-neutral placement metrics to keep pins aligned with the artwork.
+fn center_offset(kind: ComponentKind) -> Result<(i32, i32), DomainCodecError> {
+    let offset = crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)
+        .ok_or_else(|| invalid("component kind has no default symbol"))?;
+    Ok((
+        exact_i32(offset[0], "symbol center x offset")?,
+        exact_i32(offset[1], "symbol center y offset")?,
+    ))
 }
 fn pin_offsets(kind: ComponentKind, pin: PinId) -> Option<Coord> {
     match (kind, pin.direction, pin.index) {
@@ -1407,7 +1409,7 @@ fn exact_i32(value: f32, what: &str) -> Result<i32, DomainCodecError> {
 fn pin_coord(component: &Component, pin: PinId) -> Result<Coord, DomainCodecError> {
     let x = exact_i32(component.position.x, "component x")?;
     let y = exact_i32(component.position.y, "component y")?;
-    let offset = center_offset(component.kind);
+    let offset = center_offset(component.kind)?;
     let pin = pin_offsets(component.kind, pin).ok_or_else(|| invalid("invalid pin reference"))?;
     Ok((
         x.checked_sub(offset.0)
@@ -1431,7 +1433,7 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
     for (index, element) in dig.elements.iter().enumerate() {
         let kind = kind_from_name(&element.name)
             .ok_or_else(|| invalid(format!("unsupported component {:?}", element.name)))?;
-        let (dx, dy) = center_offset(kind);
+        let (dx, dy) = center_offset(kind)?;
         let x = element
             .x
             .checked_add(dx)
@@ -1462,14 +1464,27 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
     };
     let pins = all_pins(&document)?;
     let pin_at = unique_pin_coordinates(&pins)?;
+    let coordinate_by_pin: BTreeMap<PinRef, Coord> =
+        pins.iter().map(|(pin, coord)| (*pin, *coord)).collect();
     let groups = geometry_groups(&dig.wires, &pin_at)?;
     let mut edges = BTreeSet::new();
     for group in groups {
         if group.len() < 2 {
             return Err(invalid("wire net must connect at least two pins"));
         }
-        let first = group[0];
-        for &other in &group[1..] {
+        // IDs follow XML order and must not influence which geometric pin is used as the
+        // canonical fanout root; otherwise reordering elements changes exported routes.
+        let mut by_position = Vec::with_capacity(group.len());
+        for pin in group {
+            let position = coordinate_by_pin
+                .get(&pin)
+                .copied()
+                .ok_or_else(|| invalid("wire net references unknown pin"))?;
+            by_position.push((position, pin));
+        }
+        by_position.sort();
+        let first = by_position[0].1;
+        for &(_, other) in &by_position[1..] {
             edges.insert(canonical_pair(first, other));
         }
     }
@@ -1569,13 +1584,10 @@ fn geometry_groups(
                 if ah && a1.1 == b1.1 && ranges_overlap(a1.0, a2.0, b1.0, b2.0)
                     || !ah && a1.0 == b1.0 && ranges_overlap(a1.1, a2.1, b1.1, b2.1)
                 {
-                    let common = [a1, a2]
-                        .into_iter()
-                        .filter(|p| *p == b1 || *p == b2)
-                        .count();
-                    if common != 1 {
-                        return Err(invalid("overlapping or duplicate wire segments"));
-                    }
+                    // Any positive-length collinear intersection is overlapping geometry,
+                    // even if the segments also share an endpoint. Adjacent segments meet
+                    // at one point and do not satisfy ranges_overlap.
+                    return Err(invalid("overlapping or duplicate wire segments"));
                 }
             } else {
                 let (h1, h2, v1, v2) = if ah {
@@ -1710,7 +1722,7 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
         }
         let x = exact_i32(c.position.x, "component center x")?;
         let y = exact_i32(c.position.y, "component center y")?;
-        let (dx, dy) = center_offset(c.kind);
+        let (dx, dy) = center_offset(c.kind)?;
         let ox = x
             .checked_sub(dx)
             .ok_or_else(|| invalid("component origin x overflow"))?;
@@ -1766,23 +1778,25 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
         if !seen_edges.insert(pair) {
             return Err(invalid("duplicate wire edge"));
         }
-        let a = *pin_coords.get(&a).ok_or_else(|| invalid("unknown pin"))?;
-        let b = *pin_coords.get(&b).ok_or_else(|| invalid("unknown pin"))?;
-        let bend = (b.0, a.1);
-        let points = if bend == a || bend == b {
-            vec![a, b]
-        } else {
-            vec![a, bend, b]
-        };
-        for pair in points.windows(2) {
+        let route_a = *pin_coords
+            .get(&pair[0])
+            .ok_or_else(|| invalid("unknown pin"))?;
+        let route_b = *pin_coords
+            .get(&pair[1])
+            .ok_or_else(|| invalid("unknown pin"))?;
+        let route = crate::wire_geometry::path(
+            (pair[0], [route_a.0 as f32, route_a.1 as f32]),
+            (pair[1], [route_b.0 as f32, route_b.1 as f32]),
+        );
+        for segment in route.windows(2) {
             wires.push(DigWire {
                 p1: DigPoint {
-                    x: pair[0].0,
-                    y: pair[0].1,
+                    x: exact_i32(segment[0][0], "wire x")?,
+                    y: exact_i32(segment[0][1], "wire y")?,
                 },
                 p2: DigPoint {
-                    x: pair[1].0,
-                    y: pair[1].1,
+                    x: exact_i32(segment[1][0], "wire x")?,
+                    y: exact_i32(segment[1][1], "wire y")?,
                 },
             });
         }
@@ -1933,6 +1947,55 @@ mod tests {
         );
     }
     #[test]
+    fn codec_pin_placement_matches_render_anchors_for_every_component_kind() {
+        use crate::domain::*;
+        use crate::{symbol_render::SymbolLayout, symbols::SymbolStyle};
+        for kind in [
+            ComponentKind::Input,
+            ComponentKind::Output,
+            ComponentKind::And,
+            ComponentKind::Or,
+            ComponentKind::Not,
+        ] {
+            let (dx, dy) = center_offset(kind).unwrap();
+            let component = Component {
+                id: ComponentId(0),
+                kind,
+                position: Position {
+                    x: dx as f32,
+                    y: dy as f32,
+                },
+                label: String::new(),
+            };
+            let layout =
+                SymbolLayout::centered_on(SymbolStyle::Rect, kind, [dx as f32, dy as f32]).unwrap();
+            for (pin, coord) in all_pins(&Document {
+                components: vec![component.clone()],
+                wires: vec![],
+            })
+            .unwrap()
+            {
+                let anchor = layout.pin_position(pin.pin).unwrap();
+                assert_eq!(
+                    coord,
+                    (anchor[0] as i32, anchor[1] as i32),
+                    "{kind:?} {pin:?}"
+                );
+            }
+            let encoded = from_domain(&Document {
+                components: vec![component],
+                wires: vec![],
+            })
+            .unwrap();
+            assert_eq!(
+                (encoded.elements[0].x, encoded.elements[0].y),
+                (0, 0),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn geometry_roundtrips_simple_segments_and_rejects_bad_geometry() {
         use crate::domain::*;
         let input = Component {
@@ -2015,6 +2078,79 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn fanout_net_normalization_is_independent_of_xml_element_order() {
+        let wires = vec![
+            DigWire {
+                p1: DigPoint { x: 100, y: 0 },
+                p2: DigPoint { x: 0, y: 0 },
+            },
+            DigWire {
+                p1: DigPoint { x: 0, y: 0 },
+                p2: DigPoint { x: 0, y: 100 },
+            },
+        ];
+        // XML order: output at (100,0), input at (0,0), output at (0,100).
+        for elements in [
+            vec![("Out", 100, 0), ("In", 0, 0), ("Out", 0, 100)],
+            vec![("Out", 0, 100), ("Out", 100, 0), ("In", 0, 0)],
+            vec![("In", 0, 0), ("Out", 0, 100), ("Out", 100, 0)],
+        ] {
+            let doc = DigV2 {
+                elements: elements
+                    .into_iter()
+                    .map(|(name, x, y)| DigElement {
+                        name: name.into(),
+                        x,
+                        y,
+                        label: None,
+                    })
+                    .collect(),
+                wires: wires.clone(),
+            };
+            let domain = to_domain(&doc).unwrap();
+            let exported = from_domain(&domain).unwrap();
+            assert_eq!(exported.wires.len(), 2);
+            assert_eq!(to_domain(&exported).unwrap().wires.len(), 2);
+            // Each path remains the intended geometric pin-to-pin connection, not an
+            // overlapping star edge from the distant pin.
+            let canonical_segment = |w: &DigWire| {
+                let (a, b) = ((w.p1.x, w.p1.y), (w.p2.x, w.p2.y));
+                if a <= b { (a, b) } else { (b, a) }
+            };
+            let got = exported
+                .wires
+                .iter()
+                .map(canonical_segment)
+                .collect::<BTreeSet<_>>();
+            let expected = wires.iter().map(canonical_segment).collect::<BTreeSet<_>>();
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_positive_length_collinear_overlap_even_when_segments_share_endpoint() {
+        let wire = |p1: (i32, i32), p2: (i32, i32)| DigWire {
+            p1: DigPoint { x: p1.0, y: p1.1 },
+            p2: DigPoint { x: p2.0, y: p2.1 },
+        };
+        let cases = [
+            vec![
+                wire((0, 0), (100, 0)),
+                wire((50, 0), (50, 50)),
+                wire((50, 0), (0, 0)),
+            ],
+            vec![wire((0, 0), (100, 0)), wire((100, 0), (50, 0))],
+            vec![wire((100, 0), (0, 0)), wire((50, 0), (100, 0))],
+        ];
+        for wires in cases {
+            assert!(
+                geometry_groups(&wires, &BTreeMap::new()).is_err(),
+                "{wires:?}"
+            );
+        }
+    }
+
     #[test]
     fn fanout_and_disconnected_crossings_follow_endpoint_topology() {
         let pin = |id| PinRef {
@@ -2143,6 +2279,9 @@ mod tests {
         };
         let dig = from_domain(&doc).unwrap();
         assert_eq!(dig.wires.len(), 2);
+        let mut reversed = doc.clone();
+        reversed.wires[0].endpoints.swap(0, 1);
+        assert_eq!(from_domain(&reversed).unwrap().wires, dig.wires);
         let restored = to_domain(&dig).unwrap();
         assert_eq!(restored.wires.len(), 1);
         assert_eq!(restored.components[1].position, b.position);
@@ -2150,11 +2289,17 @@ mod tests {
     #[test]
     fn export_refuses_geometry_that_accidentally_joins_explicit_nets() {
         use crate::domain::*;
-        let component = |id, kind, x, y| Component {
-            id: ComponentId(id),
-            kind,
-            position: Position { x, y },
-            label: String::new(),
+        let component = |id, kind, x, y| {
+            let (dx, dy) = center_offset(kind).unwrap();
+            Component {
+                id: ComponentId(id),
+                kind,
+                position: Position {
+                    x: x + dx as f32,
+                    y: y + dy as f32,
+                },
+                label: String::new(),
+            }
         };
         let input = |id| PinRef {
             component: ComponentId(id),

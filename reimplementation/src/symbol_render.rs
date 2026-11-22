@@ -21,7 +21,9 @@ use crate::domain::{ComponentKind, PinDirection, PinId};
 use crate::{
     canvas::CanvasTransform,
     symbol_tessellate::{PathLayer, TessellateError, tessellate_path},
-    symbols::{Point, PortDirection, SymbolBounds, SymbolDef, SymbolStyle, symbol},
+    symbols::{
+        Point, PortDirection, SymbolBounds, SymbolDef, SymbolStyle, origin_from_center, symbol,
+    },
 };
 use eframe::egui::{
     Color32, Mesh, Painter, Shape, Visuals,
@@ -88,13 +90,9 @@ impl SymbolLayout {
     /// as the center of the drawn component. Returns `None` if no symbol is drawn for the pair.
     pub fn centered_on(style: SymbolStyle, kind: ComponentKind, center: Point) -> Option<Self> {
         let def = symbol(style, kind)?;
-        let b = def.bounds;
         Some(Self {
             def,
-            origin: [
-                center[0] - 0.5 * (b.min[0] + b.max[0]),
-                center[1] - 0.5 * (b.min[1] + b.max[1]),
-            ],
+            origin: origin_from_center(style, kind, center)?,
         })
     }
 
