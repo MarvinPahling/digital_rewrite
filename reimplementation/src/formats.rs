@@ -8,6 +8,7 @@ const MAX_DEPTH: usize = 32;
 const MAX_ELEMENTS: usize = 10_000;
 const MAX_WIRES: usize = 30_000;
 const MAX_STRING_BYTES: usize = 4 * 1024;
+const MAX_ATTRIBUTES_PER_ELEMENT: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigV2 {
@@ -693,7 +694,7 @@ impl<'a> XmlParser<'a> {
     }
 
     fn skip_space(&mut self) {
-        while self.at < self.bytes.len() && self.bytes[self.at].is_ascii_whitespace() {
+        while self.at < self.bytes.len() && is_xml_space_byte(self.bytes[self.at]) {
             self.at += 1;
         }
     }
@@ -751,6 +752,14 @@ impl<'a> XmlParser<'a> {
             }
             let attr_offset = self.at;
             let key = self.read_name()?;
+            if attributes.len() >= MAX_ATTRIBUTES_PER_ELEMENT {
+                return Err(error(
+                    DigReadErrorKind::Limit,
+                    attr_offset,
+                    &name,
+                    "XML attribute count exceeds 64",
+                ));
+            }
             if attributes.iter().any(|(existing, _)| existing == &key) {
                 return Err(error(
                     DigReadErrorKind::DuplicateField,
@@ -802,6 +811,18 @@ impl<'a> XmlParser<'a> {
             }
             let value = decode_entities(&self.source[start..self.at], start)?;
             self.at += 1;
+            if self.at < self.bytes.len()
+                && !is_xml_space_byte(self.bytes[self.at])
+                && !self.starts(">")
+                && !self.starts("/>")
+            {
+                return Err(error(
+                    DigReadErrorKind::Xml,
+                    self.at,
+                    &name,
+                    "whitespace is required between XML attributes",
+                ));
+            }
             attributes.push((key, value));
         }
         if self.stack.len() + 1 > MAX_DEPTH {
@@ -901,25 +922,7 @@ impl<'a> XmlParser<'a> {
         self.at += 5;
         if let Some(end) = self.source[self.at..].find("?>") {
             let declaration = &self.source[start..self.at + end + 2];
-            if declaration.contains("encoding")
-                && !declaration
-                    .to_ascii_lowercase()
-                    .contains("encoding=\"utf-8\"")
-                && !declaration
-                    .to_ascii_lowercase()
-                    .contains("encoding='utf-8'")
-                && !declaration
-                    .to_ascii_lowercase()
-                    .contains("encoding=\"utf8\"")
-                && !declaration.to_ascii_lowercase().contains("encoding='utf8'")
-            {
-                return Err(error(
-                    DigReadErrorKind::Unsupported,
-                    start,
-                    "XML declaration",
-                    "only UTF-8 encoding is supported",
-                ));
-            }
+            validate_xml_declaration(declaration, start)?;
             self.at += end + 2;
             Ok(())
         } else {
@@ -933,18 +936,160 @@ impl<'a> XmlParser<'a> {
     }
 }
 
+fn is_xml_space_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | 0x09 | 0x0d | 0x0a)
+}
+
+fn validate_xml_declaration(declaration: &str, offset: usize) -> Result<(), DigReadError> {
+    let malformed =
+        |message: &str| error(DigReadErrorKind::Xml, offset, "XML declaration", message);
+    let unsupported = |message: &str| {
+        error(
+            DigReadErrorKind::Unsupported,
+            offset,
+            "XML declaration",
+            message,
+        )
+    };
+    let inner = declaration
+        .strip_prefix("<?xml")
+        .and_then(|s| s.strip_suffix("?>"))
+        .ok_or_else(|| malformed("malformed XML declaration"))?;
+    let bytes = inner.as_bytes();
+    let mut at = 0;
+    let skip_space = |at: &mut usize| {
+        while *at < bytes.len() && is_xml_space_byte(bytes[*at]) {
+            *at += 1;
+        }
+    };
+    if bytes.first().is_none_or(|b| !is_xml_space_byte(*b)) {
+        return Err(malformed(
+            "whitespace and version information are required after '<?xml'",
+        ));
+    }
+    let mut seen_version = false;
+    let mut seen_encoding = false;
+    let mut seen_standalone = false;
+    let mut last_rank = 0;
+    while at < bytes.len() {
+        skip_space(&mut at);
+        if at == bytes.len() {
+            break;
+        }
+        let name_start = at;
+        while at < bytes.len() && bytes[at].is_ascii_alphabetic() {
+            at += 1;
+        }
+        if at == name_start {
+            return Err(malformed("invalid XML declaration field name"));
+        }
+        let name = &inner[name_start..at];
+        while at < bytes.len() && is_xml_space_byte(bytes[at]) {
+            at += 1;
+        }
+        if bytes.get(at) != Some(&b'=') {
+            return Err(malformed("expected '=' in XML declaration field"));
+        }
+        at += 1;
+        while at < bytes.len() && is_xml_space_byte(bytes[at]) {
+            at += 1;
+        }
+        let quote = *bytes
+            .get(at)
+            .filter(|b| matches!(b, b'\'' | b'\"'))
+            .ok_or_else(|| malformed("XML declaration values must be quoted"))?;
+        at += 1;
+        let value_start = at;
+        while at < bytes.len() && bytes[at] != quote {
+            at += 1;
+        }
+        if at == bytes.len() {
+            return Err(malformed("unterminated XML declaration value"));
+        }
+        let value = &inner[value_start..at];
+        at += 1;
+        let rank = match name {
+            "version" => {
+                if seen_version || last_rank != 0 {
+                    return Err(malformed("version must occur exactly once and first"));
+                }
+                seen_version = true;
+                1
+            }
+            "encoding" => {
+                if seen_encoding || !seen_version || last_rank > 1 {
+                    return Err(malformed("encoding is duplicated or out of order"));
+                }
+                seen_encoding = true;
+                2
+            }
+            "standalone" => {
+                if seen_standalone || !seen_version || last_rank > 2 {
+                    return Err(malformed("standalone is duplicated or out of order"));
+                }
+                seen_standalone = true;
+                3
+            }
+            _ => {
+                return Err(unsupported(&format!(
+                    "unsupported XML declaration field {name:?}"
+                )));
+            }
+        };
+        last_rank = rank;
+        match name {
+            "version" if value != "1.0" => {
+                return Err(unsupported(&format!(
+                    "XML version {value:?} is unsupported; only 1.0 is supported"
+                )));
+            }
+            "encoding" if !value.eq_ignore_ascii_case("UTF-8") => {
+                return Err(unsupported("only UTF-8 encoding is supported"));
+            }
+            "standalone" if !matches!(value, "yes" | "no") => {
+                return Err(malformed("standalone must be 'yes' or 'no'"));
+            }
+            _ => {}
+        }
+        if at < bytes.len() && !is_xml_space_byte(bytes[at]) {
+            return Err(malformed(
+                "whitespace is required between XML declaration fields",
+            ));
+        }
+    }
+    if !seen_version {
+        return Err(malformed("required version field is absent"));
+    }
+    Ok(())
+}
+
+fn normalize_xml_newlines(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            output.push('\n');
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 fn decode_entities(value: &str, offset: usize) -> Result<String, DigReadError> {
     let mut output = String::with_capacity(value.len());
     let mut rest = value;
     let mut consumed = 0;
     while let Some(index) = rest.find('&') {
-        output.push_str(&rest[..index]);
-        consumed += index;
+        output.push_str(&normalize_xml_newlines(&rest[..index]));
         let tail = &rest[index + 1..];
         let end = tail.find(';').ok_or_else(|| {
             error(
                 DigReadErrorKind::Xml,
-                offset + consumed,
+                offset + consumed + index,
                 "entity",
                 "unterminated XML entity",
             )
@@ -967,7 +1112,7 @@ fn decode_entities(value: &str, offset: usize) -> Result<String, DigReadError> {
         .ok_or_else(|| {
             error(
                 DigReadErrorKind::Unsupported,
-                offset + consumed,
+                offset + consumed + index,
                 "entity",
                 "only XML predefined and numeric entities are supported",
             )
@@ -975,7 +1120,7 @@ fn decode_entities(value: &str, offset: usize) -> Result<String, DigReadError> {
         if matches!(ch as u32, 0..=8 | 11..=12 | 14..=31 | 0xfffe..=0xffff) {
             return Err(error(
                 DigReadErrorKind::Xml,
-                offset + consumed,
+                offset + consumed + index,
                 "entity",
                 "invalid XML character reference",
             ));
@@ -985,7 +1130,7 @@ fn decode_entities(value: &str, offset: usize) -> Result<String, DigReadError> {
         consumed += skip;
         rest = &tail[end + 1..];
     }
-    output.push_str(rest);
+    output.push_str(&normalize_xml_newlines(rest));
     Ok(output)
 }
 
@@ -1173,9 +1318,98 @@ mod tests {
     }
 
     #[test]
+    fn requires_whitespace_between_attributes_and_bounds_attribute_count() {
+        let missing_separator = EMPTY.replace("<circuit>", "<circuit x=\"0\"y=\"1\">");
+        let error = parse_v2(missing_separator.as_bytes()).unwrap_err();
+        assert_eq!(error.kind, DigReadErrorKind::Xml);
+        assert!(error.message.contains("whitespace"), "{error:?}");
+
+        let attributes = (0..65)
+            .map(|index| format!(" a{index}=\"x\""))
+            .collect::<String>();
+        let over_budget = format!("<circuit{attributes}/> ");
+        let error = parse_v2(over_budget.as_bytes()).unwrap_err();
+        assert_eq!(error.kind, DigReadErrorKind::Limit);
+        assert!(error.message.contains("attribute"), "{error:?}");
+    }
+
+    #[test]
+    fn validates_xml_declaration_grammar_and_encoding() {
+        let valid = [
+            "<?xml version=\"1.0\"?>",
+            "<?xml version = '1.0' encoding = \"UTF-8\"?>",
+            "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>",
+            "<?xml version=\"1.0\" standalone=\"no\"?>",
+        ];
+        for declaration in valid {
+            assert!(
+                parse_v2(format!("{declaration}{EMPTY}").as_bytes()).is_ok(),
+                "{declaration}"
+            );
+        }
+        for declaration in [
+            "<?xml?>",
+            "<?xml version9.9?>",
+            "<?xml\u{b}version=\"1.0\"?>",
+            "<?xml version=\"9.9\"?>",
+            "<?xml version=\"1.0\" fake='encoding=\"utf-8\"'?>",
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" version=\"1.0\"?>",
+            "<?xml version=\"1.0\" version=\"1.0\"?>",
+            "<?xml version=1.0?>",
+            "<?xml version=\"1.0\" standalone=\"maybe\"?>",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" encoding=\"UTF-8\"?>",
+        ] {
+            assert!(
+                parse_v2(format!("{declaration}{EMPTY}").as_bytes()).is_err(),
+                "accepted {declaration}"
+            );
+        }
+        let err =
+            parse_v2(format!("<?xml version=\"1.0\" encoding=\"UTF-16\"?>{EMPTY}").as_bytes())
+                .unwrap_err();
+        assert_eq!(err.kind, DigReadErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn normalizes_literal_newlines_before_entity_decoding() {
+        let label = "one\r\ntwo\rthree&#13;four";
+        let xml = doc(
+            &format!(
+                "<visualElement><elementName>A</elementName><elementAttributes><entry><string>Label</string><string>{label}</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>"
+            ),
+            "",
+        );
+        assert_eq!(
+            parse_v2(xml.as_bytes()).unwrap().elements[0]
+                .label
+                .as_deref(),
+            Some("one\ntwo\nthree\rfour")
+        );
+    }
+
+    #[test]
+    fn entity_errors_report_original_input_offset_once() {
+        for prefix in ["abc&amp;", "a&amp;b&amp;middle&amp;", &"x".repeat(900)] {
+            let invalid = "&bogus;";
+            let contents = format!("{prefix}{invalid}");
+            let xml = format!("<circuit>{contents}</circuit>");
+            let error = parse_v2(xml.as_bytes()).unwrap_err();
+            assert_eq!(error.offset, xml.find(invalid).unwrap(), "{error:?}");
+            assert!(error.offset < xml.len(), "{error:?}");
+        }
+    }
+
+    #[test]
     fn rejects_dtd_external_entities_invalid_utf8_and_malformed_entities() {
         for input in [
             "<!DOCTYPE circuit><circuit/>",
+            "<circuit><!-- bad--inside --></circuit>",
+            "<circuit><!-- unterminated</circuit>",
+            "<circuit>&#;</circuit>",
+            "<circuit>&#x;</circuit>",
+            "<circuit>&#0;</circuit>",
+            "<circuit>&#xD800;</circuit>",
             "<circuit>&external;</circuit>",
             "<circuit>&amp</circuit>",
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?><circuit/>",
