@@ -3965,7 +3965,7 @@ mod tests {
                 .place(
                     ComponentKind::Not,
                     Position {
-                        x: 200. + 20. * n as f32,
+                        x: 200. + 100. * n as f32,
                         y: 100.,
                     },
                 )
@@ -3980,7 +3980,13 @@ mod tests {
         }
         let output = app
             .session
-            .place(ComponentKind::Output, Position { x: 300., y: 100. })
+            .place(
+                ComponentKind::Output,
+                Position {
+                    x: 200. + 100. * nots as f32,
+                    y: 100.,
+                },
+            )
             .unwrap();
         app.session
             .connect([

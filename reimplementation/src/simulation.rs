@@ -1,7 +1,6 @@
-//! Bounded compiler for one-bit circuits with explicit-pin connectivity.
-//! Geometry never joins nets. Floating receiving pins and multiple drivers are errors.
+//! Bounded compiler for the supported one-bit circuits and geometric connectivity.
 use crate::domain::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 /// Limits are checked before allocating compiler work proportional to the document.
 pub const MAX_COMPONENTS: usize = 10_000;
@@ -20,6 +19,7 @@ pub enum CompileError {
     InvalidEndpoint { wire: WireId, pin: PinRef },
     MissingDriver { pins: Vec<PinRef> },
     MultipleDrivers { pins: Vec<PinRef> },
+    InvalidGeometry(crate::topology::TopologyError),
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Net {
@@ -29,14 +29,6 @@ pub struct Net {
 #[derive(Debug, PartialEq, Eq)]
 pub struct CompiledCircuit {
     pub nets: Vec<Net>,
-}
-
-fn root(parent: &mut [usize], mut n: usize) -> usize {
-    while parent[n] != n {
-        parent[n] = parent[parent[n]];
-        n = parent[n];
-    }
-    n
 }
 
 pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
@@ -83,29 +75,62 @@ pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
             }
         }
     }
-    let mut parent: Vec<_> = (0..pins.len()).collect();
     let mut wire_ids = HashSet::new();
     for wire in &document.wires {
         if !wire_ids.insert(wire.id) {
             return Err(CompileError::DuplicateWire(wire.id));
         }
-        let mut ends = [0; 2];
-        for (i, pin) in wire.endpoints.iter().enumerate() {
-            ends[i] = *indices.get(pin).ok_or(CompileError::InvalidEndpoint {
-                wire: wire.id,
-                pin: *pin,
-            })?;
+        for pin in wire.endpoints {
+            if !indices.contains_key(&pin) {
+                return Err(CompileError::InvalidEndpoint { wire: wire.id, pin });
+            }
         }
-        let a = root(&mut parent, ends[0]);
-        let b = root(&mut parent, ends[1]);
-        parent[a] = b;
     }
-    let mut groups: BTreeMap<usize, Vec<PinRef>> = BTreeMap::new();
-    for (i, pin) in pins.iter().enumerate() {
-        groups.entry(root(&mut parent, i)).or_default().push(*pin);
+    let mut pin_points = Vec::with_capacity(pins.len());
+    let mut point_by_pin = HashMap::with_capacity(pins.len());
+    for component in &document.components {
+        let layout = crate::symbol_render::SymbolLayout::centered_on(
+            crate::symbols::SymbolStyle::Rect,
+            component.kind,
+            [component.position.x, component.position.y],
+        )
+        .ok_or(CompileError::InvalidGeometry(
+            crate::topology::TopologyError::InvalidCoordinate,
+        ))?;
+        for direction in [PinDirection::Input, PinDirection::Output] {
+            for index in 0..2 {
+                let id = PinId { direction, index };
+                if !component.kind.has_pin(id) {
+                    continue;
+                }
+                let pin = PinRef {
+                    component: component.id,
+                    pin: id,
+                };
+                let point = layout
+                    .pin_position(id)
+                    .ok_or(CompileError::InvalidEndpoint {
+                        wire: WireId(0),
+                        pin,
+                    })?;
+                point_by_pin.insert(pin, point);
+                pin_points.push(crate::topology::PinPoint { pin, point });
+            }
+        }
     }
+    let mut segments = Vec::with_capacity(document.wires.len().saturating_mul(2));
+    for wire in &document.wires {
+        let [a, b] = wire.endpoints;
+        let path = crate::wire_geometry::path((a, point_by_pin[&a]), (b, point_by_pin[&b]));
+        segments.extend(path.windows(2).map(|pair| crate::topology::Segment {
+            a: pair[0],
+            b: pair[1],
+        }));
+    }
+    let groups =
+        crate::topology::resolve(&pin_points, &segments).map_err(CompileError::InvalidGeometry)?;
     let mut nets = Vec::new();
-    for pins in groups.into_values() {
+    for pins in groups {
         let drivers: Vec<_> = pins
             .iter()
             .copied()
@@ -138,7 +163,10 @@ mod tests {
         Component {
             id: ComponentId(id),
             kind,
-            position: Position { x: 0.0, y: 0.0 },
+            position: Position {
+                x: id as f32 * 300.0,
+                y: (id % 7) as f32 * 180.0,
+            },
             label: String::new(),
             constant_value: true,
         }
@@ -283,6 +311,23 @@ mod tests {
             Err(CompileError::MultipleDrivers { .. })
         ));
     }
+    #[test]
+    fn coincident_pin_anchors_share_a_net_without_an_explicit_wire() {
+        let source_a = component(1, ComponentKind::Input);
+        let mut source_b = component(2, ComponentKind::Input);
+        let mut receiver = component(3, ComponentKind::Output);
+        source_b.position = source_a.position;
+        receiver.position = source_a.position;
+        let document = Document {
+            components: vec![source_a, source_b, receiver],
+            wires: vec![],
+        };
+        assert!(matches!(
+            compile(&document),
+            Err(CompileError::MultipleDrivers { .. })
+        ));
+    }
+
     #[test]
     fn limits() {
         let mut d = Document {

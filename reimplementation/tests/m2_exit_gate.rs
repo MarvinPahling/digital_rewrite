@@ -19,8 +19,8 @@ fn component(id: u64, kind: K, value: bool) -> Component {
         id: ComponentId(id),
         kind,
         position: Position {
-            x: id as f32 * 40.0,
-            y: 0.0,
+            x: id as f32 * 300.0,
+            y: (id % 7) as f32 * 180.0,
         },
         label: String::new(),
         constant_value: value,

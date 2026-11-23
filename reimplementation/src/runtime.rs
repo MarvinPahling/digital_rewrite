@@ -1348,7 +1348,10 @@ mod tests {
         Component {
             id: ComponentId(id),
             kind,
-            position: Position { x: 0.0, y: 0.0 },
+            position: Position {
+                x: id as f32 * 300.0,
+                y: (id % 7) as f32 * 180.0,
+            },
             label: String::new(),
             constant_value: true,
         }
