@@ -182,8 +182,7 @@ pub(crate) enum ResetOutputPolarity {
     Inverted,
 }
 impl ResetOutputPolarity {
-    #[cfg(test)]
-    fn held_level(self) -> Level {
+    fn asserted_level(self) -> Level {
         match self {
             Self::Normal => Level::High,
             Self::Inverted => Level::Low,
@@ -202,6 +201,31 @@ struct ResetParticipant {
     net: usize,
     polarity: ResetOutputPolarity,
     released: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResetParticipantError {
+    NetOutOfRange,
+    DuplicateNet,
+}
+impl ResetParticipant {
+    fn validated(
+        net: usize,
+        net_count: usize,
+        polarity: ResetOutputPolarity,
+    ) -> Result<Self, ResetParticipantError> {
+        if net >= net_count {
+            return Err(ResetParticipantError::NetOutOfRange);
+        }
+        Ok(Self {
+            net,
+            polarity,
+            released: false,
+        })
+    }
+    fn asserted_level(&self) -> Level {
+        self.polarity.asserted_level()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -414,14 +438,7 @@ impl Runtime {
         )
     }
     fn trace_frontier_remaining(&self) -> usize {
-        if self.startup_phase == StartupPhase::ResetRelease {
-            return self
-                .reset_participants
-                .iter()
-                .filter(|p| !p.released)
-                .count();
-        }
-        if self.startup_phase != StartupPhase::Running {
+        let frontier = if self.startup_phase != StartupPhase::Running {
             let remaining = self
                 .startup_frontier
                 .len()
@@ -439,7 +456,19 @@ impl Runtime {
             self.batch
                 .as_ref()
                 .map_or_else(|| self.queue.len(), |batch| batch.gates.len())
-        }
+        };
+        // A single operation can cross the startup barrier and release every reset. Reserve
+        // both release records and worst-case net publications regardless of its entry phase.
+        let releases = self
+            .reset_participants
+            .iter()
+            .filter(|p| !p.released)
+            .count();
+        frontier.saturating_add(if releases == 0 {
+            0
+        } else {
+            releases.saturating_mul(2).saturating_add(2)
+        })
     }
     pub fn trace(&self) -> Option<&TraceLog> {
         self.trace.as_ref()
@@ -516,20 +545,31 @@ impl Runtime {
         }
     }
 
+    // Private production lifecycle mechanism, deliberately not exposed as a public component API.
+    #[allow(dead_code)]
+    fn install_reset_participant(
+        &mut self,
+        net: usize,
+        polarity: ResetOutputPolarity,
+    ) -> Result<(), ResetParticipantError> {
+        if self.reset_participants.iter().any(|p| p.net == net) {
+            return Err(ResetParticipantError::DuplicateNet);
+        }
+        let participant = ResetParticipant::validated(net, self.values.len(), polarity)?;
+        // The typed production participant owns asserted-level initialization; this seam only
+        // calls that mechanism and never duplicates its reset semantics.
+        self.values[net] = participant.asserted_level();
+        self.reset_participants.push(participant);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn register_reset_participant_for_test(
         &mut self,
         net: usize,
         polarity: ResetOutputPolarity,
     ) {
-        assert!(net < self.values.len());
-        assert!(!self.reset_participants.iter().any(|p| p.net == net));
-        self.values[net] = polarity.held_level();
-        self.reset_participants.push(ResetParticipant {
-            net,
-            polarity,
-            released: false,
-        });
+        self.install_reset_participant(net, polarity).unwrap();
     }
 
     #[cfg(test)]
@@ -741,20 +781,31 @@ impl Runtime {
             self.trace_stability_if_reached();
             return outcome;
         }
-        // Explicit stepping is a raw, undetected microstep; it closes any settle episode.
-        self.detector = None;
+        // Running-state explicit stepping is raw and undetected; reset settling remains
+        // within the detector episode opened by reset release.
+        if self.startup_phase != StartupPhase::ResetSettling {
+            self.detector = None;
+        }
         if !self.normal_pending() {
             self.finish_reset_if_idle();
             self.trace_stability_if_reached();
             return StepOutcome::Idle;
         }
         if self.batch.is_none() {
-            self.begin_batch();
+            if self.startup_phase == StartupPhase::ResetSettling {
+                if let Err(diagnostic) = self.begin_detected_batch() {
+                    return StepOutcome::Oscillating { diagnostic };
+                }
+            } else {
+                self.begin_batch();
+            }
         }
         loop {
             if let Some(evaluated) = self.evaluate_next() {
                 self.finish_reset_if_idle();
-                self.detector = None;
+                if self.startup_phase != StartupPhase::ResetSettling {
+                    self.detector = None;
+                }
                 self.trace_stability_if_reached();
                 return StepOutcome::Stepped { evaluated };
             }
@@ -806,14 +857,22 @@ impl Runtime {
                 StepOutcome::Idle
             };
         }
-        self.detector = None;
+        if self.startup_phase != StartupPhase::ResetSettling {
+            self.detector = None;
+        }
         if !self.normal_pending() {
             self.finish_reset_if_idle();
             self.trace_stability_if_reached();
             return StepOutcome::Idle;
         }
         if self.batch.is_none() {
-            self.begin_batch();
+            if self.startup_phase == StartupPhase::ResetSettling {
+                if let Err(diagnostic) = self.begin_detected_batch() {
+                    return StepOutcome::Oscillating { diagnostic };
+                }
+            } else {
+                self.begin_batch();
+            }
         }
         let mut evaluated = 0;
         while self.batch.is_some() {
@@ -828,6 +887,9 @@ impl Runtime {
             evaluated += 1;
         }
         self.finish_reset_if_idle();
+        if self.startup_phase != StartupPhase::ResetSettling {
+            self.detector = None;
+        }
         self.trace_stability_if_reached();
         StepOutcome::Stepped { evaluated }
     }
@@ -855,7 +917,9 @@ impl Runtime {
             return SettleOutcome::TraceSequenceExhausted { work: 0 };
         }
         if !self.microstep_active {
-            self.detector = None;
+            if self.startup_phase != StartupPhase::ResetSettling {
+                self.detector = None;
+            }
             self.microstep_active = true;
         }
         let mut work = 0;
@@ -873,7 +937,14 @@ impl Runtime {
                 return SettleOutcome::BudgetExhausted { work };
             }
             if self.batch.is_none() {
-                self.begin_batch();
+                if self.startup_phase == StartupPhase::ResetSettling {
+                    if let Err(diagnostic) = self.begin_detected_batch() {
+                        self.microstep_active = false;
+                        return SettleOutcome::Oscillating { work, diagnostic };
+                    }
+                } else {
+                    self.begin_batch();
+                }
                 work += 1;
                 if work == budget {
                     return SettleOutcome::BudgetExhausted { work };
@@ -884,6 +955,9 @@ impl Runtime {
             if evaluated == count {
                 self.finish_reset_if_idle();
                 self.microstep_active = false;
+                if self.startup_phase != StartupPhase::ResetSettling {
+                    self.detector = None;
+                }
                 self.trace_stability_if_reached();
                 return SettleOutcome::Settled { work };
             }
@@ -892,6 +966,9 @@ impl Runtime {
             if self.batch.is_none() {
                 self.finish_reset_if_idle();
                 self.microstep_active = false;
+                if self.startup_phase != StartupPhase::ResetSettling {
+                    self.detector = None;
+                }
                 self.trace_stability_if_reached();
                 return SettleOutcome::Settled { work };
             }
@@ -1164,11 +1241,32 @@ impl Runtime {
         }
     }
 
+    /// Starts one normal batch inside the persistent reset-settling detector episode.
+    fn begin_detected_batch(&mut self) -> Result<(), OscillationDiagnostic> {
+        let scheduled: Vec<_> = self.queue.iter().map(|&gate| &self.gates[gate]).collect();
+        let detector = self
+            .detector
+            .get_or_insert_with(|| OscillationDetector::new(self.oscillation_limit));
+        if detector.steps >= detector.limit.saturating_add(OSCILLATION_COLLECTION_OFFSET) {
+            let diagnostic = OscillationDiagnostic {
+                threshold: detector.limit,
+                steps: detector.steps,
+                components: detector.components.values().cloned().collect(),
+            };
+            self.terminal = Some(diagnostic.clone());
+            self.trace_event(TraceEvent::Terminal);
+            return Err(diagnostic);
+        }
+        detector.begin_batch(scheduled);
+        self.begin_batch();
+        Ok(())
+    }
+
     /// Snapshots the scheduled gates as the next microstep.
     fn begin_batch(&mut self) {
         self.trace_event(TraceEvent::FrontierBegin {
             startup: false,
-            phase: StartupPhase::Running,
+            phase: self.startup_phase,
         });
         let gates = std::mem::take(&mut self.queue);
         for &gate in &gates {
@@ -2801,6 +2899,31 @@ mod tests {
     }
 
     #[test]
+    fn production_reset_registration_validates_before_typed_asserted_initialization() {
+        let doc = not_chain(1);
+        let mut runtime = Runtime::start_with_seed(&doc, 13).unwrap();
+        let net = runtime.pin_nets[&out(2)];
+        let before = runtime.values.clone();
+        assert_eq!(
+            runtime.install_reset_participant(usize::MAX, ResetOutputPolarity::Normal),
+            Err(ResetParticipantError::NetOutOfRange)
+        );
+        assert_eq!(runtime.values, before);
+        assert!(runtime.reset_participants.is_empty());
+        runtime
+            .install_reset_participant(net, ResetOutputPolarity::Normal)
+            .unwrap();
+        assert_eq!(runtime.values[net], Level::High);
+        let after_install = runtime.values.clone();
+        assert_eq!(
+            runtime.install_reset_participant(net, ResetOutputPolarity::Inverted),
+            Err(ResetParticipantError::DuplicateNet)
+        );
+        assert_eq!(runtime.values, after_install);
+        assert_eq!(runtime.reset_participants.len(), 1);
+    }
+
+    #[test]
     fn reset_participants_hold_during_startup_release_once_and_use_normal_scheduler() {
         use crate::trace::TraceEvent;
         let doc = not_chain(2);
@@ -2875,7 +2998,7 @@ mod tests {
             event,
             TraceEvent::FrontierBegin {
                 startup: false,
-                phase: StartupPhase::Running
+                phase: StartupPhase::ResetSettling
             }
         )));
         assert!(rows.iter().any(|event| matches!(event, TraceEvent::NetPublished { net, new: Level::Low, .. } if *net == net_b)));
@@ -2885,7 +3008,15 @@ mod tests {
             .unwrap();
         let normal_frontier = rows
             .iter()
-            .position(|event| matches!(event, TraceEvent::FrontierBegin { startup: false, .. }))
+            .position(|event| {
+                matches!(
+                    event,
+                    TraceEvent::FrontierBegin {
+                        startup: false,
+                        phase: StartupPhase::ResetSettling
+                    }
+                )
+            })
             .unwrap();
         let running = rows
             .iter()
@@ -2950,6 +3081,139 @@ mod tests {
         assert_eq!(stepped.micro_step(), StepOutcome::Stepped { evaluated: 1 });
         assert_eq!(stepped.startup_phase(), StartupPhase::Running);
         assert_eq!(stepped.pin_value(out(3)), Some(Level::Low));
+    }
+
+    #[test]
+    fn reset_release_trace_preflight_reserves_all_releases_from_startup_phase() {
+        let kinds = (1..=20)
+            .map(|id| (id, ComponentKind::Not))
+            .collect::<Vec<_>>();
+        let wires = (1..=20).map(|id| (out(id), inp(id, 0))).collect::<Vec<_>>();
+        let doc = document(&kinds, &wires);
+        let mut runtime =
+            Runtime::start_with_trace(&doc, 31, crate::trace::TraceLog::new(128, 31, 0).unwrap())
+                .unwrap();
+        for id in 1..=20 {
+            let net = runtime.pin_nets[&out(id)];
+            runtime.register_reset_participant_for_test(net, ResetOutputPolarity::Inverted);
+        }
+        // Model the empty startup frontier immediately before the barrier. The upcoming
+        // settle operation crosses startup, release, and reset-settling in one call.
+        runtime.startup_frontier.clear();
+        runtime.startup_cursor = 0;
+        runtime.startup_batch_pending = false;
+        runtime.startup_frontier_shuffled = true;
+        runtime.force_trace_sequence_for_test(u64::MAX - 21);
+        let before_values = runtime.values.clone();
+        let before_queue = runtime.queue.clone();
+        let before_queued = runtime.queued.clone();
+        let before_phase = runtime.startup_phase;
+        let before_detector = runtime.detector.clone();
+        let before_rng = runtime.rng.0;
+        let before_frontier = runtime.startup_frontier.clone();
+        let before_next = runtime.startup_next.clone();
+        let before_cursor = runtime.startup_cursor;
+        let before_released = runtime
+            .reset_participants
+            .iter()
+            .map(|p| p.released)
+            .collect::<Vec<_>>();
+        let before_trace = runtime
+            .trace
+            .as_ref()
+            .unwrap()
+            .records()
+            .collect::<Vec<_>>();
+        let before_dropped = runtime.trace.as_ref().unwrap().dropped();
+        let before_first = runtime.trace.as_ref().unwrap().first_sequence();
+        let before_sequence = runtime.trace.as_ref().unwrap().sequence_state_for_test();
+
+        assert_eq!(
+            runtime.settle(2),
+            SettleOutcome::TraceSequenceExhausted { work: 0 }
+        );
+        assert_eq!(runtime.values, before_values);
+        assert_eq!(runtime.queue, before_queue);
+        assert_eq!(runtime.queued, before_queued);
+        assert_eq!(runtime.startup_phase, before_phase);
+        assert_eq!(runtime.detector, before_detector);
+        assert_eq!(runtime.rng.0, before_rng);
+        assert_eq!(runtime.startup_frontier, before_frontier);
+        assert_eq!(runtime.startup_next, before_next);
+        assert_eq!(runtime.startup_cursor, before_cursor);
+        assert_eq!(
+            runtime
+                .reset_participants
+                .iter()
+                .map(|p| p.released)
+                .collect::<Vec<_>>(),
+            before_released
+        );
+        let trace = runtime.trace.as_ref().unwrap();
+        assert_eq!(trace.records().collect::<Vec<_>>(), before_trace);
+        assert_eq!(trace.dropped(), before_dropped);
+        assert_eq!(trace.first_sequence(), before_first);
+        assert_eq!(trace.sequence_state_for_test(), before_sequence);
+    }
+
+    fn self_not_after_held_reset_release() -> (Document, Runtime) {
+        let doc = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
+        let mut runtime = Runtime::start_with_seed(&doc, 7).unwrap();
+        runtime.register_reset_participant_for_test(
+            runtime.pin_nets[&out(1)],
+            ResetOutputPolarity::Inverted,
+        );
+        runtime.set_oscillation_limit(1).unwrap();
+        while runtime.startup_phase() != StartupPhase::ResetSettling {
+            let outcome = runtime.step();
+            assert!(!matches!(outcome, StepOutcome::Oscillating { .. }));
+        }
+        (doc, runtime)
+    }
+
+    #[test]
+    fn reset_settling_oscillation_survives_all_stepping_apis_and_chunks() {
+        for api in 0..4 {
+            let (_doc, mut runtime) = self_not_after_held_reset_release();
+            let mut polls = 0;
+            loop {
+                polls += 1;
+                assert!(
+                    polls < 2_000,
+                    "reset oscillation must be detected in finite work"
+                );
+                let outcome = match api {
+                    0 => match runtime.step() {
+                        StepOutcome::Oscillating { diagnostic } => SettleOutcome::Oscillating {
+                            work: 0,
+                            diagnostic,
+                        },
+                        _ => SettleOutcome::BudgetExhausted { work: 0 },
+                    },
+                    1 => match runtime.micro_step() {
+                        StepOutcome::Oscillating { diagnostic } => SettleOutcome::Oscillating {
+                            work: 0,
+                            diagnostic,
+                        },
+                        _ => SettleOutcome::BudgetExhausted { work: 0 },
+                    },
+                    2 => runtime.micro_step_bounded(1),
+                    _ => runtime.settle(1),
+                };
+                if let SettleOutcome::Oscillating { diagnostic, .. } = outcome {
+                    assert_eq!(diagnostic.threshold, 1);
+                    assert_eq!(diagnostic.steps, 1 + OSCILLATION_COLLECTION_OFFSET);
+                    assert_eq!(runtime.terminal_diagnostic(), Some(&diagnostic));
+                    assert!(
+                        diagnostic
+                            .components
+                            .iter()
+                            .any(|component| component.id == ComponentId(1))
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     #[test]
