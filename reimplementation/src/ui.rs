@@ -2140,15 +2140,14 @@ mod tests {
     fn new_logic_gate_palette_placement_anchors_and_styles_are_shared() {
         let ctx = egui::Context::default();
         let mut app = DigitalApp::default();
-        for (index, (name, kind)) in [
+        let placements = [
             ("NAND", ComponentKind::NAnd),
             ("NOR", ComponentKind::NOr),
             ("XOR", ComponentKind::XOr),
             ("XNOR", ComponentKind::XNOr),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        ];
+        let mut canvas_centers = Vec::new();
+        for (index, (name, kind)) in placements.into_iter().enumerate() {
             click_text(&ctx, &mut app, name);
             let center = Pos2::new(
                 350. + (index % 2) as f32 * 120.,
@@ -2156,6 +2155,7 @@ mod tests {
             );
             click_at(&ctx, &mut app, center);
             assert_eq!(app.session.document().components.last().unwrap().kind, kind);
+            canvas_centers.push((name, center));
         }
         for style in [SymbolStyle::Rect, SymbolStyle::Ieee] {
             app.style = style;
@@ -2211,8 +2211,19 @@ mod tests {
                 );
             }
             let painted = frame(&ctx, &mut app, vec![], true);
-            for name in ["NAND", "NOR", "XOR", "XNOR"] {
-                assert!(has_text(&painted, name));
+            for (name, center) in &canvas_centers {
+                let has_canvas_name = painted.shapes.iter().any(|shape| {
+                    matches!(
+                        &shape.shape,
+                        egui::Shape::Text(text)
+                            if text.galley.job.text == *name
+                                && text.pos.distance(*center) < 80.
+                    )
+                });
+                assert!(
+                    has_canvas_name,
+                    "{name} must be painted near its placed canvas component at {center:?}"
+                );
             }
         }
         press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);

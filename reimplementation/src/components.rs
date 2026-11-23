@@ -12,7 +12,7 @@ pub struct ComponentDescriptor {
     pub defaults: &'static [(&'static str, &'static str)],
 }
 const ONE_BIT: &[(&str, &str)] = &[("Bits", "1")];
-const TWO_INPUT_GATE: &[(&str, &str)] = &[("Bits", "1"), ("Inputs", "2"), ("Wide", "false")];
+const TWO_INPUT_GATE: &[(&str, &str)] = &[("Bits", "1"), ("Inputs", "2"), ("wideShape", "false")];
 pub const DESCRIPTORS: [ComponentDescriptor; 9] = [
     ComponentDescriptor {
         kind: ComponentKind::Input,
@@ -152,6 +152,10 @@ mod tests {
             ComponentKind::XOr,
             ComponentKind::XNOr,
         ] {
+            assert_eq!(
+                descriptor(kind).defaults,
+                &[("Bits", "1"), ("Inputs", "2"), ("wideShape", "false")]
+            );
             assert_eq!(descriptor(kind).defaults, TWO_INPUT_GATE);
             assert_eq!(descriptor(kind).input_pins, 2);
             assert_eq!(descriptor(kind).output_pins, 1);

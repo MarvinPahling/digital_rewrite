@@ -2676,7 +2676,7 @@ mod tests {
             DigReadErrorKind::Unsupported,
             "elementAttributes",
         );
-        for (key, value) in [("Bits", "1"), ("Inputs", "2"), ("Wide", "false")] {
+        for (key, value) in [("Bits", "1"), ("Inputs", "2"), ("wideShape", "false")] {
             let explicit_default = format!(
                 "<visualElement><elementName>NAnd</elementName><elementAttributes><entry><string>{key}</string><string>{value}</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>"
             );
