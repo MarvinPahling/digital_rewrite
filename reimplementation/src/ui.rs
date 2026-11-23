@@ -10,7 +10,7 @@ use crate::{
     engine::{EditError, SaveError, Session, SimulationError},
     file_session::{DiscardIntent, FileIo, LocalFileIo, PublishOutcome, SaveAsIntent},
     runtime::{InputChange, Level, SettleOutcome},
-    sim_text::{describe_simulation_error, level_badge, level_text},
+    sim_text::{describe_latched_oscillation, describe_simulation_error, level_badge, level_text},
     symbol_render::{PaintState, Palette, SymbolLayout, SymbolRenderer},
     symbols::{DEFAULT_STYLE, GRID_UNIT, STROKE_WIDTH, SymbolStyle},
 };
@@ -52,6 +52,8 @@ enum SimState {
     Idle,
     /// The last start failed and the document has not changed since.
     Error,
+    /// A terminal oscillation was detected and editing is available again.
+    Oscillating,
     Pending {
         settling: bool,
     },
@@ -780,6 +782,7 @@ impl DigitalApp {
                 settling: self.settling,
             },
             Some(_) => SimState::Settled,
+            None if self.session.oscillation_diagnostic().is_some() => SimState::Oscillating,
             None if self.failed_start.as_ref() == Some(self.session.document()) => SimState::Error,
             None => SimState::Idle,
         }
@@ -921,10 +924,17 @@ impl DigitalApp {
             ui.label(match self.sim_state() {
                 SimState::Idle => "State: idle (not simulating)",
                 SimState::Error => "State: error (cannot start, see message)",
+                SimState::Oscillating => "State: stopped (oscillation detected; see diagnostic)",
                 SimState::Pending { settling: true } => "State: pending (settling)",
                 SimState::Pending { settling: false } => "State: pending (paused; Step or Settle)",
                 SimState::Settled => "State: settled",
             });
+            if let Some(diagnostic) = self.session.oscillation_diagnostic() {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    describe_latched_oscillation(self.session.document(), diagnostic),
+                );
+            }
             ui.label("F5 start, Shift+F5 stop, F10 step, F6 settle.");
             if let Some(runtime) = self.session.inspect() {
                 let document = self.session.document();
@@ -2173,8 +2183,9 @@ mod tests {
             .start_simulation_with_oscillation_limit(1)
             .unwrap();
         app.settling = true;
+        let mut rendered = None;
         for _ in 0..3 {
-            frame(&ctx, &mut app, vec![], true);
+            rendered = Some(frame(&ctx, &mut app, vec![], true));
         }
         assert!(!app.session.simulation_active());
         assert!(!app.settling);
@@ -2185,7 +2196,41 @@ mod tests {
                     && text.contains("NOT")
                     && text.contains(&format!("#{}", affected.0)))
         );
-        assert!(app.session.oscillation_diagnostic().is_some());
+        let diagnostic = app.session.oscillation_diagnostic().unwrap();
+        assert_eq!(app.sim_state(), SimState::Oscillating);
+        let explanation = describe_latched_oscillation(app.session.document(), diagnostic);
+        let output = rendered.unwrap();
+        assert!(has_text(&output, "State: stopped (oscillation detected"));
+        assert!(has_text(&output, &explanation));
+
+        // View operations and an unchanged label Apply clear transient UI errors, not the
+        // engine-owned terminal diagnostic rendered by the simulation panel.
+        app.fit_extent(
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(800., 600.)),
+            [0., 0.],
+            [100., 100.],
+            20.,
+        );
+        let output = frame(&ctx, &mut app, vec![], true);
+        assert!(app.error.is_none());
+        assert!(has_text(&output, "State: stopped (oscillation detected"));
+        assert!(has_text(&output, &explanation));
+
+        app.begin_label_edit();
+        app.finish_label_edit();
+        let output = frame(&ctx, &mut app, vec![], true);
+        assert!(app.error.is_none());
+        assert!(has_text(&output, "State: stopped (oscillation detected"));
+        assert!(has_text(&output, &explanation));
+
+        app.apply_simulation_action(SimAction::Start);
+        assert!(app.session.oscillation_diagnostic().is_none());
+        assert!(matches!(
+            app.sim_state(),
+            SimState::Pending { .. } | SimState::Settled
+        ));
+        app.apply_simulation_action(SimAction::Stop);
+
         assert_eq!(app.session.document().components.len(), 104);
         assert_eq!(app.session.undo().unwrap(), ());
     }

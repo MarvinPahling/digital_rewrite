@@ -106,6 +106,41 @@ pub fn describe_simulation_error(document: &Document, error: &SimulationError) -
     }
 }
 
+pub fn describe_latched_oscillation(
+    document: &Document,
+    diagnostic: &OscillationDiagnostic,
+) -> String {
+    let components = diagnostic
+        .components
+        .iter()
+        .map(|component| {
+            let label = document
+                .components
+                .iter()
+                .find(|item| item.id == component.id)
+                .map(|item| item.label.as_str())
+                .unwrap_or(&component.label);
+            format!(
+                "{} \"{}\" #{}",
+                component.kind.name(),
+                label,
+                component.id.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Oscillation detected after {} microsteps (limit {}). Affected components: {}.",
+        diagnostic.steps,
+        diagnostic.threshold,
+        if components.is_empty() {
+            "none"
+        } else {
+            &components
+        }
+    )
+}
+
 pub fn describe_oscillation(
     document: &Document,
     diagnostic: &OscillationDiagnostic,
