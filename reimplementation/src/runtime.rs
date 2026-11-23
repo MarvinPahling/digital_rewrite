@@ -163,6 +163,14 @@ struct Batch {
     staged: Vec<Level>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingInspection {
+    pub awaiting_evaluation: Vec<ComponentId>,
+    pub staged_unpublished: Vec<ComponentId>,
+    pub next_scheduled: Vec<ComponentId>,
+    pub unique_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartupPhase {
     StartupSettling,
@@ -379,7 +387,61 @@ impl Runtime {
         }
     }
 
-    /// Gates scheduled or part-way through the current microstep.
+    /// Immutable scheduler view. A gate can appear in multiple categories during a partially
+    /// evaluated batch; `unique_count` counts distinct IDs. Ordering is stable by component ID.
+    pub fn pending_inspection(&self) -> PendingInspection {
+        let mut awaiting = Vec::new();
+        let mut staged = Vec::new();
+        let mut next = Vec::new();
+        if self.startup_phase != StartupPhase::Running {
+            awaiting.extend(
+                self.startup_frontier
+                    .iter()
+                    .skip(self.startup_cursor)
+                    .map(|&i| self.gates[i].id),
+            );
+            next.extend(self.startup_next.iter().map(|&i| self.gates[i].id));
+        } else {
+            next.extend(self.queue.iter().map(|&i| self.gates[i].id));
+            if let Some(batch) = &self.batch {
+                let evaluated = batch.staged.len();
+                staged.extend(
+                    batch
+                        .gates
+                        .iter()
+                        .take(evaluated)
+                        .map(|&i| self.gates[i].id),
+                );
+                awaiting.extend(
+                    batch
+                        .gates
+                        .iter()
+                        .skip(evaluated)
+                        .map(|&i| self.gates[i].id),
+                );
+            }
+        }
+        for ids in [&mut awaiting, &mut staged, &mut next] {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        let mut all = awaiting
+            .iter()
+            .chain(&staged)
+            .chain(&next)
+            .copied()
+            .collect::<Vec<_>>();
+        all.sort_unstable();
+        all.dedup();
+        PendingInspection {
+            awaiting_evaluation: awaiting,
+            staged_unpublished: staged,
+            next_scheduled: next,
+            unique_count: all.len(),
+        }
+    }
+
+    /// Legacy total scheduler count, retained for compatibility. It is not a unique count.
     pub fn pending_gate_count(&self) -> usize {
         if self.startup_phase != StartupPhase::Running {
             self.startup_frontier
@@ -446,8 +508,9 @@ impl Runtime {
         }
     }
 
-    /// Runs one complete microstep (finishing one already begun by a bounded settle).
-    /// Its cost is bounded by the compiled gate count.
+    /// Runs one bounded legacy work unit. During startup this is a gatewise startup unit;
+    /// during normal operation it completes the entire active read/evaluate/publish frontier.
+    /// Prefer [`micro_step`](Self::micro_step) for an explicit one-frontier operation.
     pub fn step(&mut self) -> StepOutcome {
         if let Some(diagnostic) = self.terminal.clone() {
             return StepOutcome::Oscillating { diagnostic };
@@ -478,8 +541,68 @@ impl Runtime {
         }
     }
 
-    /// Microsteps until idle or `budget` work units are spent. A microstep in progress is
-    /// resumed, so a large frontier is evaluated across calls without partial publication.
+    /// Completes exactly the currently active frontier (or starts and completes one startup
+    /// frontier). It never consumes a successor frontier. Normal outputs publish together; the
+    /// startup policy publishes each shuffled gate immediately, matching startup semantics.
+    pub fn micro_step(&mut self) -> StepOutcome {
+        if let Some(diagnostic) = self.terminal.clone() {
+            return StepOutcome::Oscillating { diagnostic };
+        }
+        if self.startup_phase != StartupPhase::Running {
+            if self.startup_phase == StartupPhase::ResetRelease {
+                let _ = self.advance_startup_unit();
+                return StepOutcome::Stepped { evaluated: 0 };
+            }
+            if self.startup_phase == StartupPhase::ResetSettling {
+                let _ = self.advance_startup_unit();
+                return StepOutcome::Stepped { evaluated: 0 };
+            }
+            if self.startup_cursor >= self.startup_frontier.len() {
+                let _ = self.advance_startup_unit();
+            }
+            let initial_len = self.startup_frontier.len();
+            let mut evaluated = 0;
+            while self.startup_cursor < initial_len {
+                match self.advance_startup_unit() {
+                    Ok(true) => evaluated += 1,
+                    Ok(false) => {}
+                    Err(diagnostic) => return StepOutcome::Oscillating { diagnostic },
+                }
+            }
+            // Empty startup frontiers advance to their lifecycle barrier, without fabricating
+            // a gate evaluation.
+            if initial_len == 0 && self.startup_phase == StartupPhase::StartupSettling {
+                let _ = self.advance_startup_unit();
+            }
+            return if evaluated > 0 || self.startup_phase != StartupPhase::Running {
+                StepOutcome::Stepped { evaluated }
+            } else {
+                StepOutcome::Idle
+            };
+        }
+        self.detector = None;
+        if !self.is_pending() {
+            return StepOutcome::Idle;
+        }
+        if self.batch.is_none() {
+            self.begin_batch();
+        }
+        let mut evaluated = 0;
+        while self.batch.is_some() {
+            let remaining = self
+                .batch
+                .as_ref()
+                .map_or(0, |batch| batch.gates.len() - batch.staged.len());
+            if remaining == 0 {
+                break;
+            }
+            self.evaluate_next();
+            evaluated += 1;
+        }
+        StepOutcome::Stepped { evaluated }
+    }
+
+    /// Bounded full-settle episode; chunks resume one unchanged detection episode.
     pub fn settle(&mut self, budget: usize) -> SettleOutcome {
         if let Some(diagnostic) = self.terminal.clone() {
             return SettleOutcome::Oscillating {

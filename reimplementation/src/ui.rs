@@ -33,9 +33,11 @@ const EDIT_LOCK_NOTE: &str =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SimAction {
     Start,
+    StartPaused,
     Stop,
     Step,
     Settle,
+    Pause,
     Toggle(ComponentId),
 }
 
@@ -813,7 +815,7 @@ impl DigitalApp {
     /// editing gesture; a failed start leaves the editor exactly as it was.
     fn apply_simulation_action(&mut self, action: SimAction) {
         match action {
-            SimAction::Start => {
+            SimAction::Start | SimAction::StartPaused => {
                 let seed = if self.startup_seed_text.is_empty()
                     || !self.startup_seed_text.bytes().all(|b| b.is_ascii_digit())
                 {
@@ -843,7 +845,7 @@ impl DigitalApp {
                         self.drag = None;
                         self.failed_start = None;
                         self.error = None;
-                        self.settling = true;
+                        self.settling = action == SimAction::Start;
                     }
                     Err(error) => {
                         if matches!(error, SimulationError::Compile(_)) {
@@ -863,7 +865,7 @@ impl DigitalApp {
             },
             SimAction::Step => {
                 self.settling = false;
-                if let Err(error) = self.session.step_simulation() {
+                if let Err(error) = self.session.micro_step_simulation() {
                     self.report_simulation_error(&error);
                 }
             }
@@ -871,6 +873,9 @@ impl DigitalApp {
                 if self.session.simulation_active() {
                     self.settling = true;
                 }
+            }
+            SimAction::Pause => {
+                self.settling = false;
             }
             SimAction::Toggle(id) => match self.session.toggle_input(id) {
                 Ok(InputChange::Changed) => {
@@ -908,6 +913,10 @@ impl DigitalApp {
         let action = ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F5) {
                 Some(SimAction::Stop)
+            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F10) {
+                Some(SimAction::StartPaused)
+            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6) {
+                Some(SimAction::Pause)
             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F5) {
                 Some(SimAction::Start)
             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F10) {
@@ -1000,8 +1009,9 @@ impl DigitalApp {
             });
             if let Some(seed) = self.session.startup_seed() { ui.label(format!("Active startup seed: {seed}")); }
             if let Some(phase) = self.session.startup_phase() { ui.label(format!("Lifecycle: {phase:?}")); }
-            ui.label("F5 start, Shift+F5 stop, F10 step, F6 settle. Canvas Ctrl+Tab → seed field; Escape → canvas.");
+            ui.label("F5 start, Shift+F10 start paused, Shift+F6 pause, Shift+F5 stop, F10 microstep, F6 full settle. Canvas Ctrl+Tab → seed field; Escape → canvas.");
             if let Some(runtime) = self.session.inspect() {
+                let pending = runtime.pending_inspection();
                 let document = self.session.document();
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -1082,6 +1092,11 @@ impl DigitalApp {
                                 ));
                             }
                         }
+                        ui.collapsing(format!("Pending gates: {} unique", pending.unique_count), |ui| {
+                            ui.label(format!("Awaiting evaluation ({}): {:?}", pending.awaiting_evaluation.len(), pending.awaiting_evaluation.iter().map(|id| id.0).collect::<Vec<_>>()));
+                            ui.label(format!("Staged, unpublished ({}): {:?}", pending.staged_unpublished.len(), pending.staged_unpublished.iter().map(|id| id.0).collect::<Vec<_>>()));
+                            ui.label(format!("Next frontier ({}): {:?}", pending.next_scheduled.len(), pending.next_scheduled.iter().map(|id| id.0).collect::<Vec<_>>()));
+                        });
                     });
             }
             if let Some(action) = action.filter(|_| !modal_blocked) {

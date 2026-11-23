@@ -413,6 +413,7 @@ impl Session {
     fn runtime_mut(&mut self) -> Result<&mut Runtime, SimulationError> {
         self.runtime.as_mut().ok_or(SimulationError::NotActive)
     }
+    /// Legacy one-work-unit stepping. Use `micro_step_simulation` for one complete frontier.
     pub fn step_simulation(&mut self) -> Result<StepOutcome, SimulationError> {
         if let Some(diagnostic) = self.oscillation_diagnostic.clone() {
             return Err(SimulationError::Oscillation {
@@ -437,6 +438,37 @@ impl Session {
         }
         Ok(outcome)
     }
+    /// Advances one logical propagation frontier without consuming its successor.
+    pub fn micro_step_simulation(&mut self) -> Result<StepOutcome, SimulationError> {
+        if let Some(diagnostic) = self.oscillation_diagnostic.clone() {
+            return Err(SimulationError::Oscillation {
+                diagnostic,
+                work: 0,
+            });
+        }
+        let outcome = self.runtime_mut()?.micro_step();
+        self.retain_terminal(outcome)
+    }
+
+    fn retain_terminal(&mut self, outcome: StepOutcome) -> Result<StepOutcome, SimulationError> {
+        if let StepOutcome::Oscillating { diagnostic } = outcome {
+            let runtime = self.runtime.as_ref().ok_or(SimulationError::NotActive)?;
+            let context = TerminalSimulationContext {
+                startup_seed: runtime.startup_seed(),
+                phase: runtime.startup_phase(),
+            };
+            self.runtime = None;
+            self.oscillation_diagnostic = Some(diagnostic.clone());
+            self.terminal_simulation_context = Some(context);
+            Err(SimulationError::Oscillation {
+                diagnostic,
+                work: 0,
+            })
+        } else {
+            Ok(outcome)
+        }
+    }
+
     pub fn settle_simulation(&mut self, budget: usize) -> Result<SettleOutcome, SimulationError> {
         if let Some(diagnostic) = self.oscillation_diagnostic.clone() {
             return Err(SimulationError::Oscillation {
