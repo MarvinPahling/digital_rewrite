@@ -895,6 +895,10 @@ impl DigitalApp {
         }
         match self.session.settle_simulation(self.settle_budget) {
             Ok(SettleOutcome::BudgetExhausted { .. }) => {}
+            Ok(SettleOutcome::TraceSequenceExhausted { .. }) => {
+                self.settling = false;
+                self.error = Some("Trace sequence exhausted; simulation was not advanced".into());
+            }
             Ok(SettleOutcome::Settled { .. }) | Ok(SettleOutcome::Oscillating { .. }) => {
                 self.settling = false
             }
@@ -952,15 +956,15 @@ impl DigitalApp {
                         SimAction::Stop,
                     ),
                     (
-                        "Step",
+                        "Microstep",
                         active && !modal_blocked,
                         "One microstep (F10)",
                         SimAction::Step,
                     ),
                     (
-                        "Settle",
+                        "Full step",
                         active && !modal_blocked,
-                        "Run until stable (F6)",
+                        "Run to stable state (F6)",
                         SimAction::Settle,
                     ),
                 ] {
@@ -1673,6 +1677,7 @@ impl DigitalApp {
                 }
             }
             let selection_width = ui.visuals().selection.stroke.width;
+            let pending_view = self.session.inspect().map(|runtime| runtime.pending_inspection());
             for c in &self.session.document().components {
                 let mut pos = c.position;
                 if let (Some((id, start, origin)), Some(p)) = (self.drag, pointer)
@@ -1729,6 +1734,22 @@ impl DigitalApp {
                     self.error = Some(e.to_string());
                 }
                 let bounds = layout.bounds();
+                if let Some(pending) = &pending_view {
+                    let marker_pos = transform.to_screen(bounds.min) + Vec2::new(0.0, -4.0);
+                    let mut offset=0.0;
+                    for (ids, label, color) in [
+                        (&pending.awaiting_evaluation, "EVAL", ui.visuals().hyperlink_color),
+                        (&pending.staged_unpublished, "STAGED", ui.visuals().warn_fg_color),
+                        (&pending.next_scheduled, "NEXT", ui.visuals().weak_text_color()),
+                    ] {
+                        if ids.binary_search(&c.id).is_ok() {
+                            let frame=Rect::from_min_max(transform.to_screen(bounds.min),transform.to_screen(bounds.max)).expand(3.0+offset);
+                            painter.rect_stroke(frame,3.0,Stroke::new(1.5_f32,color),egui::StrokeKind::Inside);
+                            painter.text(marker_pos-Vec2::new(0.0,offset),egui::Align2::LEFT_BOTTOM,label,egui::FontId::monospace(9.0),color);
+                            offset+=4.0;
+                        }
+                    }
+                }
                 if self.selected == Some(c.id) {
                     let frame = Rect::from_min_max(
                         transform.to_screen(bounds.min),
@@ -4145,7 +4166,10 @@ mod tests {
         let (start, start_visible) = text_position(&shown, "Start").unwrap();
         assert!(start_visible);
         // Wheel over the panel scrolls the list; the controls stay where they were.
-        let over_panel = Pos2::new(700., 300.);
+        let (input_header, input_header_visible) =
+            text_position(&shown, "Inputs (toggle when settled)").unwrap();
+        assert!(input_header_visible);
+        let over_panel = input_header + Vec2::new(6.0, 6.0);
         let mut events = vec![
             egui::Event::PointerMoved(over_panel),
             egui::Event::MouseWheel {
@@ -4158,7 +4182,9 @@ mod tests {
         for _ in 0..30 {
             shown = frame(&ctx, &mut app, vec![], true);
         }
-        let (_, visible) = text_position(&shown, &last_label).unwrap();
+        let Some((_, visible)) = text_position(&shown, &last_label) else {
+            panic!("last input not found after scroll: {:?}", texts(&shown));
+        };
         assert!(visible, "last input scrolled into view");
         assert_eq!(text_position(&shown, "Start"), Some((start, true)));
         assert!(!app.session.inspect().unwrap().is_pending());
@@ -4205,6 +4231,10 @@ mod tests {
         let paused = app.session.inspect().unwrap().pending_gate_count();
         let shown = frame(&ctx, &mut app, vec![], true);
         assert!(has_text(&shown, "paused"));
+        assert!(
+            has_text(&shown, "NEXT"),
+            "successor frontier is visibly identified"
+        );
         assert_eq!(
             app.session.inspect().unwrap().pending_gate_count(),
             paused,
@@ -4218,6 +4248,42 @@ mod tests {
         }
         assert_eq!(output_level(&app, output), Some(Level::Low));
         assert!(!app.session.inspect().unwrap().is_pending());
+    }
+
+    #[test]
+    fn paused_start_microstep_full_step_and_pause_shortcuts_route_to_engine() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let (_, output) = inverter_chain(&mut app, 2);
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::F10,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        assert!(app.session.simulation_active());
+        assert!(!app.settling);
+        assert!(app.session.inspect().unwrap().is_pending());
+        let pending = app.session.inspect().unwrap().pending_gate_count();
+        press(&ctx, &mut app, egui::Key::F10, egui::Modifiers::NONE);
+        assert!(
+            !app.session
+                .inspect()
+                .unwrap()
+                .pending_inspection()
+                .next_scheduled
+                .is_empty()
+        );
+        assert!(!app.settling);
+        assert_eq!(output_level(&app, output), Some(Level::Low));
+        press(&ctx, &mut app, egui::Key::F6, egui::Modifiers::SHIFT);
+        assert!(!app.settling);
+        // The shortcut route did not turn the F10 frontier into an unbounded successor loop.
+        assert!(pending > 0);
+        app.apply_simulation_action(SimAction::Stop);
     }
 
     #[test]

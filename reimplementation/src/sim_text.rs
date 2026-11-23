@@ -96,10 +96,20 @@ pub fn describe_simulation_error(document: &Document, error: &SimulationError) -
         SimulationError::Runtime(RuntimeError::InvalidOscillationLimit(limit)) => {
             format!("Oscillation limit {limit} is invalid.")
         }
+        SimulationError::Runtime(RuntimeError::TraceSequenceExhausted) => {
+            "Trace sequence exhausted; operation was not advanced.".into()
+        }
         SimulationError::InvalidOscillationLimit(limit) => format!(
             "Oscillation limit {limit} is invalid; choose 1–{}.",
             crate::simulation::MAX_WORK
         ),
+        SimulationError::TraceConfig(error) => format!("Trace configuration is invalid: {error}"),
+        SimulationError::TraceSequenceExhausted => {
+            "Trace sequence exhausted; operation was not advanced.".into()
+        }
+        SimulationError::SessionGenerationExhausted => {
+            "Simulation session generation exhausted.".into()
+        }
         SimulationError::Oscillation { diagnostic, work } => {
             describe_oscillation(document, diagnostic, *work)
         }

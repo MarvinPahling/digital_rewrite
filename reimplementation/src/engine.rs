@@ -13,6 +13,7 @@ use crate::runtime::{
     StartupPhase, StepOutcome,
 };
 use crate::simulation::CompileError;
+use crate::trace::{MAX_TRACE_CAPACITY, TraceConfigError, TraceLog};
 use std::path::{Path, PathBuf};
 pub struct TerminalSimulationContext {
     pub startup_seed: u64,
@@ -30,6 +31,8 @@ pub struct Session {
     runtime: Option<Runtime>,
     oscillation_diagnostic: Option<OscillationDiagnostic>,
     terminal_simulation_context: Option<TerminalSimulationContext>,
+    trace: Option<TraceLog>,
+    simulation_generation: u64,
     path: Option<PathBuf>,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -121,6 +124,9 @@ pub enum SimulationError {
     Compile(CompileError),
     Runtime(RuntimeError),
     InvalidOscillationLimit(usize),
+    TraceConfig(TraceConfigError),
+    TraceSequenceExhausted,
+    SessionGenerationExhausted,
     Oscillation {
         diagnostic: OscillationDiagnostic,
         work: usize,
@@ -138,6 +144,13 @@ impl std::fmt::Display for SimulationError {
                 "Oscillation limit must be between 1 and {} (got {limit})",
                 crate::simulation::MAX_WORK
             ),
+            Self::TraceConfig(error) => error.fmt(f),
+            Self::TraceSequenceExhausted => {
+                f.write_str("Trace sequence exhausted; operation was not advanced")
+            }
+            Self::SessionGenerationExhausted => {
+                f.write_str("Simulation session generation exhausted")
+            }
             Self::Oscillation { diagnostic, .. } => write!(
                 f,
                 "Circuit appears to oscillate after {} microsteps (limit {})",
@@ -158,6 +171,7 @@ impl Session {
             return Err(SessionDigError::DirtyDiscardRequired);
         }
         self.document = Document::default();
+        self.trace = None;
         self.oscillation_diagnostic = None;
         self.terminal_simulation_context = None;
         self.saved = Document::default();
@@ -188,6 +202,7 @@ impl Session {
             SessionDigError::Domain(formats::DomainCodecError("wire ID counter overflow".into()))
         })?;
         self.document = document.clone();
+        self.trace = None;
         self.oscillation_diagnostic = None;
         self.terminal_simulation_context = None;
         self.saved = document;
@@ -266,6 +281,7 @@ impl Session {
             SessionDigError::Domain(formats::DomainCodecError("wire ID counter overflow".into()))
         })?;
         self.document = document.clone();
+        self.trace = None;
         self.oscillation_diagnostic = None;
         self.terminal_simulation_context = None;
         self.saved = document;
@@ -378,21 +394,57 @@ impl Session {
         &mut self,
         options: SimulationOptions,
     ) -> Result<(), SimulationError> {
+        self.start_with_capture(options, None)
+    }
+    /// Starts with bounded trace capture. Capacity and allocation are validated before compile
+    /// or session mutation; successful starts replace the previously retained trace.
+    pub fn start_simulation_with_trace(
+        &mut self,
+        options: SimulationOptions,
+        capacity: usize,
+    ) -> Result<(), SimulationError> {
+        if !(1..=MAX_TRACE_CAPACITY).contains(&capacity) {
+            return Err(SimulationError::TraceConfig(
+                TraceConfigError::CapacityOutOfRange(capacity),
+            ));
+        }
+        let generation = self
+            .simulation_generation
+            .checked_add(1)
+            .ok_or(SimulationError::SessionGenerationExhausted)?;
+        let capture = TraceLog::new(capacity, options.startup_seed, generation)
+            .map_err(SimulationError::TraceConfig)?;
+        self.start_with_capture(options, Some(capture))
+    }
+    fn start_with_capture(
+        &mut self,
+        options: SimulationOptions,
+        capture: Option<TraceLog>,
+    ) -> Result<(), SimulationError> {
         if self.runtime.is_some() {
             return Err(SimulationError::AlreadyActive);
         }
+        let next_generation = self
+            .simulation_generation
+            .checked_add(1)
+            .ok_or(SimulationError::SessionGenerationExhausted)?;
         if options.oscillation_limit == 0 || options.oscillation_limit > crate::simulation::MAX_WORK
         {
             return Err(SimulationError::InvalidOscillationLimit(
                 options.oscillation_limit,
             ));
         }
-        let mut runtime = Runtime::start_with_seed(&self.document, options.startup_seed)
-            .map_err(SimulationError::Compile)?;
+        let mut runtime = match capture {
+            Some(trace) => Runtime::start_with_trace(&self.document, options.startup_seed, trace),
+            None => Runtime::start_with_seed(&self.document, options.startup_seed),
+        }
+        .map_err(SimulationError::Compile)?;
         runtime
             .set_oscillation_limit(options.oscillation_limit)
             .map_err(|_| SimulationError::InvalidOscillationLimit(options.oscillation_limit))?;
         self.runtime = Some(runtime);
+        self.simulation_generation = next_generation;
+        self.trace = None;
         self.oscillation_diagnostic = None;
         self.terminal_simulation_context = None;
         Ok(())
@@ -400,15 +452,31 @@ impl Session {
     pub fn oscillation_diagnostic(&self) -> Option<&OscillationDiagnostic> {
         self.oscillation_diagnostic.as_ref()
     }
+    pub fn trace(&self) -> Option<&TraceLog> {
+        self.runtime
+            .as_ref()
+            .and_then(Runtime::trace)
+            .or(self.trace.as_ref())
+    }
     pub fn terminal_simulation_context(&self) -> Option<&TerminalSimulationContext> {
         self.terminal_simulation_context.as_ref()
     }
     /// Discards the runtime; the document, history, dirty state and ids were never touched.
     pub fn stop_simulation(&mut self) -> Result<(), SimulationError> {
-        self.runtime
-            .take()
-            .map(drop)
-            .ok_or(SimulationError::NotActive)
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.can_trace_stop())
+        {
+            return Err(SimulationError::TraceSequenceExhausted);
+        }
+        let Some(mut runtime) = self.runtime.take() else {
+            return Err(SimulationError::NotActive);
+        };
+        runtime.trace_stop();
+        self.trace = runtime.take_trace();
+        drop(runtime);
+        Ok(())
     }
     fn runtime_mut(&mut self) -> Result<&mut Runtime, SimulationError> {
         self.runtime.as_mut().ok_or(SimulationError::NotActive)
@@ -422,13 +490,17 @@ impl Session {
             });
         }
         let outcome = self.runtime_mut()?.step();
+        if outcome == StepOutcome::TraceSequenceExhausted {
+            return Err(SimulationError::TraceSequenceExhausted);
+        }
         if let StepOutcome::Oscillating { diagnostic } = outcome {
-            let runtime = self.runtime.as_ref().ok_or(SimulationError::NotActive)?;
+            let mut runtime = self.runtime.take().ok_or(SimulationError::NotActive)?;
             let context = TerminalSimulationContext {
                 startup_seed: runtime.startup_seed(),
                 phase: runtime.startup_phase(),
             };
-            self.runtime = None;
+            self.trace = runtime.take_trace();
+            drop(runtime);
             self.oscillation_diagnostic = Some(diagnostic.clone());
             self.terminal_simulation_context = Some(context);
             return Err(SimulationError::Oscillation {
@@ -451,13 +523,17 @@ impl Session {
     }
 
     fn retain_terminal(&mut self, outcome: StepOutcome) -> Result<StepOutcome, SimulationError> {
+        if outcome == StepOutcome::TraceSequenceExhausted {
+            return Err(SimulationError::TraceSequenceExhausted);
+        }
         if let StepOutcome::Oscillating { diagnostic } = outcome {
-            let runtime = self.runtime.as_ref().ok_or(SimulationError::NotActive)?;
+            let mut runtime = self.runtime.take().ok_or(SimulationError::NotActive)?;
             let context = TerminalSimulationContext {
                 startup_seed: runtime.startup_seed(),
                 phase: runtime.startup_phase(),
             };
-            self.runtime = None;
+            self.trace = runtime.take_trace();
+            drop(runtime);
             self.oscillation_diagnostic = Some(diagnostic.clone());
             self.terminal_simulation_context = Some(context);
             Err(SimulationError::Oscillation {
@@ -477,13 +553,17 @@ impl Session {
             });
         }
         let outcome = self.runtime_mut()?.settle(budget);
+        if matches!(&outcome, SettleOutcome::TraceSequenceExhausted { .. }) {
+            return Err(SimulationError::TraceSequenceExhausted);
+        }
         if let SettleOutcome::Oscillating { work, diagnostic } = outcome {
-            let runtime = self.runtime.as_ref().ok_or(SimulationError::NotActive)?;
+            let mut runtime = self.runtime.take().ok_or(SimulationError::NotActive)?;
             let context = TerminalSimulationContext {
                 startup_seed: runtime.startup_seed(),
                 phase: runtime.startup_phase(),
             };
-            self.runtime = None;
+            self.trace = runtime.take_trace();
+            drop(runtime);
             self.oscillation_diagnostic = Some(diagnostic.clone());
             self.terminal_simulation_context = Some(context);
             return Err(SimulationError::Oscillation { diagnostic, work });
@@ -491,9 +571,13 @@ impl Session {
         Ok(outcome)
     }
     pub fn toggle_input(&mut self, id: ComponentId) -> Result<InputChange, SimulationError> {
-        self.runtime_mut()?
-            .toggle_input(id)
-            .map_err(SimulationError::Runtime)
+        self.runtime_mut()?.toggle_input(id).map_err(|error| {
+            if error == RuntimeError::TraceSequenceExhausted {
+                SimulationError::TraceSequenceExhausted
+            } else {
+                SimulationError::Runtime(error)
+            }
+        })
     }
     /// Set a one-bit input without changing the editable document or history.
     pub fn set_input(
@@ -501,9 +585,13 @@ impl Session {
         id: ComponentId,
         value: bool,
     ) -> Result<InputChange, SimulationError> {
-        self.runtime_mut()?
-            .set_input(id, value)
-            .map_err(SimulationError::Runtime)
+        self.runtime_mut()?.set_input(id, value).map_err(|error| {
+            if error == RuntimeError::TraceSequenceExhausted {
+                SimulationError::TraceSequenceExhausted
+            } else {
+                SimulationError::Runtime(error)
+            }
+        })
     }
     fn ensure_editable(&self) -> Result<(), EditError> {
         if self.runtime.is_some() {

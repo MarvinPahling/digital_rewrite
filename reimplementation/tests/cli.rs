@@ -665,3 +665,108 @@ fn feedback_startup_exhaustion_is_an_error_with_replay_seed_and_no_rows() {
     assert!(message.contains("StartupSettling"), "{message}");
     assert_eq!(fs::read(dir.0.join("ring.dig")).unwrap(), bytes);
 }
+
+#[test]
+fn bounded_trace_command_runs_ops_reports_ring_eviction_and_never_changes_file() {
+    let dir = TempDir::new();
+    let path = dir.0.join("trace.dig");
+    let bytes = fixture("");
+    fs::write(&path, &bytes).unwrap();
+    let result = cli(
+        &dir,
+        &[
+            "trace",
+            "trace.dig",
+            "--seed",
+            "5",
+            "--budget",
+            "20",
+            "--trace-capacity",
+            "1",
+            "--op",
+            "full",
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = String::from_utf8_lossy(&result.stdout);
+    assert!(output.contains("op 1=full pending=0"), "{output}");
+    assert!(
+        output.contains("capacity=1 retained=1 dropped="),
+        "{output}"
+    );
+    assert!(output.contains("event=Stop"), "{output}");
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    let invalid = cli(&dir, &["trace", "trace.dig", "--trace-capacity", "0"]);
+    assert_eq!(invalid.status.code(), Some(2));
+}
+
+#[test]
+fn trace_terminal_failure_reports_diagnostic_rows_without_settled_success() {
+    use digital_rust::domain::{
+        Component, ComponentId, ComponentKind as K, Document, PinDirection as D, PinId, PinRef,
+        Position, Wire, WireId,
+    };
+    let dir = TempDir::new();
+    let pin = |id, direction| PinRef {
+        component: ComponentId(id),
+        pin: PinId {
+            direction,
+            index: 0,
+        },
+    };
+    let document = Document {
+        components: vec![
+            Component {
+                id: ComponentId(1),
+                kind: K::Not,
+                position: Position { x: 0., y: 0. },
+                label: String::new(),
+                constant_value: true,
+            },
+            Component {
+                id: ComponentId(2),
+                kind: K::Output,
+                position: Position { x: 100., y: 0. },
+                label: String::new(),
+                constant_value: true,
+            },
+        ],
+        wires: vec![
+            Wire {
+                id: WireId(1),
+                endpoints: [pin(1, D::Output), pin(1, D::Input)],
+            },
+            Wire {
+                id: WireId(2),
+                endpoints: [pin(1, D::Output), pin(2, D::Input)],
+            },
+        ],
+    };
+    let bytes = digital_rust::formats::serialize_v2(
+        &digital_rust::formats::from_domain(&document).unwrap(),
+    )
+    .unwrap();
+    fs::write(dir.0.join("ring.dig"), &bytes).unwrap();
+    let output = cli(
+        &dir,
+        &[
+            "trace",
+            "ring.dig",
+            "--oscillation-limit",
+            "1",
+            "--budget",
+            "80000",
+            "--op",
+            "full",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("trace status=diagnostic"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("event=Terminal"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("oscillat"));
+    assert_eq!(fs::read(dir.0.join("ring.dig")).unwrap(), bytes);
+}

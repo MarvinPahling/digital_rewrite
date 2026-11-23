@@ -15,7 +15,7 @@ const MAX_ASSIGNMENTS: usize = 10_000;
 const MAX_BUDGET: usize = MAX_WORK;
 
 fn usage() -> &'static str {
-    "Usage:\n  digital-rust-cli open PATH\n  digital-rust-cli validate PATH\n  digital-rust-cli simulate PATH [--input ID=0|1]... [--budget N] [--oscillation-limit N] [--seed N]\n\nExit codes: 0 success, 1 document/operation/simulation failure, 2 usage error.\nOnly the strict editable .dig v2 subset and one-bit simulator are supported; feedback is accepted but settling is bounded and convergence is not guaranteed. Startup seed defaults to 0; seeded order uses splitmix64-fy-v1 and is not Java trace-compatible. This is not Digital CLI compatibility."
+    "Usage:\n  digital-rust-cli open PATH\n  digital-rust-cli validate PATH\n  digital-rust-cli simulate PATH [--input ID=0|1]... [--budget N] [--oscillation-limit N] [--seed N]\n  digital-rust-cli trace PATH [--seed N] [--oscillation-limit N] [--budget N] [--trace-capacity N] [--op micro|full|input:ID=0|1]...\n\nExit codes: 0 success, 1 document/operation/simulation failure, 2 usage error.\nOnly the strict editable .dig v2 subset and one-bit simulator are supported; feedback is accepted but settling is bounded and convergence is not guaranteed. Startup seed defaults to 0; seeded order uses splitmix64-fy-v1 and is not Java trace-compatible. This is not Digital CLI compatibility."
 }
 fn fail(message: impl std::fmt::Display, code: u8) -> ExitCode {
     eprintln!("digital-rust-cli: {message}");
@@ -65,7 +65,7 @@ fn run_with_io_output(
         outln!("{}", usage());
         return Ok(());
     }
-    if !matches!(command, "open" | "validate" | "simulate") {
+    if !matches!(command, "open" | "validate" | "simulate" | "trace") {
         return Err((format!("unknown command {command:?}\n{}", usage()), 2));
     }
     let path = args
@@ -78,15 +78,17 @@ fn run_with_io_output(
         0_u64,
         false,
     );
-    if command != "simulate" && args.next().is_some() {
+    let mut trace_capacity = 1024usize;
+    let mut trace_ops = Vec::<String>::new();
+    if !matches!(command, "simulate" | "trace") && args.next().is_some() {
         return Err((format!("unexpected argument\n{}", usage()), 2));
     }
-    if command == "simulate" {
+    if command == "simulate" || command == "trace" {
         let rest: Vec<_> = args.collect();
         let mut i = 0;
         while i < rest.len() {
             match rest[i].to_str() {
-                Some("--input") => {
+                Some("--input") if command == "simulate" => {
                     i += 1;
                     let text = rest
                         .get(i)
@@ -114,6 +116,55 @@ fn run_with_io_output(
                     assignments.push((ComponentId(id), value));
                     if assignments.len() > MAX_ASSIGNMENTS {
                         return Err((format!("too many assignments (limit {MAX_ASSIGNMENTS})"), 2));
+                    }
+                }
+                Some("--op") if command == "trace" => {
+                    i += 1;
+                    let op = rest
+                        .get(i)
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| ("--op requires a UTF-8 operation".into(), 2))?;
+                    if !(op == "micro" || op == "full" || op.starts_with("input:")) {
+                        return Err((format!("invalid trace operation {op:?}"), 2));
+                    }
+                    if let Some(assignment) = op.strip_prefix("input:") {
+                        let (id, value) = assignment.split_once('=').ok_or_else(|| {
+                            (
+                                format!(
+                                    "invalid trace input operation {op:?}; expected input:ID=0|1"
+                                ),
+                                2,
+                            )
+                        })?;
+                        id.parse::<u64>()
+                            .map_err(|_| (format!("invalid component ID {id:?}"), 2))?;
+                        if !matches!(value, "0" | "1") {
+                            return Err((
+                                format!("invalid input value {value:?}; expected 0 or 1"),
+                                2,
+                            ));
+                        }
+                    }
+                    trace_ops.push(op.to_owned());
+                    if trace_ops.len() > 10_000 {
+                        return Err(("too many trace operations (limit 10000)".into(), 2));
+                    }
+                }
+                Some("--trace-capacity") if command == "trace" => {
+                    i += 1;
+                    let text = rest
+                        .get(i)
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| ("--trace-capacity requires an integer".into(), 2))?;
+                    trace_capacity = parse_number(text, "trace capacity").map_err(|e| (e, 2))?;
+                    if !(1..=digital_rust::trace::MAX_TRACE_CAPACITY).contains(&trace_capacity) {
+                        return Err((
+                            format!(
+                                "trace capacity must be 1..={}",
+                                digital_rust::trace::MAX_TRACE_CAPACITY
+                            ),
+                            2,
+                        ));
                     }
                 }
                 Some("--seed") => {
@@ -216,6 +267,188 @@ fn run_with_io_output(
                 "valid: supported one-bit circuit structure (not full Digital validation; feedback convergence is not assessed)"
             );
         }
+        "trace" => {
+            for op in &trace_ops {
+                if let Some(assignment) = op.strip_prefix("input:") {
+                    let (id, _) = assignment
+                        .split_once('=')
+                        .ok_or_else(|| ("invalid trace input operation".into(), 2))?;
+                    let id = ComponentId(
+                        id.parse::<u64>()
+                            .map_err(|_| (format!("invalid component ID {id:?}"), 2))?,
+                    );
+                    let Some(component) = session
+                        .document()
+                        .components
+                        .iter()
+                        .find(|component| component.id == id)
+                    else {
+                        return Err((format!("unknown input component ID {}", id.0), 1));
+                    };
+                    if component.kind != ComponentKind::Input {
+                        return Err((format!("component ID {} is not an input", id.0), 1));
+                    }
+                }
+            }
+            if session.document().components.len() > MAX_COMPONENTS {
+                return Err(("component limit exceeded".into(), 1));
+            }
+            session
+                .start_simulation_with_trace(
+                    SimulationOptions {
+                        startup_seed,
+                        oscillation_limit,
+                    },
+                    trace_capacity,
+                )
+                .map_err(|e| {
+                    (
+                        sim_text::describe_simulation_error(session.document(), &e),
+                        1,
+                    )
+                })?;
+            let execution = (|| -> Result<(), (String, u8)> {
+                let mut remaining = budget;
+                for (number, op) in trace_ops.iter().enumerate() {
+                    if op == "micro" {
+                        let max_micro = 1 + session
+                            .document()
+                            .components
+                            .iter()
+                            .filter(|c| {
+                                matches!(
+                                    c.kind,
+                                    ComponentKind::And
+                                        | ComponentKind::NAnd
+                                        | ComponentKind::Or
+                                        | ComponentKind::NOr
+                                        | ComponentKind::XOr
+                                        | ComponentKind::XNOr
+                                        | ComponentKind::Not
+                                )
+                            })
+                            .count();
+                        if remaining < max_micro {
+                            return Err((
+                                format!(
+                                    "trace work budget exhausted before operation {} (needs up to {max_micro} work units)",
+                                    number + 1
+                                ),
+                                1,
+                            ));
+                        }
+                        match session.micro_step_simulation().map_err(|e| {
+                            (
+                                sim_text::describe_simulation_error(session.document(), &e),
+                                1,
+                            )
+                        })? {
+                            digital_rust::runtime::StepOutcome::Stepped { evaluated } => {
+                                remaining = remaining.saturating_sub(evaluated.saturating_add(1));
+                            }
+                            digital_rust::runtime::StepOutcome::Idle => {}
+                            other => {
+                                return Err((format!("microstep did not complete: {other:?}"), 1));
+                            }
+                        }
+                    } else if op == "full" {
+                        let before = remaining;
+                        settle(&mut session, &mut remaining, budget)?;
+                        if before == remaining
+                            && session
+                                .inspect()
+                                .is_some_and(|runtime| runtime.is_pending())
+                        {
+                            return Err(("full settle made no progress".into(), 1));
+                        }
+                    } else {
+                        let assignment = op.strip_prefix("input:").unwrap_or_default();
+                        let (id, value) = assignment.split_once('=').ok_or_else(|| {
+                            (
+                                format!(
+                                    "invalid trace input operation {op:?}; expected input:ID=0|1"
+                                ),
+                                2,
+                            )
+                        })?;
+                        let id = ComponentId(
+                            id.parse::<u64>()
+                                .map_err(|_| (format!("invalid component ID {id:?}"), 2))?,
+                        );
+                        let value = match value {
+                            "0" => false,
+                            "1" => true,
+                            _ => return Err((format!("invalid input value {value:?}"), 2)),
+                        };
+                        if remaining == 0 {
+                            return Err((
+                                format!(
+                                    "trace work budget exhausted before operation {}",
+                                    number + 1
+                                ),
+                                1,
+                            ));
+                        }
+                        session.set_input(id, value).map_err(|e| {
+                            (
+                                sim_text::describe_simulation_error(session.document(), &e),
+                                1,
+                            )
+                        })?;
+                        remaining -= 1;
+                    }
+                    let pending = session.inspect().map(|r| r.pending_inspection());
+                    if let Some(pending) = pending {
+                        outln!(
+                            "op {}={} pending={} awaiting={:?} staged={:?} next={:?}",
+                            number + 1,
+                            op,
+                            pending.unique_count,
+                            pending
+                                .awaiting_evaluation
+                                .iter()
+                                .map(|id| id.0)
+                                .collect::<Vec<_>>(),
+                            pending
+                                .staged_unpublished
+                                .iter()
+                                .map(|id| id.0)
+                                .collect::<Vec<_>>(),
+                            pending
+                                .next_scheduled
+                                .iter()
+                                .map(|id| id.0)
+                                .collect::<Vec<_>>()
+                        );
+                    } else {
+                        outln!("op {}={} status=terminal", number + 1, op);
+                    }
+                }
+                Ok(())
+            })();
+            if session.simulation_active() {
+                session.stop_simulation().map_err(|e| (e.to_string(), 1))?;
+            }
+            let trace = session
+                .trace()
+                .ok_or_else(|| ("trace capture unavailable".into(), 1))?;
+            if let Err((message, _)) = &execution {
+                outln!("trace status=diagnostic error=\"{}\"", escaped(message));
+            }
+            outln!(
+                "trace seed={} policy={} capacity={} retained={} dropped={} first_sequence={:?}",
+                trace.header.startup_seed,
+                trace.header.random_policy,
+                trace.capacity(),
+                trace.len(),
+                trace.dropped(),
+                trace.first_sequence()
+            );
+            for record in trace.records() {
+                outln!("trace seq={} event={:?}", record.sequence, record.event);
+            }
+            execution?;
+        }
         "simulate" => {
             // Check every user-supplied assignment before compilation/startup can tick runtime.
             let mut seen = std::collections::HashSet::new();
@@ -306,6 +539,10 @@ fn settle(session: &mut Session, remaining: &mut usize, total: usize) -> Result<
         }
         SettleOutcome::BudgetExhausted { .. } => Err((
             format!("settling work budget exhausted (limit {total}); no settled outputs reported"),
+            1,
+        )),
+        SettleOutcome::TraceSequenceExhausted { .. } => Err((
+            "trace sequence exhausted; operation was not advanced".into(),
             1,
         )),
         SettleOutcome::Oscillating { work, diagnostic } => Err((

@@ -7,6 +7,7 @@
 //! Running-state fixtures and is not used as a guessed startup value. High-Z and buses are absent.
 use crate::domain::*;
 use crate::simulation::{CompileError, CompiledCircuit, compile};
+use crate::trace::{TraceEvent, TraceLog};
 use std::collections::{BTreeMap, HashMap};
 
 pub const DEFAULT_OSCILLATION_LIMIT: usize = 1_000;
@@ -79,6 +80,7 @@ pub enum RuntimeError {
     UnknownComponent(ComponentId),
     NotAnInput(ComponentId),
     InvalidOscillationLimit(usize),
+    TraceSequenceExhausted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,9 +94,14 @@ pub enum StepOutcome {
     /// Nothing was pending; state is untouched.
     Idle,
     /// One microstep published the outputs of `evaluated` gates.
-    Stepped { evaluated: usize },
+    Stepped {
+        evaluated: usize,
+    },
     /// A previous settle latched terminal oscillation; no more work is permitted.
-    Oscillating { diagnostic: OscillationDiagnostic },
+    Oscillating {
+        diagnostic: OscillationDiagnostic,
+    },
+    TraceSequenceExhausted,
 }
 
 /// Work is counted in gate evaluations plus one unit per microstep started.
@@ -111,6 +118,9 @@ pub enum SettleOutcome {
     Oscillating {
         work: usize,
         diagnostic: OscillationDiagnostic,
+    },
+    TraceSequenceExhausted {
+        work: usize,
     },
 }
 
@@ -242,6 +252,8 @@ pub struct Runtime {
     oscillation_limit: usize,
     detector: Option<OscillationDetector>,
     terminal: Option<OscillationDiagnostic>,
+    trace: Option<TraceLog>,
+    trace_stable: bool,
 }
 
 impl Runtime {
@@ -337,6 +349,62 @@ impl Runtime {
             oscillation_limit: DEFAULT_OSCILLATION_LIMIT,
             detector: None,
             terminal: None,
+            trace: None,
+            trace_stable: false,
+        }
+    }
+
+    /// Starts with an already validated, bounded trace ring so capture includes startup.
+    pub fn start_with_trace(
+        document: &Document,
+        seed: u64,
+        trace: TraceLog,
+    ) -> Result<Self, CompileError> {
+        let mut runtime = Self::start_with_seed(document, seed)?;
+        runtime.trace = Some(trace);
+        runtime.trace_event(TraceEvent::Lifecycle {
+            phase: StartupPhase::StartupSettling,
+        });
+        Ok(runtime)
+    }
+
+    fn trace_can_record(&self, count: usize) -> bool {
+        self.trace
+            .as_ref()
+            .is_none_or(|trace| trace.can_record(count))
+    }
+    pub fn trace(&self) -> Option<&TraceLog> {
+        self.trace.as_ref()
+    }
+    pub(crate) fn take_trace(&mut self) -> Option<TraceLog> {
+        self.trace.take()
+    }
+    #[cfg(test)]
+    pub(crate) fn force_trace_sequence_for_test(&mut self, sequence: u64) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.force_sequence(sequence);
+        }
+    }
+    pub(crate) fn trace_stop(&mut self) {
+        self.trace_event(TraceEvent::Stop);
+    }
+    pub(crate) fn can_trace_stop(&self) -> bool {
+        self.trace_can_record(1)
+    }
+    fn trace_event(&mut self, event: TraceEvent) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.record(event);
+        }
+    }
+    fn trace_stability_if_reached(&mut self) {
+        if self.startup_phase == StartupPhase::Running && !self.is_pending() {
+            self.mark_stable();
+        }
+    }
+    fn mark_stable(&mut self) {
+        if !self.trace_stable {
+            self.trace_event(TraceEvent::Stable);
+            self.trace_stable = true;
         }
     }
 
@@ -492,7 +560,12 @@ impl Runtime {
         if self.values[net] == level {
             return Ok(InputChange::Unchanged);
         }
+        if !self.trace_can_record(1) {
+            return Err(RuntimeError::TraceSequenceExhausted);
+        }
         self.values[net] = level;
+        self.trace_stable = false;
+        self.trace_event(TraceEvent::InputChanged { component, value });
         self.schedule_consumers(net);
         Ok(InputChange::Changed)
     }
@@ -515,8 +588,13 @@ impl Runtime {
         if let Some(diagnostic) = self.terminal.clone() {
             return StepOutcome::Oscillating { diagnostic };
         }
+        if self.is_pending()
+            && !self.trace_can_record(self.gates.len().saturating_mul(2).saturating_add(4))
+        {
+            return StepOutcome::TraceSequenceExhausted;
+        }
         if self.startup_phase != StartupPhase::Running {
-            return match self.advance_startup_unit() {
+            let outcome = match self.advance_startup_unit() {
                 Ok(true) => StepOutcome::Stepped { evaluated: 1 },
                 Ok(false) if self.startup_phase != StartupPhase::Running => {
                     StepOutcome::Stepped { evaluated: 0 }
@@ -524,10 +602,13 @@ impl Runtime {
                 Ok(false) => StepOutcome::Idle,
                 Err(diagnostic) => StepOutcome::Oscillating { diagnostic },
             };
+            self.trace_stability_if_reached();
+            return outcome;
         }
         // Explicit stepping is a raw, undetected microstep; it closes any settle episode.
         self.detector = None;
         if !self.is_pending() {
+            self.trace_stability_if_reached();
             return StepOutcome::Idle;
         }
         if self.batch.is_none() {
@@ -536,6 +617,7 @@ impl Runtime {
         loop {
             if let Some(evaluated) = self.evaluate_next() {
                 self.detector = None;
+                self.trace_stability_if_reached();
                 return StepOutcome::Stepped { evaluated };
             }
         }
@@ -548,13 +630,20 @@ impl Runtime {
         if let Some(diagnostic) = self.terminal.clone() {
             return StepOutcome::Oscillating { diagnostic };
         }
+        if self.is_pending()
+            && !self.trace_can_record(self.gates.len().saturating_mul(2).saturating_add(4))
+        {
+            return StepOutcome::TraceSequenceExhausted;
+        }
         if self.startup_phase != StartupPhase::Running {
             if self.startup_phase == StartupPhase::ResetRelease {
                 let _ = self.advance_startup_unit();
+                self.trace_stability_if_reached();
                 return StepOutcome::Stepped { evaluated: 0 };
             }
             if self.startup_phase == StartupPhase::ResetSettling {
                 let _ = self.advance_startup_unit();
+                self.trace_stability_if_reached();
                 return StepOutcome::Stepped { evaluated: 0 };
             }
             if self.startup_cursor >= self.startup_frontier.len() {
@@ -574,6 +663,7 @@ impl Runtime {
             if initial_len == 0 && self.startup_phase == StartupPhase::StartupSettling {
                 let _ = self.advance_startup_unit();
             }
+            self.trace_stability_if_reached();
             return if evaluated > 0 || self.startup_phase != StartupPhase::Running {
                 StepOutcome::Stepped { evaluated }
             } else {
@@ -582,6 +672,7 @@ impl Runtime {
         }
         self.detector = None;
         if !self.is_pending() {
+            self.trace_stability_if_reached();
             return StepOutcome::Idle;
         }
         if self.batch.is_none() {
@@ -599,11 +690,16 @@ impl Runtime {
             self.evaluate_next();
             evaluated += 1;
         }
+        self.trace_stability_if_reached();
         StepOutcome::Stepped { evaluated }
     }
 
     /// Bounded full-settle episode; chunks resume one unchanged detection episode.
     pub fn settle(&mut self, budget: usize) -> SettleOutcome {
+        let trace_headroom = budget.saturating_mul(4).saturating_add(8);
+        if budget > 0 && !self.trace_can_record(trace_headroom) {
+            return SettleOutcome::TraceSequenceExhausted { work: 0 };
+        }
         if let Some(diagnostic) = self.terminal.clone() {
             return SettleOutcome::Oscillating {
                 work: 0,
@@ -653,6 +749,7 @@ impl Runtime {
                         components,
                     };
                     self.terminal = Some(diagnostic.clone());
+                    self.trace_event(TraceEvent::Terminal);
                     return SettleOutcome::Oscillating { work, diagnostic };
                 }
                 detector.begin_batch(scheduled);
@@ -664,6 +761,7 @@ impl Runtime {
             }
         }
         self.detector = None;
+        self.mark_stable();
         SettleOutcome::Settled { work }
     }
 
@@ -674,6 +772,9 @@ impl Runtime {
             if self.startup_cursor >= self.startup_frontier.len() {
                 if self.startup_next.is_empty() {
                     self.startup_phase = StartupPhase::ResetRelease;
+                    self.trace_event(TraceEvent::Lifecycle {
+                        phase: StartupPhase::ResetRelease,
+                    });
                     return Ok(false);
                 }
                 let mut next = std::mem::take(&mut self.startup_next);
@@ -687,6 +788,10 @@ impl Runtime {
                 self.startup_frontier_shuffled = false;
             }
             if self.startup_batch_pending && !self.startup_frontier.is_empty() {
+                self.trace_event(TraceEvent::FrontierBegin {
+                    startup: true,
+                    phase: self.startup_phase,
+                });
                 if !self.startup_frontier_shuffled {
                     self.rng.shuffle(&mut self.startup_frontier);
                     self.startup_frontier_shuffled = true;
@@ -701,6 +806,7 @@ impl Runtime {
                         components: detector.components.values().cloned().collect(),
                     };
                     self.terminal = Some(diagnostic.clone());
+                    self.trace_event(TraceEvent::Terminal);
                     return Err(diagnostic);
                 }
                 let scheduled: Vec<_> = self
@@ -714,17 +820,42 @@ impl Runtime {
             }
             if let Some(&index) = self.startup_frontier.get(self.startup_cursor) {
                 self.startup_cursor += 1;
-                let gate = &self.gates[index];
-                let level = gate.evaluate(&self.values);
-                let net = gate.output;
+                let (gate_id, net, level) = {
+                    let gate = &self.gates[index];
+                    (gate.id, gate.output, gate.evaluate(&self.values))
+                };
+                self.trace_event(TraceEvent::GateEvaluated {
+                    component: gate_id,
+                    immediate: true,
+                    value: level,
+                });
                 if self.values[net] != level {
+                    let old = self.values[net];
                     self.values[net] = level;
+                    self.trace_event(TraceEvent::NetPublished {
+                        net,
+                        driver: PinRef {
+                            component: gate_id,
+                            pin: PinId {
+                                direction: PinDirection::Output,
+                                index: 0,
+                            },
+                        },
+                        old,
+                        new: level,
+                    });
                     for &consumer in &self.consumers[net] {
                         if !self.startup_queued[consumer] {
                             self.startup_queued[consumer] = true;
                             self.startup_next.push(consumer);
                         }
                     }
+                }
+                if self.startup_cursor == self.startup_frontier.len() {
+                    self.trace_event(TraceEvent::FrontierComplete {
+                        startup: true,
+                        evaluated: self.startup_frontier.len(),
+                    });
                 }
                 return Ok(true);
             }
@@ -737,6 +868,9 @@ impl Runtime {
                     // This catalog has no reset participants. Keep one observable barrier,
                     // then enter Running without manufacturing a propagation step.
                     self.startup_phase = StartupPhase::Running;
+                    self.trace_event(TraceEvent::Lifecycle {
+                        phase: StartupPhase::Running,
+                    });
                     self.detector = None;
                 } else {
                     self.startup_phase = StartupPhase::ResetSettling;
@@ -745,6 +879,9 @@ impl Runtime {
             }
             StartupPhase::ResetSettling => {
                 self.startup_phase = StartupPhase::Running;
+                self.trace_event(TraceEvent::Lifecycle {
+                    phase: StartupPhase::Running,
+                });
                 self.detector = None;
                 Ok(false)
             }
@@ -755,6 +892,10 @@ impl Runtime {
 
     /// Snapshots the scheduled gates as the next microstep.
     fn begin_batch(&mut self) {
+        self.trace_event(TraceEvent::FrontierBegin {
+            startup: false,
+            phase: StartupPhase::Running,
+        });
         let gates = std::mem::take(&mut self.queue);
         for &gate in &gates {
             self.queued[gate] = false;
@@ -768,9 +909,19 @@ impl Runtime {
     /// Evaluates one gate of the current microstep against unpublished values. After the
     /// last gate, publishes all outputs together and returns the batch size.
     fn evaluate_next(&mut self) -> Option<usize> {
+        let gate = {
+            let batch = self.batch.as_ref()?;
+            *batch.gates.get(batch.staged.len())?
+        };
+        let gate_id = self.gates[gate].id;
+        let value = self.gates[gate].evaluate(&self.values);
+        self.trace_event(TraceEvent::GateEvaluated {
+            component: gate_id,
+            immediate: false,
+            value,
+        });
         let batch = self.batch.as_mut()?;
-        let gate = batch.gates[batch.staged.len()];
-        batch.staged.push(self.gates[gate].evaluate(&self.values));
+        batch.staged.push(value);
         if batch.staged.len() < batch.gates.len() {
             return None;
         }
@@ -779,13 +930,30 @@ impl Runtime {
         for (&gate, &level) in batch.gates.iter().zip(&batch.staged) {
             let net = self.gates[gate].output;
             if self.values[net] != level {
+                let old = self.values[net];
                 self.values[net] = level;
+                self.trace_event(TraceEvent::NetPublished {
+                    net,
+                    driver: PinRef {
+                        component: self.gates[gate].id,
+                        pin: PinId {
+                            direction: PinDirection::Output,
+                            index: 0,
+                        },
+                    },
+                    old,
+                    new: level,
+                });
                 changed.push(net);
             }
         }
         for net in changed {
             self.schedule_consumers(net);
         }
+        self.trace_event(TraceEvent::FrontierComplete {
+            startup: false,
+            evaluated: batch.gates.len(),
+        });
         Some(batch.gates.len())
     }
 
@@ -2054,6 +2222,7 @@ mod tests {
                     break;
                 }
                 SettleOutcome::Oscillating { .. } => panic!("no detector configured"),
+                SettleOutcome::TraceSequenceExhausted { .. } => panic!("trace capture is disabled"),
             }
             assert!(calls < 1_000, "bounded calls must make progress");
         }
@@ -2122,5 +2291,18 @@ mod tests {
             Runtime::start(&document),
             Err(CompileError::MissingDriver { .. })
         ));
+    }
+
+    #[test]
+    fn trace_sequence_exhaustion_preflights_without_advancing_runtime() {
+        let doc = not_chain(2);
+        let mut runtime =
+            Runtime::start_with_trace(&doc, 5, crate::trace::TraceLog::new(32, 5, 0).unwrap())
+                .unwrap();
+        runtime.force_trace_sequence_for_test(u64::MAX);
+        let before = snapshot(&runtime, &doc);
+        assert_eq!(runtime.micro_step(), StepOutcome::TraceSequenceExhausted);
+        assert_eq!(snapshot(&runtime, &doc), before);
+        assert_eq!(runtime.startup_phase(), StartupPhase::StartupSettling);
     }
 }
