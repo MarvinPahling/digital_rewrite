@@ -4,14 +4,7 @@
 #[allow(dead_code)]
 mod assets;
 mod canvas;
-use digital_rust::components;
-use digital_rust::domain;
-use digital_rust::runtime;
-use digital_rust::simulation;
-mod engine;
-mod file_session;
-mod formats;
-mod sim_text;
+use digital_rust::{components, domain, engine, file_session, runtime, sim_text};
 mod symbol_render;
 #[cfg(test)]
 mod symbol_sheet;

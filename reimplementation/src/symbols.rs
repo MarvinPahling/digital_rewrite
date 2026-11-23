@@ -159,6 +159,10 @@ pub fn origin_from_center(style: SymbolStyle, kind: ComponentKind, center: Point
 }
 
 /// Center offset from the logical symbol origin used by Digital's element position.
+#[allow(
+    dead_code,
+    reason = "the library format adapter calls this through its own module instance"
+)]
 pub fn center_from_origin_offset(style: SymbolStyle, kind: ComponentKind) -> Option<Point> {
     let bounds = symbol(style, kind)?.bounds;
     Some([

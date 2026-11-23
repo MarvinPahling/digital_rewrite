@@ -330,6 +330,16 @@ impl Session {
             .toggle_input(id)
             .map_err(SimulationError::Runtime)
     }
+    /// Set a one-bit input without changing the editable document or history.
+    pub fn set_input(
+        &mut self,
+        id: ComponentId,
+        value: bool,
+    ) -> Result<InputChange, SimulationError> {
+        self.runtime_mut()?
+            .set_input(id, value)
+            .map_err(SimulationError::Runtime)
+    }
     fn ensure_editable(&self) -> Result<(), EditError> {
         if self.runtime.is_some() {
             Err(EditError::SimulationActive)
@@ -459,6 +469,41 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn set_input_changes_only_runtime_not_document_history_or_dirty_state() {
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let document = session.document().clone();
+        let undo_len = session.undo.len();
+        let dirty = session.dirty();
+        session.start_simulation().unwrap();
+        assert_eq!(
+            session.settle_simulation(10).unwrap(),
+            SettleOutcome::Settled { work: 0 }
+        );
+        assert_eq!(session.set_input(id, true).unwrap(), InputChange::Changed);
+        assert_eq!(
+            session.settle_simulation(10).unwrap(),
+            SettleOutcome::Settled { work: 0 }
+        );
+        assert_eq!(
+            session.inspect().unwrap().pin_value(PinRef {
+                component: id,
+                pin: crate::domain::PinId {
+                    direction: crate::domain::PinDirection::Output,
+                    index: 0
+                }
+            }),
+            Some(crate::runtime::Level::High)
+        );
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo.len(), undo_len);
+        assert_eq!(session.dirty(), dirty);
+        session.stop_simulation().unwrap();
+    }
+
     #[test]
     fn new_document_is_clean_transactional_and_requires_discard() {
         let mut session = Session::default();
