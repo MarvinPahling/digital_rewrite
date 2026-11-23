@@ -1417,6 +1417,43 @@ mod tests {
         assert_eq!(s.path, before.path);
     }
     #[test]
+    fn feedback_start_is_locked_and_stop_restores_editing_and_history() {
+        use crate::domain::{PinDirection, PinId};
+        let mut s = Session::default();
+        let a = s
+            .place(ComponentKind::Not, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let b = s
+            .place(ComponentKind::Not, Position { x: 1.0, y: 0.0 })
+            .unwrap();
+        let pin = |component, direction| PinRef {
+            component,
+            pin: PinId {
+                direction,
+                index: 0,
+            },
+        };
+        s.connect([pin(a, PinDirection::Output), pin(b, PinDirection::Input)])
+            .unwrap();
+        s.connect([pin(b, PinDirection::Output), pin(a, PinDirection::Input)])
+            .unwrap();
+        let before = snapshot(&s);
+        s.start_simulation().unwrap();
+        assert!(s.simulation_active());
+        assert_eq!(s.undo(), Err(EditError::SimulationActive));
+        assert_eq!(s.redo(), Err(EditError::SimulationActive));
+        assert_eq!(
+            s.place(ComponentKind::Input, Position { x: 4.0, y: 4.0 }),
+            Err(EditError::SimulationActive)
+        );
+        assert_unchanged(&s, &before);
+        s.stop_simulation().unwrap();
+        assert!(!s.simulation_active());
+        s.undo().unwrap();
+        assert_ne!(s.document, before.document);
+    }
+
+    #[test]
     fn failed_start_preserves_everything_and_does_not_activate() {
         let mut s = Session::default();
         let p = Position { x: 0.0, y: 0.0 };

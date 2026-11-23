@@ -3384,6 +3384,37 @@ mod tests {
     }
 
     #[test]
+    fn existing_simulation_controls_start_and_stop_feedback_without_startup_claims() {
+        use crate::domain::{PinDirection, PinId};
+        let ctx = egui::Context::default();
+        let mut app = app_with(ComponentKind::Not);
+        let id = app.session.document().components[0].id;
+        app.session
+            .connect([
+                PinRef {
+                    component: id,
+                    pin: PinId {
+                        direction: PinDirection::Output,
+                        index: 0,
+                    },
+                },
+                PinRef {
+                    component: id,
+                    pin: PinId {
+                        direction: PinDirection::Input,
+                        index: 0,
+                    },
+                },
+            ])
+            .unwrap();
+        click_text(&ctx, &mut app, "Start");
+        assert!(app.session.simulation_active());
+        assert!(app.failed_start.is_none());
+        click_text(&ctx, &mut app, "Stop");
+        assert!(!app.session.simulation_active());
+    }
+
+    #[test]
     fn shape_style_defaults_to_rectangular_and_is_offered_in_the_palette() {
         let ctx = egui::Context::default();
         let mut app = app_with(ComponentKind::And);

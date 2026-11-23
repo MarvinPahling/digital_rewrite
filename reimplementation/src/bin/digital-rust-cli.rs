@@ -15,7 +15,7 @@ const MAX_ASSIGNMENTS: usize = 10_000;
 const MAX_BUDGET: usize = MAX_WORK;
 
 fn usage() -> &'static str {
-    "Usage:\n  digital-rust-cli open PATH\n  digital-rust-cli validate PATH\n  digital-rust-cli simulate PATH [--input ID=0|1]... [--budget N]\n\nExit codes: 0 success, 1 document/operation/simulation failure, 2 usage error.\nOnly the strict editable .dig v2 subset and one-bit acyclic simulator are supported; this is not Digital CLI compatibility."
+    "Usage:\n  digital-rust-cli open PATH\n  digital-rust-cli validate PATH\n  digital-rust-cli simulate PATH [--input ID=0|1]... [--budget N]\n\nExit codes: 0 success, 1 document/operation/simulation failure, 2 usage error.\nOnly the strict editable .dig v2 subset and one-bit simulator are supported; feedback is accepted but settling is bounded and convergence is not guaranteed. This is not Digital CLI compatibility."
 }
 fn fail(message: impl std::fmt::Display, code: u8) -> ExitCode {
     eprintln!("digital-rust-cli: {message}");
@@ -158,7 +158,9 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
         "validate" => {
             simulation::compile(session.document())
                 .map_err(|e| (sim_text::describe_compile_error(session.document(), &e), 1))?;
-            println!("valid: supported one-bit acyclic circuit (not full Digital validation)");
+            println!(
+                "valid: supported one-bit circuit structure (not full Digital validation; feedback convergence is not assessed)"
+            );
         }
         "simulate" => {
             // Check every user-supplied assignment before compilation/startup can tick runtime.

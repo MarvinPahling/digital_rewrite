@@ -403,7 +403,7 @@ fn non_utf8_filename_is_passed_as_an_os_path() {
 }
 
 #[test]
-fn validate_reports_floating_multiple_driver_and_feedback_errors() {
+fn validate_keeps_driver_errors_but_accepts_feedback_without_claiming_convergence() {
     use digital_rust::{
         domain::{
             ComponentId as C, ComponentKind as K, PinDirection as D, PinId, PinRef, Wire, WireId,
@@ -473,8 +473,16 @@ fn validate_reports_floating_multiple_driver_and_feedback_errors() {
     let bytes = formats::serialize_v2(&formats::from_domain(&cycle).unwrap()).unwrap();
     fs::write(dir.0.join("cycle.dig"), bytes).unwrap();
     let out = cli(&dir, &["validate", "cycle.dig"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Feedback loop"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("feedback convergence is not assessed"),
+        "{stdout}"
+    );
 }
 
 #[test]

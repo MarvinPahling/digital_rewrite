@@ -1,7 +1,7 @@
-//! Bounded compiler for one-bit acyclic circuits with explicit-pin connectivity.
+//! Bounded compiler for one-bit circuits with explicit-pin connectivity.
 //! Geometry never joins nets. Floating receiving pins and multiple drivers are errors.
 use crate::domain::*;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Limits are checked before allocating compiler work proportional to the document.
 pub const MAX_COMPONENTS: usize = 10_000;
@@ -20,7 +20,6 @@ pub enum CompileError {
     InvalidEndpoint { wire: WireId, pin: PinRef },
     MissingDriver { pins: Vec<PinRef> },
     MultipleDrivers { pins: Vec<PinRef> },
-    Cycle { components: Vec<ComponentId> },
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Net {
@@ -30,7 +29,6 @@ pub struct Net {
 #[derive(Debug, PartialEq, Eq)]
 pub struct CompiledCircuit {
     pub nets: Vec<Net>,
-    pub order: Vec<ComponentId>,
 }
 
 fn root(parent: &mut [usize], mut n: usize) -> usize {
@@ -107,8 +105,6 @@ pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
         groups.entry(root(&mut parent, i)).or_default().push(*pin);
     }
     let mut nets = Vec::new();
-    let mut edges = vec![Vec::new(); document.components.len()];
-    let mut degrees = vec![0usize; document.components.len()];
     for pins in groups.into_values() {
         let drivers: Vec<_> = pins
             .iter()
@@ -126,97 +122,13 @@ pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
         if drivers.is_empty() && !receivers.is_empty() {
             return Err(CompileError::MissingDriver { pins });
         }
-        if let Some(driver) = drivers.first() {
-            for receiver in &receivers {
-                let from = components[&driver.component];
-                let to = components[&receiver.component];
-                edges[from].push(to);
-                degrees[to] += 1;
-            }
-        }
+
         nets.push(Net {
             driver: drivers.first().copied(),
             receivers,
         });
     }
-    let mut queue: VecDeque<_> = degrees
-        .iter()
-        .enumerate()
-        .filter_map(|(i, d)| (*d == 0).then_some(i))
-        .collect();
-    let mut order = Vec::new();
-    while let Some(i) = queue.pop_front() {
-        order.push(document.components[i].id);
-        for &next in &edges[i] {
-            degrees[next] -= 1;
-            if degrees[next] == 0 {
-                queue.push_back(next);
-            }
-        }
-    }
-    if order.len() != document.components.len() {
-        // Iterative Kosaraju traversal avoids recursion on large user documents.
-        let mut reverse = vec![Vec::new(); edges.len()];
-        for (from, targets) in edges.iter().enumerate() {
-            for &to in targets {
-                reverse[to].push(from);
-            }
-        }
-        let mut seen = vec![false; edges.len()];
-        let mut finish = Vec::new();
-        for start in 0..edges.len() {
-            if seen[start] {
-                continue;
-            }
-            seen[start] = true;
-            let mut stack = vec![(start, 0)];
-            while let Some((node, next)) = stack.last_mut() {
-                if *next == edges[*node].len() {
-                    finish.push(*node);
-                    stack.pop();
-                } else {
-                    let target = edges[*node][*next];
-                    *next += 1;
-                    if !seen[target] {
-                        seen[target] = true;
-                        stack.push((target, 0));
-                    }
-                }
-            }
-        }
-        seen.fill(false);
-        let mut cyclic = vec![false; edges.len()];
-        for &start in finish.iter().rev() {
-            if seen[start] {
-                continue;
-            }
-            seen[start] = true;
-            let mut stack = vec![start];
-            let mut group = Vec::new();
-            while let Some(node) = stack.pop() {
-                group.push(node);
-                for &target in &reverse[node] {
-                    if !seen[target] {
-                        seen[target] = true;
-                        stack.push(target);
-                    }
-                }
-            }
-            if group.len() > 1 || edges[start].contains(&start) {
-                for node in group {
-                    cyclic[node] = true;
-                }
-            }
-        }
-        return Err(CompileError::Cycle {
-            components: cyclic
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &yes)| yes.then_some(document.components[i].id))
-                .collect(),
-        });
-    }
-    Ok(CompiledCircuit { nets, order })
+    Ok(CompiledCircuit { nets })
 }
 
 #[cfg(test)]
@@ -316,25 +228,60 @@ mod tests {
         assert!(matches!(compile(&d), Err(CompileError::DuplicateWire(_))));
     }
     #[test]
-    fn cycles_and_empty() {
+    fn feedback_and_disconnected_regions_compile() {
         assert!(compile(&Document::default()).is_ok());
-        assert!(
-            compile(&Document {
-                components: vec![component(1, ComponentKind::Input)],
-                wires: vec![]
-            })
-            .is_ok()
-        );
-        let input = |n| pin(n, PinDirection::Input, 0);
-        let output = |n| pin(n, PinDirection::Output, 0);
-        let mut d = Document {
+        let i = |n| pin(n, PinDirection::Input, 0);
+        let o = |n| pin(n, PinDirection::Output, 0);
+        let self_loop = Document {
             components: vec![component(1, ComponentKind::Not)],
-            wires: vec![wire(1, input(1), output(1))],
+            wires: vec![wire(1, i(1), o(1))],
         };
-        assert!(matches!(compile(&d), Err(CompileError::Cycle { .. })));
-        d.components.push(component(2, ComponentKind::Not));
-        d.wires = vec![wire(1, output(1), input(2)), wire(2, output(2), input(1))];
-        assert!(matches!(compile(&d), Err(CompileError::Cycle { .. })));
+        assert!(compile(&self_loop).is_ok());
+
+        // Two cross-coupled inverters, a downstream output, and an independent region.
+        let multi = Document {
+            components: vec![
+                component(1, ComponentKind::Not),
+                component(2, ComponentKind::Not),
+                component(3, ComponentKind::Output),
+                component(4, ComponentKind::Input),
+                component(5, ComponentKind::Output),
+            ],
+            wires: vec![
+                wire(1, o(1), i(2)),
+                wire(2, o(2), i(1)),
+                wire(3, o(2), pin(3, PinDirection::Input, 0)),
+                wire(4, o(4), pin(5, PinDirection::Input, 0)),
+            ],
+        };
+        assert!(compile(&multi).is_ok());
+    }
+
+    #[test]
+    fn feedback_does_not_bypass_driver_validation() {
+        let i = |n| pin(n, PinDirection::Input, 0);
+        let o = |n| pin(n, PinDirection::Output, 0);
+        let mut missing = Document {
+            components: vec![
+                component(1, ComponentKind::Not),
+                component(2, ComponentKind::Not),
+            ],
+            wires: vec![wire(1, o(1), i(1))],
+        };
+        assert!(matches!(
+            compile(&missing),
+            Err(CompileError::MissingDriver { .. })
+        ));
+
+        missing.wires = vec![
+            wire(1, o(1), i(1)),
+            wire(2, o(1), i(2)),
+            wire(3, o(2), i(2)),
+        ];
+        assert!(matches!(
+            compile(&missing),
+            Err(CompileError::MultipleDrivers { .. })
+        ));
     }
     #[test]
     fn limits() {
@@ -387,40 +334,6 @@ mod tests {
         d.wires
             .extend((20000..20003).map(|id| wire(id, output, output)));
         assert_eq!(compile(&d), Err(CompileError::WorkLimit));
-    }
-    #[test]
-    fn only_cycle_members_reported() {
-        let i = |n| pin(n, PinDirection::Input, 0);
-        let o = |n| pin(n, PinDirection::Output, 0);
-        let mut d = Document {
-            components: vec![
-                component(1, ComponentKind::Not),
-                component(2, ComponentKind::Not),
-                component(3, ComponentKind::Output),
-            ],
-            wires: vec![
-                wire(1, o(1), i(2)),
-                wire(2, o(2), i(1)),
-                wire(3, o(2), i(3)),
-            ],
-        };
-        assert_eq!(
-            compile(&d),
-            Err(CompileError::Cycle {
-                components: vec![ComponentId(1), ComponentId(2)]
-            })
-        );
-        d.wires = vec![
-            wire(1, o(1), i(1)),
-            wire(2, o(1), i(2)),
-            wire(3, o(2), i(3)),
-        ];
-        assert_eq!(
-            compile(&d),
-            Err(CompileError::Cycle {
-                components: vec![ComponentId(1)]
-            })
-        );
     }
     #[test]
     fn floating_pins_and_coincident_geometry() {

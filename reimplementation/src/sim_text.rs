@@ -71,14 +71,6 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
             "Several outputs drive one net: {}. A net may have only one output.",
             pin_list(document, pins)
         ),
-        CompileError::Cycle { components } => format!(
-            "Feedback loop through {}. Only acyclic circuits can be simulated.",
-            components
-                .iter()
-                .map(|id| component_name(document, *id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
     }
 }
 
@@ -190,13 +182,6 @@ mod tests {
             multiple.contains("output pin 1 of OR \"carry\" #2"),
             "{multiple}"
         );
-        let cycle = describe_compile_error(
-            &document,
-            &CompileError::Cycle {
-                components: vec![ComponentId(1), ComponentId(2)],
-            },
-        );
-        assert!(cycle.contains("AND #1, OR \"carry\" #2"), "{cycle}");
         let endpoint = describe_compile_error(
             &document,
             &CompileError::InvalidEndpoint {

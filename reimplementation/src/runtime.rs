@@ -1,9 +1,10 @@
-//! Headless runtime for one-bit acyclic circuits compiled by [`crate::simulation`].
+//! Headless runtime for one-bit circuits compiled by [`crate::simulation`].
 //!
 //! Runtime values live here, never in the editable [`Document`]. A microstep reads every
 //! scheduled gate's inputs before any output is published, so results do not depend on
 //! evaluation order. Acyclic initialisation is deterministic and makes no claim about
-//! randomised feedback startup. High-Z, buses and feedback are not modelled.
+//! randomised feedback startup; `Unavailable` idle loops are not Digital startup semantics.
+//! High-Z and buses are not modelled.
 use crate::domain::*;
 use crate::simulation::{CompileError, CompiledCircuit, compile};
 use std::collections::HashMap;
@@ -447,6 +448,115 @@ mod tests {
     }
 
     #[test]
+    fn controlled_feedback_microsteps_are_staged_and_document_order_independent() {
+        let make = |reverse: bool| {
+            let mut doc = document(
+                &[(1, ComponentKind::Not), (2, ComponentKind::Not)],
+                &[(out(1), inp(2, 0)), (out(2), inp(1, 0))],
+            );
+            if reverse {
+                doc.components.reverse();
+                doc.wires.reverse();
+            }
+            doc
+        };
+        let mut traces = Vec::new();
+        for doc in [make(false), make(true)] {
+            let mut runtime = Runtime::start(&doc).unwrap();
+            // Controlled known state for scheduler semantics only; no startup behavior asserted.
+            runtime.values[runtime.pin_nets[&out(1)]] = Low;
+            runtime.values[runtime.pin_nets[&out(2)]] = Low;
+            assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 2 });
+            assert_eq!(runtime.pin_value(out(1)), Some(High));
+            assert_eq!(runtime.pin_value(out(2)), Some(High));
+            let mut trace = vec![runtime.pin_value(out(1)), runtime.pin_value(out(2))];
+            assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 2 });
+            trace.extend([runtime.pin_value(out(1)), runtime.pin_value(out(2))]);
+            traces.push(trace);
+        }
+        assert_eq!(traces[0], traces[1]);
+        assert_eq!(traces[0], [Some(High), Some(High), Some(Low), Some(Low)]);
+    }
+
+    #[test]
+    fn shared_input_net_deduplicates_a_gates_two_consumers() {
+        let doc = document(
+            &[(1, ComponentKind::Input), (2, ComponentKind::And)],
+            &[(out(1), inp(2, 0)), (out(1), inp(2, 1))],
+        );
+        let mut runtime = Runtime::start(&doc).unwrap();
+        while runtime.step() != StepOutcome::Idle {}
+        runtime.toggle_input(ComponentId(1)).unwrap();
+        assert_eq!(runtime.pending_gate_count(), 1);
+        assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
+    }
+
+    #[test]
+    fn self_loop_reschedules_and_constant_feedback_fixed_point_idles() {
+        let self_loop = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
+        let mut runtime = Runtime::start(&self_loop).unwrap();
+        runtime.values[runtime.pin_nets[&out(1)]] = Low;
+        assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
+        assert_eq!(runtime.pin_value(out(1)), Some(High));
+        assert_eq!(runtime.pending_gate_count(), 1);
+        assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
+        assert_eq!(runtime.pin_value(out(1)), Some(Low));
+        assert_eq!(runtime.pending_gate_count(), 1);
+
+        let mut fixed = document(
+            &[(1, ComponentKind::Or), (2, ComponentKind::Const)],
+            &[(out(1), inp(1, 0)), (out(2), inp(1, 1))],
+        );
+        fixed.components[1].constant_value = false;
+        let mut runtime = Runtime::start(&fixed).unwrap();
+        runtime.values[runtime.pin_nets[&out(1)]] = High;
+        assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
+        assert_eq!(runtime.pin_value(out(1)), Some(High));
+        assert_eq!(runtime.step(), StepOutcome::Idle);
+        assert!(!runtime.is_pending());
+    }
+
+    #[test]
+    fn toggling_feedback_is_bounded_and_resumable() {
+        let doc = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
+        let mut whole = Runtime::start(&doc).unwrap();
+        let mut chunked = Runtime::start(&doc).unwrap();
+        for runtime in [&mut whole, &mut chunked] {
+            runtime.values[runtime.pin_nets[&out(1)]] = Low;
+        }
+        assert_eq!(whole.settle(0), SettleOutcome::BudgetExhausted { work: 0 });
+        assert_eq!(whole.pin_value(out(1)), Some(Low));
+        assert_eq!(whole.settle(1), SettleOutcome::BudgetExhausted { work: 1 });
+        assert_eq!(whole.pin_value(out(1)), Some(Low)); // batch begun, nothing published
+        assert_eq!(
+            chunked.settle(1),
+            SettleOutcome::BudgetExhausted { work: 1 }
+        );
+        assert_eq!(chunked.pin_value(out(1)), Some(Low));
+        assert_eq!(whole.settle(1), SettleOutcome::BudgetExhausted { work: 1 });
+        assert_eq!(
+            chunked.settle(1),
+            SettleOutcome::BudgetExhausted { work: 1 }
+        );
+        assert_eq!(whole.pin_value(out(1)), Some(High));
+        assert_eq!(whole.pin_value(out(1)), chunked.pin_value(out(1)));
+        assert_eq!(whole.settle(1), SettleOutcome::BudgetExhausted { work: 1 });
+        assert_eq!(
+            chunked.settle(1),
+            SettleOutcome::BudgetExhausted { work: 1 }
+        );
+        assert_eq!(whole.pin_value(out(1)), Some(High)); // second batch has not published
+        assert_eq!(whole.pin_value(out(1)), chunked.pin_value(out(1)));
+        assert_eq!(whole.settle(1), SettleOutcome::BudgetExhausted { work: 1 });
+        assert_eq!(
+            chunked.settle(1),
+            SettleOutcome::BudgetExhausted { work: 1 }
+        );
+        assert_eq!(whole.pin_value(out(1)), Some(Low));
+        assert_eq!(whole.pin_value(out(1)), chunked.pin_value(out(1)));
+    }
+
+    #[test]
     fn constants_drive_before_gates_and_do_not_become_interactive_inputs() {
         let mut high = component(9, ComponentKind::Const);
         high.constant_value = true;
@@ -830,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_settles_acyclic_not_chain() {
+    fn deterministic_startup_settles_not_chain() {
         for length in 1..=6u64 {
             let mut runtime = Runtime::start(&not_chain(length)).unwrap();
             settled(&mut runtime);
