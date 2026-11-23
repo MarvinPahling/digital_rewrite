@@ -2195,4 +2195,82 @@ mod tests {
             Some(crate::runtime::Level::Unavailable)
         );
     }
+
+    #[test]
+    fn stop_during_reset_settling_retains_document_history_and_release_trace() {
+        use crate::runtime::{SimulationOptions, StartupPhase};
+        use crate::trace::TraceEvent;
+        let mut session = Session::default();
+        let (input, gate, _output) = wired_not(&mut session);
+        let document = session.document().clone();
+        let undo_len = session.undo.len();
+        session
+            .start_simulation_with_trace(SimulationOptions::default(), 1024)
+            .unwrap();
+        session
+            .runtime
+            .as_mut()
+            .unwrap()
+            .register_reset_pin_for_test(
+                crate::domain::PinRef {
+                    component: gate,
+                    pin: crate::domain::PinId {
+                        direction: crate::domain::PinDirection::Output,
+                        index: 0,
+                    },
+                },
+                crate::runtime::ResetOutputPolarity::Normal,
+            );
+        for _ in 0..100 {
+            if session.startup_phase() == Some(StartupPhase::ResetRelease) {
+                break;
+            }
+            session.step_simulation().unwrap();
+        }
+        assert_eq!(session.startup_phase(), Some(StartupPhase::ResetRelease));
+        let gate_output = crate::domain::PinRef {
+            component: gate,
+            pin: crate::domain::PinId {
+                direction: crate::domain::PinDirection::Output,
+                index: 0,
+            },
+        };
+        assert_eq!(
+            session.inspect().unwrap().pin_value(gate_output),
+            Some(crate::runtime::Level::High)
+        );
+        session.step_simulation().unwrap();
+        assert_eq!(session.startup_phase(), Some(StartupPhase::ResetSettling));
+        assert_eq!(
+            session.inspect().unwrap().pin_value(gate_output),
+            Some(crate::runtime::Level::Low)
+        );
+        assert_eq!(
+            session.toggle_input(input),
+            Err(SimulationError::Runtime(RuntimeError::Pending))
+        );
+        assert!(matches!(session.undo(), Err(EditError::SimulationActive)));
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo.len(), undo_len);
+        session.stop_simulation().unwrap();
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo.len(), undo_len);
+        let events = session
+            .trace()
+            .unwrap()
+            .records()
+            .map(|record| record.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TraceEvent::ResetReleased { .. }))
+                .count(),
+            1
+        );
+        assert!(events.contains(&TraceEvent::Stop));
+        let before_undo = session.document().clone();
+        session.undo().unwrap();
+        assert_ne!(session.document(), &before_undo);
+    }
 }

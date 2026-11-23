@@ -29,7 +29,7 @@ pub struct OscillationDiagnostic {
     pub components: Vec<OscillatingComponent>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct OscillationDetector {
     limit: usize,
     steps: usize,
@@ -173,6 +173,37 @@ struct Batch {
     staged: Vec<Level>,
 }
 
+// The polarity descriptor is production infrastructure; no supported public component currently
+// constructs participants. Its variants are intentionally instantiated only by test seams for M2.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum ResetOutputPolarity {
+    Normal,
+    Inverted,
+}
+impl ResetOutputPolarity {
+    #[cfg(test)]
+    fn held_level(self) -> Level {
+        match self {
+            Self::Normal => Level::High,
+            Self::Inverted => Level::Low,
+        }
+    }
+    fn released_level(self) -> Level {
+        match self {
+            Self::Normal => Level::Low,
+            Self::Inverted => Level::High,
+        }
+    }
+}
+
+/// Private startup reset driver bound to a compiled one-bit net.
+struct ResetParticipant {
+    net: usize,
+    polarity: ResetOutputPolarity,
+    released: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingInspection {
     pub awaiting_evaluation: Vec<ComponentId>,
@@ -255,6 +286,7 @@ pub struct Runtime {
     trace: Option<TraceLog>,
     trace_stable: bool,
     microstep_active: bool,
+    reset_participants: Vec<ResetParticipant>,
 }
 
 impl Runtime {
@@ -353,6 +385,7 @@ impl Runtime {
             trace: None,
             trace_stable: false,
             microstep_active: false,
+            reset_participants: Vec::new(),
         }
     }
 
@@ -381,6 +414,13 @@ impl Runtime {
         )
     }
     fn trace_frontier_remaining(&self) -> usize {
+        if self.startup_phase == StartupPhase::ResetRelease {
+            return self
+                .reset_participants
+                .iter()
+                .filter(|p| !p.released)
+                .count();
+        }
         if self.startup_phase != StartupPhase::Running {
             let remaining = self
                 .startup_frontier
@@ -453,9 +493,53 @@ impl Runtime {
         self.startup_seed
     }
     pub fn is_pending(&self) -> bool {
-        self.startup_phase != StartupPhase::Running
-            || self.batch.is_some()
-            || !self.queue.is_empty()
+        self.startup_phase != StartupPhase::Running || self.normal_pending()
+    }
+
+    fn normal_pending(&self) -> bool {
+        self.batch.is_some() || !self.queue.is_empty()
+    }
+
+    fn reset_is_held(&self, net: usize) -> bool {
+        self.reset_participants
+            .iter()
+            .any(|p| p.net == net && !p.released)
+    }
+
+    fn finish_reset_if_idle(&mut self) {
+        if self.startup_phase == StartupPhase::ResetSettling && !self.normal_pending() {
+            self.startup_phase = StartupPhase::Running;
+            self.trace_event(TraceEvent::Lifecycle {
+                phase: StartupPhase::Running,
+            });
+            self.detector = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_reset_participant_for_test(
+        &mut self,
+        net: usize,
+        polarity: ResetOutputPolarity,
+    ) {
+        assert!(net < self.values.len());
+        assert!(!self.reset_participants.iter().any(|p| p.net == net));
+        self.values[net] = polarity.held_level();
+        self.reset_participants.push(ResetParticipant {
+            net,
+            polarity,
+            released: false,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_reset_pin_for_test(
+        &mut self,
+        pin: PinRef,
+        polarity: ResetOutputPolarity,
+    ) {
+        let net = self.pin_nets[&pin];
+        self.register_reset_participant_for_test(net, polarity);
     }
 
     pub fn set_oscillation_limit(&mut self, limit: usize) -> Result<(), RuntimeError> {
@@ -499,7 +583,10 @@ impl Runtime {
         let mut awaiting = Vec::new();
         let mut staged = Vec::new();
         let mut next = Vec::new();
-        if self.startup_phase != StartupPhase::Running {
+        if matches!(
+            self.startup_phase,
+            StartupPhase::StartupSettling | StartupPhase::ResetRelease
+        ) {
             awaiting.extend(
                 self.startup_frontier
                     .iter()
@@ -549,7 +636,10 @@ impl Runtime {
 
     /// Legacy total scheduler count, retained for compatibility. It is not a unique count.
     pub fn pending_gate_count(&self) -> usize {
-        if self.startup_phase != StartupPhase::Running {
+        if matches!(
+            self.startup_phase,
+            StartupPhase::StartupSettling | StartupPhase::ResetRelease
+        ) {
             self.startup_frontier
                 .len()
                 .saturating_sub(self.startup_cursor)
@@ -636,7 +726,10 @@ impl Runtime {
             return StepOutcome::TraceSequenceExhausted;
         }
         self.microstep_active = false;
-        if self.startup_phase != StartupPhase::Running {
+        if matches!(
+            self.startup_phase,
+            StartupPhase::StartupSettling | StartupPhase::ResetRelease
+        ) {
             let outcome = match self.advance_startup_unit() {
                 Ok(true) => StepOutcome::Stepped { evaluated: 1 },
                 Ok(false) if self.startup_phase != StartupPhase::Running => {
@@ -650,7 +743,8 @@ impl Runtime {
         }
         // Explicit stepping is a raw, undetected microstep; it closes any settle episode.
         self.detector = None;
-        if !self.is_pending() {
+        if !self.normal_pending() {
+            self.finish_reset_if_idle();
             self.trace_stability_if_reached();
             return StepOutcome::Idle;
         }
@@ -659,6 +753,7 @@ impl Runtime {
         }
         loop {
             if let Some(evaluated) = self.evaluate_next() {
+                self.finish_reset_if_idle();
                 self.detector = None;
                 self.trace_stability_if_reached();
                 return StepOutcome::Stepped { evaluated };
@@ -683,17 +778,10 @@ impl Runtime {
             return StepOutcome::TraceSequenceExhausted;
         }
         self.microstep_active = false;
-        if self.startup_phase != StartupPhase::Running {
-            if self.startup_phase == StartupPhase::ResetRelease {
-                let _ = self.advance_startup_unit();
-                self.trace_stability_if_reached();
-                return StepOutcome::Stepped { evaluated: 0 };
-            }
-            if self.startup_phase == StartupPhase::ResetSettling {
-                let _ = self.advance_startup_unit();
-                self.trace_stability_if_reached();
-                return StepOutcome::Stepped { evaluated: 0 };
-            }
+        if matches!(
+            self.startup_phase,
+            StartupPhase::StartupSettling | StartupPhase::ResetRelease
+        ) {
             if self.startup_cursor >= self.startup_frontier.len() {
                 let _ = self.advance_startup_unit();
             }
@@ -719,7 +807,8 @@ impl Runtime {
             };
         }
         self.detector = None;
-        if !self.is_pending() {
+        if !self.normal_pending() {
+            self.finish_reset_if_idle();
             self.trace_stability_if_reached();
             return StepOutcome::Idle;
         }
@@ -738,6 +827,7 @@ impl Runtime {
             self.evaluate_next();
             evaluated += 1;
         }
+        self.finish_reset_if_idle();
         self.trace_stability_if_reached();
         StepOutcome::Stepped { evaluated }
     }
@@ -769,8 +859,12 @@ impl Runtime {
             self.microstep_active = true;
         }
         let mut work = 0;
-        while self.startup_phase == StartupPhase::Running {
-            if !self.is_pending() {
+        while matches!(
+            self.startup_phase,
+            StartupPhase::Running | StartupPhase::ResetSettling
+        ) {
+            if !self.normal_pending() {
+                self.finish_reset_if_idle();
                 self.microstep_active = false;
                 self.trace_stability_if_reached();
                 return SettleOutcome::Settled { work };
@@ -788,6 +882,7 @@ impl Runtime {
             let count = self.batch.as_ref().map_or(0, |batch| batch.gates.len());
             let evaluated = self.batch.as_ref().map_or(0, |batch| batch.staged.len());
             if evaluated == count {
+                self.finish_reset_if_idle();
                 self.microstep_active = false;
                 self.trace_stability_if_reached();
                 return SettleOutcome::Settled { work };
@@ -795,6 +890,7 @@ impl Runtime {
             self.evaluate_next();
             work += 1;
             if self.batch.is_none() {
+                self.finish_reset_if_idle();
                 self.microstep_active = false;
                 self.trace_stability_if_reached();
                 return SettleOutcome::Settled { work };
@@ -849,12 +945,32 @@ impl Runtime {
         self.microstep_active = false;
         let mut work = 0;
         while self.startup_phase != StartupPhase::Running {
+            if self.startup_phase == StartupPhase::ResetSettling {
+                if self.normal_pending() {
+                    break;
+                }
+                if work == budget {
+                    return SettleOutcome::BudgetExhausted { work };
+                }
+                let _ = self.advance_startup_unit();
+                work += 1;
+                continue;
+            }
             if work == budget {
                 return SettleOutcome::BudgetExhausted { work };
             }
             if self.startup_phase == StartupPhase::ResetRelease {
-                // Entering ResetRelease charged its single observable barrier unit.
+                if self.reset_participants.is_empty() {
+                    // The transition into this empty barrier was already charged as a startup
+                    // scheduler unit; do not invent a second work unit for an absent participant.
+                    let _ = self.advance_startup_unit();
+                    continue;
+                }
+                if work == budget {
+                    return SettleOutcome::BudgetExhausted { work };
+                }
                 let _ = self.advance_startup_unit();
+                work += 1;
                 continue;
             }
             match self.advance_startup_unit() {
@@ -866,7 +982,7 @@ impl Runtime {
         if self.detector.is_none() {
             self.detector = Some(OscillationDetector::new(self.oscillation_limit));
         }
-        while self.is_pending() {
+        while self.normal_pending() {
             if work == budget {
                 return SettleOutcome::BudgetExhausted { work };
             }
@@ -894,6 +1010,7 @@ impl Runtime {
                 self.evaluate_next();
             }
         }
+        self.finish_reset_if_idle();
         self.detector = None;
         self.mark_stable();
         SettleOutcome::Settled { work }
@@ -963,7 +1080,7 @@ impl Runtime {
                     immediate: true,
                     value: level,
                 });
-                if self.values[net] != level {
+                if !self.reset_is_held(net) && self.values[net] != level {
                     let old = self.values[net];
                     self.values[net] = level;
                     self.trace_event(TraceEvent::NetPublished {
@@ -998,9 +1115,32 @@ impl Runtime {
             StartupPhase::ResetRelease => {
                 self.startup_frontier.clear();
                 self.startup_cursor = 0;
-                if self.queue.is_empty() {
-                    // This catalog has no reset participants. Keep one observable barrier,
-                    // then enter Running without manufacturing a propagation step.
+                for index in 0..self.reset_participants.len() {
+                    if self.reset_participants[index].released {
+                        continue;
+                    }
+                    let net = self.reset_participants[index].net;
+                    self.reset_participants[index].released = true;
+                    let old = self.values[net];
+                    let released_level = self.reset_participants[index].polarity.released_level();
+                    self.values[net] = released_level;
+                    self.trace_event(TraceEvent::ResetReleased { net });
+                    if old != released_level {
+                        if let Some(driver) = self.pin_nets.iter().find_map(|(pin, &candidate)| {
+                            (candidate == net && pin.pin.direction == PinDirection::Output)
+                                .then_some(*pin)
+                        }) {
+                            self.trace_event(TraceEvent::NetPublished {
+                                net,
+                                driver,
+                                old,
+                                new: released_level,
+                            });
+                        }
+                        self.schedule_consumers(net);
+                    }
+                }
+                if self.reset_participants.is_empty() {
                     self.startup_phase = StartupPhase::Running;
                     self.trace_event(TraceEvent::Lifecycle {
                         phase: StartupPhase::Running,
@@ -1008,15 +1148,15 @@ impl Runtime {
                     self.detector = None;
                 } else {
                     self.startup_phase = StartupPhase::ResetSettling;
+                    self.trace_event(TraceEvent::Lifecycle {
+                        phase: StartupPhase::ResetSettling,
+                    });
+                    self.detector = Some(OscillationDetector::new(self.oscillation_limit));
                 }
                 Ok(false)
             }
             StartupPhase::ResetSettling => {
-                self.startup_phase = StartupPhase::Running;
-                self.trace_event(TraceEvent::Lifecycle {
-                    phase: StartupPhase::Running,
-                });
-                self.detector = None;
+                self.finish_reset_if_idle();
                 Ok(false)
             }
             StartupPhase::Running => Ok(false),
@@ -2572,15 +2712,273 @@ mod tests {
     }
 
     #[test]
-    fn trace_sequence_exhaustion_preflights_without_advancing_runtime() {
+    fn trace_sequence_exhaustion_refusal_preserves_every_observable_scheduler_state() {
+        let doc = not_chain(2);
+        for api in 0..8 {
+            let mut runtime =
+                Runtime::start_with_trace(&doc, 5, crate::trace::TraceLog::new(32, 5, 0).unwrap())
+                    .unwrap();
+            if api >= 4 {
+                let first = runtime.pin_nets[&out(2)];
+                let second = runtime.pin_nets[&out(3)];
+                runtime.register_reset_participant_for_test(first, ResetOutputPolarity::Inverted);
+                runtime.register_reset_participant_for_test(second, ResetOutputPolarity::Inverted);
+                while runtime.startup_phase == StartupPhase::StartupSettling {
+                    let _ = runtime.step();
+                }
+                assert_eq!(runtime.startup_phase, StartupPhase::ResetRelease);
+            }
+            runtime.force_trace_sequence_for_test(u64::MAX);
+            let before_values = snapshot(&runtime, &doc);
+            let before_pending = runtime.pending_inspection();
+            let before_frontier = runtime.startup_frontier.clone();
+            let before_next = runtime.startup_next.clone();
+            let before_cursor = runtime.startup_cursor;
+            let before_queued = runtime.startup_queued.clone();
+            let before_batch_pending = runtime.startup_batch_pending;
+            let before_shuffled = runtime.startup_frontier_shuffled;
+            let before_phase = runtime.startup_phase;
+            let before_detector = runtime.detector.clone();
+            let before_terminal = runtime.terminal.clone();
+            let before_rng = runtime.rng.0;
+            let before_microstep = runtime.microstep_active;
+            let before_reset_released = runtime
+                .reset_participants
+                .iter()
+                .map(|p| p.released)
+                .collect::<Vec<_>>();
+            let before_trace = runtime
+                .trace
+                .as_ref()
+                .unwrap()
+                .records()
+                .collect::<Vec<_>>();
+            let trace_dropped = runtime.trace.as_ref().unwrap().dropped();
+            let trace_first = runtime.trace.as_ref().unwrap().first_sequence();
+            let trace_capacity = runtime.trace.as_ref().unwrap().capacity();
+            let trace_sequence = runtime.trace.as_ref().unwrap().sequence_state_for_test();
+            let refused = match api % 4 {
+                0 => runtime.step() == StepOutcome::TraceSequenceExhausted,
+                1 => runtime.micro_step() == StepOutcome::TraceSequenceExhausted,
+                2 => matches!(
+                    runtime.micro_step_bounded(2),
+                    SettleOutcome::TraceSequenceExhausted { work: 0 }
+                ),
+                _ => matches!(
+                    runtime.settle(2),
+                    SettleOutcome::TraceSequenceExhausted { work: 0 }
+                ),
+            };
+            assert!(refused, "execution API {api}");
+            assert_eq!(snapshot(&runtime, &doc), before_values);
+            assert_eq!(runtime.pending_inspection(), before_pending);
+            assert_eq!(runtime.startup_frontier, before_frontier);
+            assert_eq!(runtime.startup_next, before_next);
+            assert_eq!(runtime.startup_cursor, before_cursor);
+            assert_eq!(runtime.startup_queued, before_queued);
+            assert_eq!(runtime.startup_batch_pending, before_batch_pending);
+            assert_eq!(runtime.startup_frontier_shuffled, before_shuffled);
+            assert_eq!(runtime.startup_phase, before_phase);
+            assert_eq!(runtime.detector, before_detector);
+            assert_eq!(runtime.terminal, before_terminal);
+            assert_eq!(runtime.rng.0, before_rng);
+            assert_eq!(runtime.microstep_active, before_microstep);
+            assert_eq!(
+                runtime
+                    .reset_participants
+                    .iter()
+                    .map(|p| p.released)
+                    .collect::<Vec<_>>(),
+                before_reset_released
+            );
+            let trace = runtime.trace.as_ref().unwrap();
+            assert_eq!(trace.records().collect::<Vec<_>>(), before_trace);
+            assert_eq!(trace.dropped(), trace_dropped);
+            assert_eq!(trace.first_sequence(), trace_first);
+            assert_eq!(trace.capacity(), trace_capacity);
+            assert_eq!(trace.sequence_state_for_test(), trace_sequence);
+        }
+    }
+
+    #[test]
+    fn reset_participants_hold_during_startup_release_once_and_use_normal_scheduler() {
+        use crate::trace::TraceEvent;
         let doc = not_chain(2);
         let mut runtime =
-            Runtime::start_with_trace(&doc, 5, crate::trace::TraceLog::new(32, 5, 0).unwrap())
+            Runtime::start_with_trace(&doc, 13, crate::trace::TraceLog::new(2048, 13, 0).unwrap())
                 .unwrap();
-        runtime.force_trace_sequence_for_test(u64::MAX);
-        let before = snapshot(&runtime, &doc);
-        assert_eq!(runtime.micro_step(), StepOutcome::TraceSequenceExhausted);
-        assert_eq!(snapshot(&runtime, &doc), before);
-        assert_eq!(runtime.startup_phase(), StartupPhase::StartupSettling);
+        let net_a = runtime.pin_nets[&out(2)];
+        let net_b = runtime.pin_nets[&out(3)];
+        runtime.register_reset_participant_for_test(net_a, ResetOutputPolarity::Inverted);
+        runtime.register_reset_participant_for_test(net_b, ResetOutputPolarity::Inverted);
+        loop {
+            match runtime.settle(2) {
+                SettleOutcome::BudgetExhausted { .. } => {}
+                SettleOutcome::Settled { .. } => break,
+                other => panic!("unexpected reset startup: {other:?}"),
+            }
+            if runtime.startup_phase == StartupPhase::ResetRelease {
+                break;
+            }
+        }
+        assert_eq!(runtime.startup_phase(), StartupPhase::ResetRelease);
+        assert_eq!(runtime.pin_value(out(2)), Some(Level::Low));
+        assert_eq!(runtime.pin_value(out(3)), Some(Level::Low));
+        assert_eq!(
+            runtime.settle(0),
+            SettleOutcome::BudgetExhausted { work: 0 }
+        );
+        assert_eq!(runtime.startup_phase(), StartupPhase::ResetRelease);
+        assert!(matches!(
+            runtime.settle(1),
+            SettleOutcome::BudgetExhausted { .. }
+        ));
+        assert_eq!(runtime.startup_phase(), StartupPhase::ResetSettling);
+        assert_eq!(runtime.pin_value(out(2)), Some(Level::High));
+        assert_eq!(runtime.pin_value(out(3)), Some(Level::High));
+        assert_eq!(
+            runtime.pending_inspection().next_scheduled,
+            vec![ComponentId(3)]
+        );
+        assert!(matches!(
+            runtime.settle(1),
+            SettleOutcome::BudgetExhausted { .. }
+        ));
+        assert_eq!(runtime.startup_phase(), StartupPhase::ResetSettling);
+        assert_eq!(
+            runtime.pin_value(out(3)),
+            Some(Level::High),
+            "staged normal output is not published early"
+        );
+        assert!(matches!(runtime.settle(1), SettleOutcome::Settled { .. }));
+        assert_eq!(runtime.startup_phase(), StartupPhase::Running);
+        assert_eq!(runtime.pin_value(out(3)), Some(Level::Low));
+        let rows = runtime
+            .trace()
+            .unwrap()
+            .records()
+            .map(|r| r.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|event| **event == TraceEvent::ResetReleased { net: net_a })
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|event| **event == TraceEvent::ResetReleased { net: net_b })
+                .count(),
+            1
+        );
+        assert!(rows.iter().any(|event| matches!(
+            event,
+            TraceEvent::FrontierBegin {
+                startup: false,
+                phase: StartupPhase::Running
+            }
+        )));
+        assert!(rows.iter().any(|event| matches!(event, TraceEvent::NetPublished { net, new: Level::Low, .. } if *net == net_b)));
+        let release = rows
+            .iter()
+            .rposition(|event| matches!(event, TraceEvent::ResetReleased { .. }))
+            .unwrap();
+        let normal_frontier = rows
+            .iter()
+            .position(|event| matches!(event, TraceEvent::FrontierBegin { startup: false, .. }))
+            .unwrap();
+        let running = rows
+            .iter()
+            .position(|event| {
+                *event
+                    == TraceEvent::Lifecycle {
+                        phase: StartupPhase::Running,
+                    }
+            })
+            .unwrap();
+        let stable = rows
+            .iter()
+            .position(|event| *event == TraceEvent::Stable)
+            .unwrap();
+        assert!(release < normal_frontier && normal_frontier < running && running < stable);
+
+        let variants = [1, 2, 64].map(|budget| {
+            let mut runtime = Runtime::start_with_trace(
+                &doc,
+                13,
+                crate::trace::TraceLog::new(2048, 13, 0).unwrap(),
+            )
+            .unwrap();
+            let first = runtime.pin_nets[&out(2)];
+            let second = runtime.pin_nets[&out(3)];
+            runtime.register_reset_participant_for_test(first, ResetOutputPolarity::Inverted);
+            runtime.register_reset_participant_for_test(second, ResetOutputPolarity::Inverted);
+            loop {
+                match runtime.settle(budget) {
+                    SettleOutcome::Settled { .. } => break,
+                    SettleOutcome::BudgetExhausted { .. } => {}
+                    other => panic!("reset budget partition failed: {other:?}"),
+                }
+            }
+            (
+                snapshot(&runtime, &doc),
+                runtime
+                    .trace()
+                    .unwrap()
+                    .records()
+                    .map(|record| record.event)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(variants[0], variants[1]);
+        assert_eq!(variants[0], variants[2]);
+
+        let mut stepped = Runtime::start_with_seed(&doc, 13).unwrap();
+        stepped.register_reset_participant_for_test(
+            stepped.pin_nets[&out(2)],
+            ResetOutputPolarity::Inverted,
+        );
+        stepped.register_reset_participant_for_test(
+            stepped.pin_nets[&out(3)],
+            ResetOutputPolarity::Inverted,
+        );
+        while stepped.startup_phase() == StartupPhase::StartupSettling {
+            let _ = stepped.step();
+        }
+        assert_eq!(stepped.step(), StepOutcome::Stepped { evaluated: 0 });
+        assert_eq!(stepped.startup_phase(), StartupPhase::ResetSettling);
+        assert_eq!(stepped.micro_step(), StepOutcome::Stepped { evaluated: 1 });
+        assert_eq!(stepped.startup_phase(), StartupPhase::Running);
+        assert_eq!(stepped.pin_value(out(3)), Some(Level::Low));
+    }
+
+    #[test]
+    fn released_reset_feedback_uses_resumable_bounded_detection() {
+        let doc = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
+        let mut runtime = Runtime::start_with_seed(&doc, 7).unwrap();
+        runtime.register_reset_participant_for_test(
+            runtime.pin_nets[&out(1)],
+            ResetOutputPolarity::Inverted,
+        );
+        runtime.set_oscillation_limit(1).unwrap();
+        while runtime.startup_phase() == StartupPhase::StartupSettling {
+            let _ = runtime.step();
+        }
+        assert_eq!(runtime.startup_phase(), StartupPhase::ResetRelease);
+        let mut polls = 0;
+        loop {
+            polls += 1;
+            assert!(polls < 10_000, "reset settling must stay bounded");
+            match runtime.settle(2) {
+                SettleOutcome::BudgetExhausted { .. } => {}
+                SettleOutcome::Oscillating { diagnostic, .. } => {
+                    assert_eq!(diagnostic.threshold, 1);
+                    assert!(!diagnostic.components.is_empty());
+                    assert_eq!(runtime.terminal_diagnostic(), Some(&diagnostic));
+                    break;
+                }
+                other => panic!("expected reset-release feedback oscillation, got {other:?}"),
+            }
+        }
     }
 }

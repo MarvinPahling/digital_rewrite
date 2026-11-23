@@ -35,6 +35,9 @@ pub enum TraceEvent {
     Lifecycle {
         phase: StartupPhase,
     },
+    ResetReleased {
+        net: usize,
+    },
     InputChanged {
         component: ComponentId,
         value: bool,
@@ -175,6 +178,10 @@ impl TraceLog {
     pub(crate) fn force_sequence(&mut self, sequence: u64) {
         self.next_sequence = sequence;
         self.sequence_exhausted = false;
+    }
+    #[cfg(test)]
+    pub(crate) fn sequence_state_for_test(&self) -> (u64, bool) {
+        (self.next_sequence, self.sequence_exhausted)
     }
 }
 
