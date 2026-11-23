@@ -877,6 +877,31 @@ mod tests {
     }
 
     #[test]
+    fn invalid_nonconst_configuration_fails_export_and_save_before_io() {
+        let mut session = Session::default();
+        session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        session.document.components[0].constant_value = false;
+        let error = session.export_dig_bytes().unwrap_err();
+        assert!(matches!(error, SessionDigError::Domain(_)));
+        assert!(matches!(
+            session.start_simulation(),
+            Err(SimulationError::Compile(
+                CompileError::InvalidConstantConfiguration {
+                    component: ComponentId(0)
+                }
+            ))
+        ));
+        assert!(!session.simulation_active());
+        let mut io = NoFileAccess;
+        assert!(matches!(
+            session.save_as(&mut io, Path::new("unsupported.dig"), SaveAsIntent::Replace),
+            Err(SaveError::Codec(SessionDigError::Domain(_)))
+        ));
+    }
+
+    #[test]
     fn save_and_save_as_update_association_only_after_publish_and_keep_history() {
         use crate::file_session::{LocalFileIo, PublishOutcome, SaveAsIntent};
         let dir =

@@ -16,6 +16,7 @@ pub enum CompileError {
     WorkLimit,
     DuplicateComponent(ComponentId),
     DuplicateWire(WireId),
+    InvalidConstantConfiguration { component: ComponentId },
     InvalidEndpoint { wire: WireId, pin: PinRef },
     MissingDriver { pins: Vec<PinRef> },
     MultipleDrivers { pins: Vec<PinRef> },
@@ -55,6 +56,13 @@ pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
         .saturating_add(document.wires.len().saturating_mul(2));
     if work > MAX_WORK {
         return Err(CompileError::WorkLimit);
+    }
+    for component in &document.components {
+        if component.kind != ComponentKind::Const && !component.constant_value {
+            return Err(CompileError::InvalidConstantConfiguration {
+                component: component.id,
+            });
+        }
     }
     let mut components = HashMap::new();
     let mut pins = Vec::new();
@@ -235,6 +243,28 @@ mod tests {
             endpoints: [a, b],
         }
     }
+    #[test]
+    fn non_const_non_default_value_is_rejected_at_compile_boundary() {
+        let mut invalid = component(7, ComponentKind::Input);
+        invalid.constant_value = false;
+        assert_eq!(
+            compile(&Document {
+                components: vec![invalid],
+                wires: vec![]
+            }),
+            Err(CompileError::InvalidConstantConfiguration {
+                component: ComponentId(7)
+            })
+        );
+        assert!(
+            compile(&Document {
+                components: vec![component(7, ComponentKind::Input)],
+                wires: vec![]
+            })
+            .is_ok()
+        );
+    }
+
     #[test]
     fn transitive_fanout_and_geometry() {
         let o = pin(1, PinDirection::Output, 0);

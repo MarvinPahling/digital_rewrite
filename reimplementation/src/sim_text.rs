@@ -54,6 +54,10 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
             format!("Component id #{} is used more than once.", id.0)
         }
         CompileError::DuplicateWire(id) => format!("Wire id #{} is used more than once.", id.0),
+        CompileError::InvalidConstantConfiguration { component } => format!(
+            "Component {} has a non-default constant configuration, but only Const components support it.",
+            component_name(document, *component)
+        ),
         CompileError::InvalidEndpoint { wire, pin } => format!(
             "Wire #{} is attached to {}, which does not exist.",
             wire.0,

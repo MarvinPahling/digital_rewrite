@@ -530,6 +530,7 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
     whitespace_text(attr_node, "elementAttributes")?;
     let mut label = None;
     let mut value = None;
+    let mut value_offset = None;
     for entry in &attr_node.children {
         if entry.name != "entry" {
             return Err(error(
@@ -621,6 +622,7 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
                         "signed decimal value is out of range",
                     )
                 })?;
+                value_offset = Some(payload.offset);
                 value = Some(match parsed {
                     0 => false,
                     1 => true,
@@ -643,6 +645,14 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
                 ));
             }
         }
+    }
+    if element_name != "Const" && value.is_some() {
+        return Err(error(
+            DigReadErrorKind::Unsupported,
+            value_offset.unwrap_or(attr_node.offset),
+            "Value",
+            "Value is supported only for Const",
+        ));
     }
     let pos_node = pos.ok_or_else(|| {
         error(
@@ -1466,9 +1476,6 @@ fn name_from_kind(kind: ComponentKind) -> &'static str {
 // Domain editor positions denote the artwork bounds center. Digital stores its logical origin;
 // share the renderer's toolkit-neutral placement metrics to keep pins aligned with the artwork.
 fn center_offset(kind: ComponentKind) -> Result<(i32, i32), DomainCodecError> {
-    if kind == ComponentKind::Const {
-        return Ok((-20, 0));
-    }
     let offset = crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)
         .ok_or_else(|| invalid("component kind has no default symbol"))?;
     Ok((
@@ -1893,6 +1900,12 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
     let mut ids = BTreeSet::new();
     let mut elements = Vec::with_capacity(doc.components.len());
     for c in &doc.components {
+        if c.kind != ComponentKind::Const && !c.constant_value {
+            return Err(invalid(format!(
+                "component {} has a non-default constant value but is not Const",
+                c.id.0
+            )));
+        }
         if !ids.insert(c.id) {
             return Err(invalid("duplicate component ID"));
         }
@@ -3518,22 +3531,31 @@ mod tests {
             serialize_v2(&nonconst).unwrap_err().kind,
             DigWriteErrorKind::UnsupportedValue
         );
-        let nonconst_with_value = "<visualElement><elementName>In</elementName><elementAttributes><entry><string>Value</string><long>0</long></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>";
+        let nonconst_with_value = "<visualElement><elementAttributes><entry><string>Value</string><long>0</long></entry></elementAttributes><pos x=\"0\" y=\"0\"/><elementName>In</elementName></visualElement>";
         let xml = EMPTY.replace(
             "<visualElements/>",
             &format!("<visualElements>{}</visualElements>", nonconst_with_value),
         );
-        let parsed = parse_v2(xml.as_bytes()).unwrap();
+        let error = parse_v2(xml.as_bytes()).unwrap_err();
+        assert_eq!(error.kind, DigReadErrorKind::Unsupported);
+        assert_eq!(error.context, "Value");
+        assert_eq!(error.offset, xml.find("<long>0").unwrap());
+
+        let low_nonconst = Document {
+            components: vec![Component {
+                id: ComponentId(0),
+                kind: ComponentKind::Input,
+                position: Position { x: 0.0, y: 0.0 },
+                label: String::new(),
+                constant_value: false,
+            }],
+            wires: vec![],
+        };
         assert!(
-            to_domain(&DigV2 {
-                elements: vec![DigElement {
-                    name: "In".into(),
-                    value: parsed.elements[0].value,
-                    ..parsed.elements[0].clone()
-                }],
-                wires: vec![]
-            })
-            .is_err()
+            from_domain(&low_nonconst)
+                .unwrap_err()
+                .0
+                .contains("not Const")
         );
     }
 

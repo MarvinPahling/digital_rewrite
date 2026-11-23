@@ -919,6 +919,7 @@ impl DigitalApp {
                     let constant_value = self.session.document().components.iter().find(|component| component.id == id && component.kind == ComponentKind::Const).map(|component| component.constant_value);
                     if let Some(value) = constant_value {
                         ui.label(format!("Const configured value: {}", if value { "HIGH (1)" } else { "LOW (0)" }));
+                        ui.label("Canvas keyboard: H = HIGH (1), L = LOW (0)");
                         ui.horizontal(|ui| {
                             if ui.add_enabled(!locked && value, egui::Button::new("Set LOW (0)" )).clicked() { let _ = self.session.set_constant_value(id, false); }
                             if ui.add_enabled(!locked && !value, egui::Button::new("Set HIGH (1)" )).clicked() { let _ = self.session.set_constant_value(id, true); }
@@ -1492,6 +1493,30 @@ impl DigitalApp {
                     && let Some(id) = self.selected
                 {
                     self.apply_simulation_action(SimAction::Toggle(id));
+                }
+            }
+            if owns_keyboard
+                && !locked
+                && let Some(id) = self.selected
+                && self
+                    .session
+                    .document()
+                    .components
+                    .iter()
+                    .any(|c| c.id == id && c.kind == ComponentKind::Const)
+            {
+                let value = if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H))
+                {
+                    Some(true)
+                } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L)) {
+                    Some(false)
+                } else {
+                    None
+                };
+                if let Some(value) = value
+                    && let Err(error) = self.session.set_constant_value(id, value)
+                {
+                    self.error = Some(error.to_string());
                 }
             }
             if owns_keyboard
@@ -2418,6 +2443,135 @@ mod tests {
     }
 
     #[test]
+    fn const_workflow_uses_canvas_keyboard_and_file_simulation_controls() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("const-ui-workflow");
+        let mut app = ui_file_app(&dir);
+        for (palette, center) in [
+            ("Const", Pos2::new(408., 158.)),
+            ("Output", Pos2::new(528., 158.)),
+        ] {
+            click_text(&ctx, &mut app, palette);
+            click_at(&ctx, &mut app, center);
+        }
+        let const_id = app.session.document().components[0].id;
+        let output_id = app.session.document().components[1].id;
+        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        assert_eq!(app.selected, Some(const_id));
+        assert!(has_text(
+            &frame(&ctx, &mut app, vec![], true),
+            "H = HIGH (1), L = LOW (0)"
+        ));
+
+        click_text(&ctx, &mut app, "Wire (W)");
+        let style = app.style;
+        let pin_screen = |kind, center: [f32; 2], pin| {
+            let point = SymbolLayout::centered_on(style, kind, center)
+                .unwrap()
+                .pin_position(pin)
+                .unwrap();
+            Pos2::new(point[0] + 208., point[1] + 8.)
+        };
+        click_at(
+            &ctx,
+            &mut app,
+            pin_screen(
+                ComponentKind::Const,
+                [200., 150.],
+                PinId {
+                    direction: PinDirection::Output,
+                    index: 0,
+                },
+            ),
+        );
+        click_at(
+            &ctx,
+            &mut app,
+            pin_screen(
+                ComponentKind::Output,
+                [320., 150.],
+                PinId {
+                    direction: PinDirection::Input,
+                    index: 0,
+                },
+            ),
+        );
+        click_text(&ctx, &mut app, "Wire (W)");
+        assert_eq!(app.session.document().wires.len(), 1);
+
+        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        press(&ctx, &mut app, egui::Key::L, egui::Modifiers::NONE);
+        assert!(!app.session.document().components[0].constant_value);
+        press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert!(app.session.document().components[0].constant_value);
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::Z,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        );
+        assert!(!app.session.document().components[0].constant_value);
+        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        press(&ctx, &mut app, egui::Key::H, egui::Modifiers::NONE);
+        assert!(app.session.document().components[0].constant_value);
+
+        click_text(&ctx, &mut app, "Save As");
+        assert!(matches!(app.file_modal, Some(FileModal::SavePath { .. })));
+        type_file_path(&ctx, &mut app, "const.dig");
+        click_text(&ctx, &mut app, "Save path");
+        assert_eq!(app.session.path(), Some(dir.join("const.dig").as_path()));
+        click_text(&ctx, &mut app, "New");
+        assert!(app.session.document().components.is_empty());
+        click_text(&ctx, &mut app, "Open");
+        assert!(matches!(app.file_modal, Some(FileModal::OpenPath)));
+        // Open modal has modality priority over canvas keyboard shortcuts.
+        press(&ctx, &mut app, egui::Key::L, egui::Modifiers::NONE);
+        assert_eq!(app.session.document().components.len(), 0);
+        type_file_path(&ctx, &mut app, "const.dig");
+        click_text(&ctx, &mut app, "Open path");
+        assert_eq!(app.session.document().components.len(), 2);
+        assert!(app.session.document().components[0].constant_value);
+        assert_eq!(app.session.document().wires.len(), 1);
+        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        assert_eq!(app.selected, Some(const_id));
+        click_text(&ctx, &mut app, "Start");
+        for _ in 0..10 {
+            let shown = frame(&ctx, &mut app, vec![], true);
+            if has_text(&shown, "State: settled") {
+                break;
+            }
+        }
+        assert_eq!(output_level(&app, output_id), Some(Level::High));
+        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        press(&ctx, &mut app, egui::Key::L, egui::Modifiers::NONE);
+        assert!(
+            app.session.document().components[0].constant_value,
+            "simulation locks value editing"
+        );
+        click_text(&ctx, &mut app, "Stop");
+        assert!(!app.session.simulation_active());
+        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        press(&ctx, &mut app, egui::Key::L, egui::Modifiers::NONE);
+        assert!(!app.session.document().components[0].constant_value);
+        assert!(app.session.dirty());
+        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        press(&ctx, &mut app, egui::Key::O, egui::Modifiers::COMMAND);
+        assert!(matches!(app.file_modal, Some(FileModal::OpenPath)));
+        let before_modal = app.session.document().clone();
+        press(&ctx, &mut app, egui::Key::H, egui::Modifiers::NONE);
+        assert_eq!(
+            *app.session.document(),
+            before_modal,
+            "file modality blocks Const shortcuts"
+        );
+        click_text(&ctx, &mut app, "Cancel path");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn shape_style_defaults_to_rectangular_and_is_offered_in_the_palette() {
         let ctx = egui::Context::default();
         let mut app = app_with(ComponentKind::And);
@@ -2593,6 +2747,36 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("no text {label:?} in {:?}", texts(&output)));
         click_at(ctx, app, pos + Vec2::new(4., 4.));
+    }
+    fn type_file_path(ctx: &egui::Context, app: &mut DigitalApp, path: &str) {
+        let output = frame(ctx, app, vec![], true);
+        let label = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text
+                        .galley
+                        .job
+                        .text
+                        .contains("Path relative to the application's startup directory") =>
+                {
+                    Some(text.pos)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("path field label is missing: {:?}", texts(&output)));
+        click_at(ctx, app, label + Vec2::new(40., 47.));
+        frame(
+            ctx,
+            app,
+            vec![
+                key(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text(path.to_owned()),
+            ],
+            true,
+        );
+        assert_eq!(app.file_path_entry, path);
     }
     fn press(
         ctx: &egui::Context,
