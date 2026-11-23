@@ -518,42 +518,56 @@ mod tests {
 
     #[test]
     fn toggling_feedback_is_bounded_and_resumable() {
-        let doc = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
-        let mut whole = Runtime::start(&doc).unwrap();
-        let mut chunked = Runtime::start(&doc).unwrap();
-        for runtime in [&mut whole, &mut chunked] {
+        // Both gates are in each frontier. Different call partitions must preserve the
+        // partially evaluated frontier as well as the successive published oscillation.
+        let doc = document(
+            &[(1, ComponentKind::Not), (2, ComponentKind::Not)],
+            &[(out(1), inp(2, 0)), (out(2), inp(1, 0))],
+        );
+        let mut first = Runtime::start(&doc).unwrap();
+        let mut second = Runtime::start(&doc).unwrap();
+        for runtime in [&mut first, &mut second] {
             runtime.values[runtime.pin_nets[&out(1)]] = Low;
+            runtime.values[runtime.pin_nets[&out(2)]] = Low;
         }
-        assert_eq!(whole.settle(0), SettleOutcome::BudgetExhausted { work: 0 });
-        assert_eq!(whole.pin_value(out(1)), Some(Low));
-        assert_eq!(whole.settle(1), SettleOutcome::BudgetExhausted { work: 1 });
-        assert_eq!(whole.pin_value(out(1)), Some(Low)); // batch begun, nothing published
+
+        let checkpoints = [2, 3, 7, 8, 12];
+        let run_partition = |runtime: &mut Runtime, parts: &[usize]| {
+            let mut consumed = 0;
+            let mut states = Vec::new();
+            for &budget in parts {
+                assert_ne!(budget, 0);
+                assert_eq!(
+                    runtime.settle(budget),
+                    SettleOutcome::BudgetExhausted { work: budget }
+                );
+                consumed += budget;
+                assert!(runtime.is_pending());
+                if checkpoints.contains(&consumed) {
+                    states.push((
+                        consumed,
+                        [runtime.pin_value(out(1)), runtime.pin_value(out(2))],
+                    ));
+                }
+            }
+            states
+        };
+
+        let first_states = run_partition(&mut first, &[2, 1, 4, 1, 4]);
+        let second_states = run_partition(&mut second, &[1, 1, 1, 2, 2, 1, 4]);
+        assert_eq!(first_states, second_states);
         assert_eq!(
-            chunked.settle(1),
-            SettleOutcome::BudgetExhausted { work: 1 }
+            first_states
+                .iter()
+                .map(|(work, _)| *work)
+                .collect::<Vec<_>>(),
+            checkpoints
         );
-        assert_eq!(chunked.pin_value(out(1)), Some(Low));
-        assert_eq!(whole.settle(1), SettleOutcome::BudgetExhausted { work: 1 });
-        assert_eq!(
-            chunked.settle(1),
-            SettleOutcome::BudgetExhausted { work: 1 }
-        );
-        assert_eq!(whole.pin_value(out(1)), Some(High));
-        assert_eq!(whole.pin_value(out(1)), chunked.pin_value(out(1)));
-        assert_eq!(whole.settle(1), SettleOutcome::BudgetExhausted { work: 1 });
-        assert_eq!(
-            chunked.settle(1),
-            SettleOutcome::BudgetExhausted { work: 1 }
-        );
-        assert_eq!(whole.pin_value(out(1)), Some(High)); // second batch has not published
-        assert_eq!(whole.pin_value(out(1)), chunked.pin_value(out(1)));
-        assert_eq!(whole.settle(1), SettleOutcome::BudgetExhausted { work: 1 });
-        assert_eq!(
-            chunked.settle(1),
-            SettleOutcome::BudgetExhausted { work: 1 }
-        );
-        assert_eq!(whole.pin_value(out(1)), Some(Low));
-        assert_eq!(whole.pin_value(out(1)), chunked.pin_value(out(1)));
+        // Work 1 starts the batch; work 2 has staged just one of two gates, so
+        // outputs remain unpublished until work 3 completes the frontier.
+        assert_eq!(first_states[0].1, [Some(Low), Some(Low)]);
+        assert_eq!(first_states[1].1, [Some(High), Some(High)]);
+        assert_eq!(first_states[4].1, [Some(Low), Some(Low)]);
     }
 
     #[test]
