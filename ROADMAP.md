@@ -158,13 +158,13 @@ Some investigation and independent adapters can proceed in parallel. Do not dela
 ### M2 — First correct headless simulator
 
 - [ ] Compile document connectivity into runtime nets, including crossing-versus-junction behavior and disconnected-pin errors.
-- [ ] Implement input, output, constants and AND/NAND/OR/NOR/XOR/XNOR/NOT; begin with an explicitly documented one-bit subset.
-- [ ] Implement event scheduling with the reference's normal read-then-publish propagation boundaries, not arbitrary immediate output updates.
-- [ ] Establish startup settling as a distinct lifecycle: randomized gatewise updates, permitted undefined initial states, then reset behavior. Expand feedback coverage in M6.
-- [ ] Implement start/stop, input changes, bounded propagation and step inspection with useful non-settling diagnostics.
-- [ ] Make event traces and headless inspection available to tests; define repeatable seed controls without promising identical Java random traces.
+- [x] Implement input, output, constants and AND/NAND/OR/NOR/XOR/XNOR/NOT in the documented one-bit subset; exhaustive public seeded oracle: `tests/m2_exit_gate.rs::public_seeded_startup_exhaustive_gate_and_source_oracle` (Digital source d118dce…; Feature 13 parity evidence).
+- [x] Implement normal event scheduling with reference read-then-publish boundaries; public reconvergence order and runtime frontier regressions are listed in Feature 13 parity evidence.
+- [x] Establish seeded gatewise startup, explicit reset-release/reset-settling lifecycle infrastructure, bounded work and reset-participant polarity/release tests; this is not the Digital Reset component (deferred to M6).
+- [x] Implement start/stop, input changes, bounded propagation, pending inspection and useful non-settling diagnostics; public API, engine lock/stop/history and feedback tests are listed in Feature 13 parity evidence.
+- [x] Make bounded event traces and headless inspection available to tests; record reproducible Rust seeds without promising Java RNG traces (trace ring, eviction, exhaustion and lifecycle evidence in Feature 13).
 
-**Exit gate:** exhaustive small gate truth tables, connectivity cases, propagation-order regression tests and bounded feedback/oscillation tests pass. Review `core/Model.java` and relevant component tests before fixing simulator semantics.
+**Exit gate:** M2 remains **open**. Gate truth tables, normal propagation boundaries, lifecycle infrastructure, bounded feedback and trace/inspection have evidence; the connectivity exit condition is still incomplete. Geometry does not join simulator nets, and the strict `.dig` conversion rejects junction geometries outside its represented subset. Do not count explicit pin-edge tests as crossing/junction topology parity.
 
 ### M3 — Safe circuit persistence and headless entrypoint
 
