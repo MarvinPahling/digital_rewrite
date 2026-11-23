@@ -1466,28 +1466,8 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
     let pin_at = unique_pin_coordinates(&pins)?;
     let coordinate_by_pin: BTreeMap<PinRef, Coord> =
         pins.iter().map(|(pin, coord)| (*pin, *coord)).collect();
-    let groups = geometry_groups(&dig.wires, &pin_at)?;
-    let mut edges = BTreeSet::new();
-    for group in groups {
-        if group.len() < 2 {
-            return Err(invalid("wire net must connect at least two pins"));
-        }
-        // IDs follow XML order and must not influence which geometric pin is used as the
-        // canonical fanout root; otherwise reordering elements changes exported routes.
-        let mut by_position = Vec::with_capacity(group.len());
-        for pin in group {
-            let position = coordinate_by_pin
-                .get(&pin)
-                .copied()
-                .ok_or_else(|| invalid("wire net references unknown pin"))?;
-            by_position.push((position, pin));
-        }
-        by_position.sort();
-        let first = by_position[0].1;
-        for &(_, other) in &by_position[1..] {
-            edges.insert(canonical_pair(first, other));
-        }
-    }
+    geometry_groups(&dig.wires, &pin_at)?;
+    let edges = pin_to_pin_chains(&dig.wires, &pin_at, &coordinate_by_pin)?;
     if edges.len() > MAX_WIRES {
         return Err(invalid("normalized wire limit exceeded"));
     }
@@ -1499,6 +1479,18 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
             endpoints,
         })
         .collect();
+    // Enforce the compatibility invariant at the import boundary: every accepted
+    // document must export immediately, without changing any geometric segment.
+    let exported = from_domain(&document)?;
+    let segments = |items: &[DigWire]| {
+        items
+            .iter()
+            .map(|wire| canonical_segment((wire.p1.x, wire.p1.y), (wire.p2.x, wire.p2.y)))
+            .collect::<BTreeSet<_>>()
+    };
+    if segments(&exported.wires) != segments(&dig.wires) {
+        return Err(invalid("import/export changes wire segment geometry"));
+    }
     Ok(document)
 }
 fn canonical_pair(a: PinRef, b: PinRef) -> [PinRef; 2] {
@@ -1622,7 +1614,7 @@ fn geometry_groups(
             return Err(invalid("pin on segment interior requires normalization"));
         }
     }
-    // Reject loops and routed pin-to-pin paths with more than one bend.
+    // Reject loops; canonical-route validation below bounds accepted path shapes.
     let mut graph_seen = BTreeSet::new();
     for start in adj.keys().copied() {
         if graph_seen.contains(&start) {
@@ -1639,34 +1631,6 @@ fn geometry_groups(
                     return Err(invalid("wire loops are unsupported"));
                 }
                 stack.push((*next, Some(point)));
-            }
-        }
-    }
-    for start in pin_at.keys() {
-        if let Some(firsts) = adj.get(start) {
-            for first in firsts {
-                let mut previous = *start;
-                let mut current = *first;
-                let mut prior_horizontal = previous.1 == current.1;
-                let mut turns = 0;
-                while !pin_at.contains_key(&current) {
-                    let nexts = &adj[&current];
-                    let next = if nexts[0] == previous {
-                        nexts[1]
-                    } else {
-                        nexts[0]
-                    };
-                    let horizontal = current.1 == next.1;
-                    if horizontal != prior_horizontal {
-                        turns += 1;
-                        prior_horizontal = horizontal;
-                    }
-                    if turns > 1 {
-                        return Err(invalid("wire path has more than one bend"));
-                    }
-                    previous = current;
-                    current = next;
-                }
             }
         }
     }
@@ -1695,6 +1659,96 @@ fn geometry_groups(
     groups.sort();
     Ok(groups)
 }
+type Segment = (Coord, Coord);
+fn canonical_segment(a: Coord, b: Coord) -> Segment {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// Recover each geometric pin-to-pin chain verbatim. Pins are graph boundaries, so a net
+/// with fanout is represented as the actual set of branches, never as a synthesized star.
+fn pin_to_pin_chains(
+    wires: &[DigWire],
+    pin_at: &BTreeMap<Coord, PinRef>,
+    coordinate_by_pin: &BTreeMap<PinRef, Coord>,
+) -> Result<BTreeSet<[PinRef; 2]>, DomainCodecError> {
+    let mut adj: BTreeMap<Coord, Vec<Coord>> = BTreeMap::new();
+    let mut all_segments = BTreeSet::new();
+    for wire in wires {
+        let a = (wire.p1.x, wire.p1.y);
+        let b = (wire.p2.x, wire.p2.y);
+        all_segments.insert(canonical_segment(a, b));
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
+    }
+    let mut consumed = BTreeSet::new();
+    let mut edges = BTreeSet::new();
+    for (&start, &start_pin) in pin_at {
+        if let Some(firsts) = adj.get(&start) {
+            for &first in firsts {
+                let first_segment = canonical_segment(start, first);
+                if consumed.contains(&first_segment) {
+                    continue;
+                }
+                let mut chain = BTreeSet::new();
+                let mut previous = start;
+                let mut current = first;
+                chain.insert(first_segment);
+                while !pin_at.contains_key(&current) {
+                    let neighbors = adj
+                        .get(&current)
+                        .ok_or_else(|| invalid("broken pin-to-pin chain"))?;
+                    let next = *neighbors
+                        .iter()
+                        .find(|&&point| point != previous)
+                        .ok_or_else(|| invalid("dangling wire chain"))?;
+                    chain.insert(canonical_segment(current, next));
+                    previous = current;
+                    current = next;
+                }
+                if chain.iter().any(|segment| !consumed.insert(*segment)) {
+                    return Err(invalid("wire segment belongs to multiple pin chains"));
+                }
+                let end_pin = pin_at[&current];
+                if start_pin == end_pin {
+                    return Err(invalid("wire chain returns to same pin"));
+                }
+                let pair = canonical_pair(start_pin, end_pin);
+                let a = *coordinate_by_pin
+                    .get(&pair[0])
+                    .ok_or_else(|| invalid("wire chain references unknown pin"))?;
+                let b = *coordinate_by_pin
+                    .get(&pair[1])
+                    .ok_or_else(|| invalid("wire chain references unknown pin"))?;
+                let route = crate::wire_geometry::path(
+                    (pair[0], [a.0 as f32, a.1 as f32]),
+                    (pair[1], [b.0 as f32, b.1 as f32]),
+                );
+                let expected = route
+                    .windows(2)
+                    .map(|part| {
+                        canonical_segment(
+                            (part[0][0] as i32, part[0][1] as i32),
+                            (part[1][0] as i32, part[1][1] as i32),
+                        )
+                    })
+                    .collect::<BTreeSet<_>>();
+                if chain != expected {
+                    return Err(invalid("wire pin-to-pin chain is not the canonical route"));
+                }
+                if !edges.insert(pair) {
+                    return Err(invalid("duplicate pin-to-pin wire chain"));
+                }
+            }
+        }
+    }
+    if consumed != all_segments {
+        return Err(invalid(
+            "wire segments are not covered by pin-to-pin chains",
+        ));
+    }
+    Ok(edges)
+}
+
 fn ranges_overlap(a: i32, b: i32, c: i32, d: i32) -> bool {
     a.min(b) < c.max(d) && c.min(d) < a.max(b)
 }
@@ -2078,6 +2132,92 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn import_preserves_pin_to_pin_chain_and_exports_same_geometry() {
+        let source = DigV2 {
+            elements: vec![
+                DigElement {
+                    name: "In".into(),
+                    x: 0,
+                    y: 0,
+                    label: None,
+                },
+                DigElement {
+                    name: "Out".into(),
+                    x: 50,
+                    y: 0,
+                    label: None,
+                },
+                DigElement {
+                    name: "Out".into(),
+                    x: 100,
+                    y: 0,
+                    label: None,
+                },
+            ],
+            wires: vec![
+                DigWire {
+                    p1: DigPoint { x: 0, y: 0 },
+                    p2: DigPoint { x: 50, y: 0 },
+                },
+                DigWire {
+                    p1: DigPoint { x: 50, y: 0 },
+                    p2: DigPoint { x: 100, y: 0 },
+                },
+            ],
+        };
+        let imported = to_domain(&source).unwrap();
+        assert_eq!(imported.wires.len(), 2);
+        let exported = from_domain(&imported).unwrap();
+        let segments = |wires: &[DigWire]| {
+            wires
+                .iter()
+                .map(|w| {
+                    let a = (w.p1.x, w.p1.y);
+                    let b = (w.p2.x, w.p2.y);
+                    if a <= b { (a, b) } else { (b, a) }
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(segments(&exported.wires), segments(&source.wires));
+        assert_eq!(
+            segments(&from_domain(&to_domain(&exported).unwrap()).unwrap().wires),
+            segments(&source.wires)
+        );
+    }
+
+    #[test]
+    fn import_rejects_noncanonical_route_instead_of_rerouting() {
+        let source = DigV2 {
+            elements: vec![
+                DigElement {
+                    name: "In".into(),
+                    x: 0,
+                    y: 0,
+                    label: None,
+                },
+                DigElement {
+                    name: "Out".into(),
+                    x: 100,
+                    y: 100,
+                    label: None,
+                },
+            ],
+            wires: vec![
+                DigWire {
+                    p1: DigPoint { x: 0, y: 0 },
+                    p2: DigPoint { x: 0, y: 100 },
+                },
+                DigWire {
+                    p1: DigPoint { x: 0, y: 100 },
+                    p2: DigPoint { x: 100, y: 100 },
+                },
+            ],
+        };
+        let error = to_domain(&source).unwrap_err();
+        assert!(error.0.contains("canonical"), "{error}");
+    }
+
     #[test]
     fn fanout_net_normalization_is_independent_of_xml_element_order() {
         let wires = vec![

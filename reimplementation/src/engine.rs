@@ -294,6 +294,12 @@ mod tests {
         let before = snapshot(&session);
         assert!(session.open_dig_bytes(b"not xml").is_err());
         assert_unchanged(&session, &before);
+        let noncanonical = b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement><visualElement><elementName>Out</elementName><elementAttributes/><pos x=\"100\" y=\"100\"/></visualElement></visualElements><wires><wire><p1 x=\"0\" y=\"0\"/><p2 x=\"0\" y=\"100\"/></wire><wire><p1 x=\"0\" y=\"100\"/><p2 x=\"100\" y=\"100\"/></wire></wires></circuit>";
+        assert!(matches!(
+            session.open_dig_bytes(noncanonical),
+            Err(SessionDigError::Domain(_))
+        ));
+        assert_unchanged(&session, &before);
         let xml=b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>";
         session.open_dig_bytes(xml).unwrap();
         assert!(!session.dirty());
