@@ -164,7 +164,7 @@ Some investigation and independent adapters can proceed in parallel. Do not dela
 - [x] Implement start/stop, input changes, bounded propagation, pending inspection and useful non-settling diagnostics; public API, engine lock/stop/history and feedback tests are listed in Feature 13 parity evidence.
 - [x] Make bounded event traces and headless inspection available to tests; record reproducible Rust seeds without promising Java RNG traces (trace ring, eviction, exhaustion and lifecycle evidence in Feature 13).
 
-**Exit gate:** M2 remains **open**. Gate truth tables, normal propagation boundaries, lifecycle infrastructure, bounded feedback and trace/inspection have evidence; the connectivity exit condition is still incomplete. Geometry does not join simulator nets, and the strict `.dig` conversion rejects junction geometries outside its represented subset. Do not count explicit pin-edge tests as crossing/junction topology parity.
+**Exit gate:** M2 remains **open**. Gate truth tables, normal propagation boundaries, lifecycle infrastructure, bounded feedback and trace/inspection have evidence. Feature 12 adds a bounded endpoint-coordinate resolver consumed by the compiler, but connectivity closure is incomplete: editable documents still store pin-pair wires rather than source segment/junction geometry, imported paths cannot be preserved/edited generally, and the strict `.dig` conversion still refuses noncanonical topology. See `reimplementation/docs/parity.md` Feature 12. Do not count explicit pin-edge tests alone as full crossing/junction, editing, or codec parity.
 
 ### M3 — Safe circuit persistence and headless entrypoint
 
