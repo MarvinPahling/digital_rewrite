@@ -9,8 +9,6 @@ use digital_rust::domain;
 use digital_rust::runtime;
 use digital_rust::simulation;
 mod engine;
-#[allow(dead_code)]
-// File workflows are headless engine seams; UI/dialog wiring is deliberately later.
 mod file_session;
 mod formats;
 mod sim_text;

@@ -7,7 +7,8 @@ use crate::{
     canvas::CanvasTransform,
     components::KINDS,
     domain::{ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position, WireId},
-    engine::{EditError, Session, SimulationError},
+    engine::{EditError, SaveError, Session, SimulationError},
+    file_session::{DiscardIntent, FileIo, LocalFileIo, PublishOutcome, SaveAsIntent},
     runtime::{InputChange, Level, SettleOutcome},
     sim_text::{describe_simulation_error, level_badge, level_text},
     symbol_render::{PaintState, Palette, SymbolLayout, SymbolRenderer},
@@ -71,9 +72,58 @@ pub struct DigitalApp {
     failed_start: Option<Document>,
     style: SymbolStyle,
     renderer: SymbolRenderer,
+    file_io: Option<Box<dyn FileIo>>,
+    file_io_error: Option<String>,
+    file_path_entry: String,
+    pending_action: Option<PendingAction>,
+    file_modal: Option<FileModal>,
+    approved_close: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingAction {
+    New,
+    Open(std::path::PathBuf),
+    Close,
+}
+#[derive(Clone, Debug)]
+enum FileModal {
+    OpenPath,
+    SavePath {
+        continuation: bool,
+    },
+    Unsaved,
+    RunningClose,
+    Overwrite {
+        path: std::path::PathBuf,
+        continuation: bool,
+    },
+    PublishedWarning {
+        diagnostics: Vec<String>,
+        continuation: bool,
+    },
 }
 impl Default for DigitalApp {
     fn default() -> Self {
+        let cwd = std::env::current_dir();
+        let (file_io, file_io_error) = match cwd {
+            Ok(path) if path.is_absolute() => (
+                Some(Box::new(LocalFileIo::new(path)) as Box<dyn FileIo>),
+                None,
+            ),
+            Ok(_) => (
+                None,
+                Some("The current directory is not absolute; file actions are unavailable".into()),
+            ),
+            Err(error) => (
+                None,
+                Some(format!("Cannot initialize local file access: {error}")),
+            ),
+        };
+        Self::with_file_io(file_io, file_io_error)
+    }
+}
+impl DigitalApp {
+    pub fn with_file_io(file_io: Option<Box<dyn FileIo>>, file_io_error: Option<String>) -> Self {
         Self {
             session: Session::default(),
             selected: None,
@@ -89,6 +139,12 @@ impl Default for DigitalApp {
             failed_start: None,
             style: DEFAULT_STYLE,
             renderer: SymbolRenderer::default(),
+            file_io,
+            file_io_error,
+            file_path_entry: String::new(),
+            pending_action: None,
+            file_modal: None,
+            approved_close: false,
         }
     }
 }
@@ -127,6 +183,326 @@ fn draw_grid(
     }
 }
 impl DigitalApp {
+    fn cancel_gestures(&mut self) {
+        self.placing = None;
+        self.wiring = false;
+        self.wire_start = None;
+        self.focused_pin = None;
+        self.drag = None;
+    }
+    fn begin_pending(&mut self, action: PendingAction) {
+        if self.session.simulation_active() && !matches!(action, PendingAction::Close) {
+            self.error = Some("Stop the simulation before changing files".into());
+            return;
+        }
+        self.cancel_gestures();
+        self.pending_action = Some(action.clone());
+        if action == PendingAction::Close && self.session.simulation_active() {
+            self.file_modal = Some(FileModal::RunningClose);
+            return;
+        }
+        if self.session.dirty() {
+            self.file_modal = Some(FileModal::Unsaved);
+        } else {
+            self.complete_pending();
+        }
+    }
+    fn complete_pending(&mut self) {
+        let Some(action) = self.pending_action.take() else {
+            return;
+        };
+        match action {
+            PendingAction::New => match self.session.new_document(DiscardIntent::DiscardDirty) {
+                Ok(()) => self.reset_document_ui(),
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    self.pending_action = Some(PendingAction::New);
+                }
+            },
+            PendingAction::Open(path) => {
+                let result = self
+                    .file_io
+                    .as_mut()
+                    .ok_or_else(|| {
+                        self.file_io_error
+                            .clone()
+                            .unwrap_or_else(|| "File access unavailable".into())
+                    })
+                    .and_then(|io| {
+                        self.session
+                            .open_path(io.as_mut(), &path, DiscardIntent::DiscardDirty)
+                            .map_err(|e| e.to_string())
+                    });
+                match result {
+                    Ok(()) => self.reset_document_ui(),
+                    Err(error) => {
+                        self.error = Some(error);
+                        self.pending_action = Some(PendingAction::Open(path));
+                    }
+                }
+            }
+            PendingAction::Close => {
+                if self.session.simulation_active() {
+                    let _ = self.session.stop_simulation();
+                }
+                self.settling = false;
+                self.approved_close = true;
+            }
+        }
+    }
+    fn reset_document_ui(&mut self) {
+        self.selected = None;
+        self.selected_wire = None;
+        self.cancel_gestures();
+        self.failed_start = None;
+        self.settling = false;
+        self.error = None;
+    }
+    fn open_path_dialog(&mut self) {
+        self.cancel_gestures();
+        self.file_path_entry.clear();
+        self.file_modal = Some(FileModal::OpenPath);
+    }
+    fn save_path_dialog(&mut self, continuation: bool) {
+        self.cancel_gestures();
+        self.file_path_entry.clear();
+        self.file_modal = Some(FileModal::SavePath { continuation });
+    }
+    fn begin_save(&mut self, continuation: bool) {
+        self.cancel_gestures();
+        if self.session.simulation_active() {
+            self.error = Some("Stop the simulation before saving".into());
+            return;
+        }
+        if self.session.path().is_none() {
+            self.save_path_dialog(continuation);
+        } else {
+            self.save_current(continuation);
+        }
+    }
+    fn save_current(&mut self, continuation: bool) {
+        let result = self
+            .file_io
+            .as_mut()
+            .ok_or_else(|| {
+                self.file_io_error
+                    .clone()
+                    .unwrap_or_else(|| "File access unavailable".into())
+            })
+            .and_then(|io| self.session.save(io.as_mut()).map_err(|e| e.to_string()));
+        match result {
+            Ok(outcome) => self.after_save(outcome, continuation),
+            Err(error) => self.error = Some(error),
+        }
+    }
+    fn save_as_path(&mut self, path: std::path::PathBuf, continuation: bool, replace: bool) {
+        let Some(io) = self.file_io.as_mut() else {
+            self.error = Some(
+                self.file_io_error
+                    .clone()
+                    .unwrap_or_else(|| "File access unavailable".into()),
+            );
+            return;
+        };
+        let result = self.session.save_as(
+            io.as_mut(),
+            &path,
+            if replace {
+                SaveAsIntent::Replace
+            } else {
+                SaveAsIntent::CreateOnly
+            },
+        );
+        match result {
+            Ok(outcome) => self.after_save(outcome, continuation),
+            Err(SaveError::NotPublished(failure))
+                if !replace && failure.primary.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                self.file_modal = Some(FileModal::Overwrite { path, continuation });
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+    fn after_save(&mut self, outcome: PublishOutcome, continuation: bool) {
+        match outcome {
+            PublishOutcome::Published => {
+                if continuation {
+                    self.complete_pending();
+                }
+            }
+            PublishOutcome::PublishedDurabilityUnconfirmed(diagnostics) => {
+                self.file_modal = Some(FileModal::PublishedWarning {
+                    diagnostics: diagnostics.iter().map(ToString::to_string).collect(),
+                    continuation,
+                });
+            }
+        }
+    }
+    fn file_actions(&mut self, ctx: &egui::Context) {
+        let locked = self.session.simulation_active() || self.file_modal.is_some();
+        let shortcut = ctx.input_mut(|i| {
+            let command = egui::Modifiers::COMMAND;
+            let shift = egui::Modifiers {
+                shift: true,
+                ..command
+            };
+            if i.consume_key(command, egui::Key::N) {
+                Some(0)
+            } else if i.consume_key(command, egui::Key::O) {
+                Some(1)
+            } else if i.consume_key(shift, egui::Key::S) {
+                Some(3)
+            } else if i.consume_key(command, egui::Key::S) {
+                Some(2)
+            } else {
+                None
+            }
+        });
+        if !locked && let Some(action) = shortcut {
+            match action {
+                0 => self.begin_pending(PendingAction::New),
+                1 => self.open_path_dialog(),
+                2 => self.begin_save(false),
+                _ => self.save_path_dialog(false),
+            }
+        }
+    }
+    fn file_modal_ui(&mut self, ctx: &egui::Context) {
+        let Some(modal) = self.file_modal.clone() else {
+            return;
+        };
+        // Durability diagnostics are rendered in the palette panel so the complete list remains
+        // visible and the acknowledgement control is operable even for several warnings.
+        if matches!(
+            modal,
+            FileModal::PublishedWarning { .. }
+                | FileModal::OpenPath
+                | FileModal::SavePath { .. }
+                | FileModal::Unsaved
+                | FileModal::RunningClose
+        ) {
+            return;
+        }
+        enum Choice {
+            Cancel,
+            Open(std::path::PathBuf),
+            Save(std::path::PathBuf),
+            SavePending,
+            Discard,
+            ConfirmReplace(std::path::PathBuf, bool),
+            Acknowledge(bool),
+            Stop,
+            ContinueClose,
+        }
+        let mut choice = None;
+        egui::Modal::new(egui::Id::new("document_file_modal")).show(ctx, |ui| {
+            ui.set_min_width(360.);
+            match &modal {
+                FileModal::OpenPath | FileModal::SavePath { .. } => {
+                    let saving = matches!(modal, FileModal::SavePath { .. });
+                    ui.heading(if saving { "Save As" } else { "Open document" });
+                    ui.label("Path (absolute or relative to the application's startup directory):");
+                    ui.text_edit_singleline(&mut self.file_path_entry);
+                    ui.horizontal(|ui| {
+                        if ui.button(if saving { "Save" } else { "Open" }).clicked() {
+                            let path = std::path::PathBuf::from(self.file_path_entry.as_str());
+                            if saving { choice = Some(Choice::Save(path)); } else { choice = Some(Choice::Open(path)); }
+                        }
+                        if ui.button("Cancel").clicked() { choice = Some(Choice::Cancel); }
+                    });
+                    if let Some(error) = &self.file_io_error { ui.colored_label(ui.visuals().error_fg_color, error); }
+                }
+                FileModal::Unsaved => {
+                    ui.heading("Unsaved changes");
+                    ui.label("Save changes before continuing?");
+                    if self.session.simulation_active() { ui.colored_label(ui.visuals().warn_fg_color, "Stop simulation before saving. Cancel preserves the running simulation."); }
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.session.simulation_active() && self.file_io.is_some(), egui::Button::new("Save")).clicked() { choice = Some(Choice::SavePending); }
+                        if ui.button("Discard").clicked() { choice = Some(Choice::Discard); }
+                        if ui.button("Cancel").clicked() { choice = Some(Choice::Cancel); }
+                    });
+                    if self.session.simulation_active() && ui.button("Stop simulation").clicked() { choice = Some(Choice::Stop); }
+                }
+                FileModal::RunningClose => {
+                    ui.heading("Simulation is running");
+                    ui.label("Closing will stop the simulation. Cancel preserves its current runtime state.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Stop and continue closing").clicked() { choice = Some(Choice::ContinueClose); }
+                        if ui.button("Cancel").clicked() { choice = Some(Choice::Cancel); }
+                    });
+                }
+                FileModal::Overwrite { path, continuation } => {
+                    ui.heading("Replace existing file?");
+                    ui.label(format!("{} already exists. Replace it?", path.display()));
+                    ui.horizontal(|ui| {
+                        if ui.button("Replace").clicked() { choice = Some(Choice::ConfirmReplace(path.clone(), *continuation)); }
+                        if ui.button("Cancel").clicked() { choice = Some(Choice::Cancel); }
+                    });
+                }
+                FileModal::PublishedWarning { diagnostics, .. } => {
+                    ui.heading("File published; durability unconfirmed");
+                    ui.label("The new file is published and the session is clean, but durability is unconfirmed. Review all diagnostics before continuing.");
+                    for diagnostic in diagnostics { ui.label(diagnostic); }
+                    if ui.button("Acknowledge and continue").clicked()
+                        && let FileModal::PublishedWarning { continuation, .. } = modal
+                    {
+                        choice = Some(Choice::Acknowledge(continuation));
+                    }
+                }
+            }
+        });
+        if let Some(choice) = choice {
+            match choice {
+                Choice::Cancel => {
+                    self.file_modal = None;
+                    self.pending_action = None;
+                }
+                Choice::Open(path) => {
+                    self.file_modal = None;
+                    self.begin_pending(PendingAction::Open(path));
+                }
+                Choice::Save(path) => {
+                    let continuation = matches!(modal, FileModal::SavePath { continuation: true });
+                    self.file_modal = None;
+                    self.save_as_path(path, continuation, false);
+                }
+                Choice::SavePending => {
+                    self.file_modal = None;
+                    self.begin_save(true);
+                }
+                Choice::Discard => {
+                    self.file_modal = None;
+                    self.complete_pending();
+                }
+                Choice::ConfirmReplace(path, continuation) => {
+                    self.file_modal = None;
+                    self.save_as_path(path, continuation, true);
+                }
+                Choice::Acknowledge(continuation) => {
+                    self.file_modal = None;
+                    if continuation {
+                        self.complete_pending();
+                    }
+                }
+                Choice::Stop => {
+                    let _ = self.session.stop_simulation();
+                    self.settling = false;
+                }
+                Choice::ContinueClose => {
+                    if self.session.simulation_active() {
+                        let _ = self.session.stop_simulation();
+                    }
+                    self.settling = false;
+                    self.file_modal = None;
+                    if self.session.dirty() {
+                        self.file_modal = Some(FileModal::Unsaved);
+                    } else {
+                        self.complete_pending();
+                    }
+                }
+            }
+        }
+    }
     fn choose_pin(&mut self, pin: PinRef) {
         if let Some(start) = self.wire_start {
             match self.session.connect([start, pin]) {
@@ -238,13 +614,34 @@ impl DigitalApp {
         egui::SidePanel::right("simulation").show(ctx, |ui| {
             ui.heading("Simulation");
             let active = self.session.simulation_active();
+            let modal_blocked = self.file_modal.is_some();
             let mut action = None;
             ui.horizontal_wrapped(|ui| {
                 for (label, enabled, hint, command) in [
-                    ("Start", !active, "Start (F5)", SimAction::Start),
-                    ("Stop", active, "Stop (Shift+F5)", SimAction::Stop),
-                    ("Step", active, "One microstep (F10)", SimAction::Step),
-                    ("Settle", active, "Run until stable (F6)", SimAction::Settle),
+                    (
+                        "Start",
+                        !active && !modal_blocked,
+                        "Start (F5)",
+                        SimAction::Start,
+                    ),
+                    (
+                        "Stop",
+                        active && !modal_blocked,
+                        "Stop (Shift+F5)",
+                        SimAction::Stop,
+                    ),
+                    (
+                        "Step",
+                        active && !modal_blocked,
+                        "One microstep (F10)",
+                        SimAction::Step,
+                    ),
+                    (
+                        "Settle",
+                        active && !modal_blocked,
+                        "Run until stable (F6)",
+                        SimAction::Settle,
+                    ),
                 ] {
                     if ui
                         .add_enabled(enabled, egui::Button::new(label))
@@ -291,7 +688,10 @@ impl DigitalApp {
                                 level_text(level)
                             );
                             if ui
-                                .add_enabled(!runtime.is_pending(), egui::Button::new(text))
+                                .add_enabled(
+                                    !runtime.is_pending() && !modal_blocked,
+                                    egui::Button::new(text),
+                                )
                                 .clicked()
                             {
                                 action = Some(SimAction::Toggle(component.id));
@@ -337,15 +737,20 @@ impl DigitalApp {
                         }
                     });
             }
-            if let Some(action) = action {
+            if let Some(action) = action.filter(|_| !modal_blocked) {
                 self.apply_simulation_action(action);
             }
         });
     }
     fn palette_panel(&mut self, ctx: &egui::Context) {
+        let mut acknowledge_warning = None;
+        let mut path_choice: Option<(bool, std::path::PathBuf, bool)> = None;
+        let mut cancel_path = false;
+        let mut unsaved_choice = None;
+        let mut running_close_choice = None;
         egui::SidePanel::left("palette").show(ctx, |ui| {
             ui.heading("Components");
-            let locked = self.session.simulation_active();
+            let locked = self.session.simulation_active() || self.file_modal.is_some();
             ui.add_enabled_ui(!locked, |ui| {
                 for kind in KINDS {
                     if ui
@@ -365,22 +770,170 @@ impl DigitalApp {
                 }
             });
             if locked {
-                ui.label(EDIT_LOCK_NOTE);
+                ui.label(if self.session.simulation_active() { EDIT_LOCK_NOTE } else { "Finish or cancel the file action to resume editing." });
             }
             ui.separator();
-            ui.label("Shape style");
-            ui.radio_value(&mut self.style, SymbolStyle::Rect, "Rectangular");
-            ui.radio_value(&mut self.style, SymbolStyle::Ieee, "IEEE");
+            ui.add_enabled_ui(!locked, |ui| {
+                ui.label("Shape style");
+                ui.radio_value(&mut self.style, SymbolStyle::Rect, "Rectangular");
+                ui.radio_value(&mut self.style, SymbolStyle::Ieee, "IEEE");
+            });
             ui.separator();
             ui.label("Click canvas to place. Drag to move. Escape cancels. Delete removes; Ctrl/Cmd-Z undoes; Shift-Ctrl/Cmd-Z redoes.");
             ui.label(if self.session.dirty() { "Modified" } else { "Unmodified" });
             if let Some(error) = &self.error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
+            if let Some(error) = &self.file_io_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            if let Some(FileModal::PublishedWarning { diagnostics, continuation }) = self.file_modal.clone() {
+                ui.colored_label(ui.visuals().warn_fg_color, "Published; durability unconfirmed. Session is clean; review all diagnostics.");
+                egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
+                    for diagnostic in diagnostics { ui.label(diagnostic); }
+                });
+                if ui.button("Acknowledge and continue").clicked() { acknowledge_warning = Some(continuation); }
+            }
+            if matches!(self.file_modal, Some(FileModal::RunningClose)) {
+                ui.separator();
+                ui.heading("Simulation is running");
+                ui.label("Closing will stop the simulation. Cancel preserves its current runtime state.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Stop and continue closing").clicked() { running_close_choice = Some(true); }
+                    if ui.button("Cancel").clicked() { running_close_choice = Some(false); }
+                });
+            }
+            if matches!(self.file_modal, Some(FileModal::Unsaved)) {
+                ui.separator();
+                ui.heading("Unsaved changes");
+                ui.label("Save changes before continuing?");
+                if self.session.simulation_active() {
+                    ui.colored_label(ui.visuals().warn_fg_color, "Stop simulation before saving. Cancel preserves the running simulation.");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!self.session.simulation_active() && self.file_io.is_some(), egui::Button::new("Save")).clicked() { unsaved_choice = Some(0); }
+                    if ui.button("Discard").clicked() { unsaved_choice = Some(1); }
+                    if ui.button("Cancel").clicked() { unsaved_choice = Some(2); }
+                    if self.session.simulation_active() && ui.button("Stop simulation").clicked() { unsaved_choice = Some(3); }
+                });
+            }
+            match self.file_modal.clone() {
+                Some(FileModal::OpenPath) | Some(FileModal::SavePath { .. }) => {
+                    let saving = matches!(self.file_modal, Some(FileModal::SavePath { .. }));
+                    let continuation = matches!(self.file_modal, Some(FileModal::SavePath { continuation: true }));
+                    ui.separator();
+                    ui.heading(if saving { "Save As" } else { "Open document" });
+                    ui.label("Path relative to the application's startup directory, or an absolute path:");
+                    ui.text_edit_singleline(&mut self.file_path_entry);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button(if saving { "Save path" } else { "Open path" }).clicked() {
+                            path_choice = Some((saving, std::path::PathBuf::from(self.file_path_entry.as_str()), continuation));
+                        }
+                        if ui.button("Cancel path").clicked() { cancel_path = true; }
+                    });
+                }
+                _ => {}
+            }
+            ui.separator();
+            let document_name = self
+                .session
+                .path()
+                .and_then(std::path::Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Untitled".into());
+            ui.heading(format!(
+                "{}{}",
+                if self.session.dirty() { "• " } else { "" },
+                document_name
+            ));
+            let mut file_action = None;
+            if self.file_modal.is_none() {
+            ui.menu_button("File", |ui| {
+                for (label, enabled, action) in [("New  Ctrl/Cmd+N", !locked, 0), ("Open…  Ctrl/Cmd+O", !locked, 1), ("Save  Ctrl/Cmd+S", !locked, 2), ("Save As…  Shift+Ctrl/Cmd+S", !locked, 3)] {
+                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() { file_action = Some(action); ui.close_menu(); }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                for (label, action) in [("New", 0), ("Open", 1), ("Save", 2), ("Save As", 3)] {
+                    if ui.add_enabled(!locked, egui::Button::new(label)).clicked() { file_action = Some(action); }
+                }
+            });
+            if let Some(action) = file_action {
+                match action {
+                    0 => self.begin_pending(PendingAction::New),
+                    1 => self.open_path_dialog(),
+                    2 => self.begin_save(false),
+                    _ => self.save_path_dialog(false)
+                }
+            }
+            }
         });
+        if let Some(continuation) = acknowledge_warning {
+            self.file_modal = None;
+            if continuation {
+                self.complete_pending();
+            }
+        }
+        if cancel_path {
+            self.file_modal = None;
+            self.pending_action = None;
+        }
+        match unsaved_choice {
+            Some(0) => {
+                self.file_modal = None;
+                self.begin_save(true);
+            }
+            Some(1) => {
+                self.file_modal = None;
+                self.complete_pending();
+            }
+            Some(2) => {
+                self.file_modal = None;
+                self.pending_action = None;
+            }
+            Some(3) => {
+                let _ = self.session.stop_simulation();
+                self.settling = false;
+            }
+            _ => {}
+        }
+        if let Some(continue_close) = running_close_choice {
+            if continue_close {
+                let _ = self.session.stop_simulation();
+                self.settling = false;
+                self.file_modal = None;
+                if self.session.dirty() {
+                    self.file_modal = Some(FileModal::Unsaved);
+                } else {
+                    self.complete_pending();
+                }
+            } else {
+                self.file_modal = None;
+                self.pending_action = None;
+            }
+        }
+        if let Some((saving, path, continuation)) = path_choice {
+            self.file_modal = None;
+            if saving {
+                self.save_as_path(path, continuation, false);
+            } else {
+                self.begin_pending(PendingAction::Open(path));
+            }
+        }
     }
     fn show(&mut self, ctx: &egui::Context) {
-        self.simulation_shortcuts(ctx);
+        self.file_actions(ctx);
+        if ctx.input(|input| input.viewport().close_requested()) && !self.approved_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.begin_pending(PendingAction::Close);
+        }
+        if self.approved_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        let modal_open = self.file_modal.is_some();
+        if !modal_open {
+            self.simulation_shortcuts(ctx);
+        }
         self.palette_panel(ctx);
         self.simulation_panel(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -400,7 +953,8 @@ impl DigitalApp {
                 ui.visuals().widgets.noninteractive.bg_stroke.color,
             );
             let pointer = response.interact_pointer_pos();
-            let cancelled = ctx.input(|i| !i.focused || i.key_pressed(egui::Key::Escape));
+            let cancelled = self.file_modal.is_some()
+                || ctx.input(|i| !i.focused || i.key_pressed(egui::Key::Escape));
             if cancelled {
                 self.drag = None;
                 self.placing = None;
@@ -698,7 +1252,7 @@ impl DigitalApp {
                     );
                 }
             }
-            let owns_keyboard = response.has_focus();
+            let owns_keyboard = response.has_focus() && self.file_modal.is_none();
             if owns_keyboard {
                 ui.memory_mut(|m| {
                     m.set_focus_lock_filter(
@@ -857,7 +1411,10 @@ impl DigitalApp {
                 }
             }
         });
-        self.advance_simulation(ctx);
+        if !modal_open {
+            self.advance_simulation(ctx);
+        }
+        self.file_modal_ui(ctx);
     }
 }
 impl eframe::App for DigitalApp {
@@ -2036,6 +2593,366 @@ mod tests {
         frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
         frame(&ctx, &mut app, vec![button(end, false)], true);
         assert_eq!(*app.session.document(), before);
+    }
+
+    fn ui_file_app(dir: &std::path::Path) -> DigitalApp {
+        DigitalApp::with_file_io(Some(Box::new(LocalFileIo::new(dir))), None)
+    }
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("digital-ui-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_menu_and_shortcut_share_pending_document_actions() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("menu");
+        let mut app = ui_file_app(&dir);
+        let original = app
+            .session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        press(&ctx, &mut app, egui::Key::N, egui::Modifiers::COMMAND);
+        assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
+        assert_eq!(app.session.document().components[0].id, original);
+        click_text(&ctx, &mut app, "Cancel");
+        assert!(app.file_modal.is_none());
+        assert!(app.session.dirty());
+        // The visible File menu's New item goes through the same pending path.
+        click_text(&ctx, &mut app, "New");
+        assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
+        click_text(&ctx, &mut app, "Discard");
+        assert!(app.session.document().components.is_empty());
+        assert!(!app.session.dirty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dirty_open_save_discard_and_cancel_all_preserve_or_replace_the_document_as_chosen() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("dirty-open-choices");
+        let mut app = ui_file_app(&dir);
+        frame(&ctx, &mut app, vec![], true);
+        let source = app
+            .session
+            .place(ComponentKind::Input, Position { x: 10., y: 10. })
+            .unwrap();
+        app.save_as_path("source.dig".into(), false, false);
+
+        let mut destination = Session::default();
+        destination
+            .place(ComponentKind::Output, Position { x: 90., y: 90. })
+            .unwrap();
+        destination
+            .save_as(
+                app.file_io.as_mut().unwrap().as_mut(),
+                std::path::Path::new("destination.dig"),
+                SaveAsIntent::CreateOnly,
+            )
+            .unwrap();
+        let old = app.session.document().clone();
+        app.session
+            .move_component(source, Position { x: 30., y: 30. })
+            .unwrap();
+        let changed = app.session.document().clone();
+
+        app.begin_pending(PendingAction::Open(dir.join("destination.dig")));
+        assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
+        click_text(&ctx, &mut app, "Cancel");
+        assert_eq!(*app.session.document(), changed);
+
+        app.begin_pending(PendingAction::Open(dir.join("destination.dig")));
+        click_text(&ctx, &mut app, "Discard");
+        assert_eq!(
+            app.session.document().components[0].kind,
+            ComponentKind::Output
+        );
+        assert!(!app.session.dirty());
+
+        let destination_id = app.session.document().components[0].id;
+        app.session
+            .move_component(destination_id, Position { x: 120., y: 120. })
+            .unwrap();
+        app.begin_pending(PendingAction::Open(dir.join("source.dig")));
+        click_text(&ctx, &mut app, "Save");
+        assert_eq!(
+            app.session.document().components[0].kind,
+            ComponentKind::Input
+        );
+        assert_eq!(app.session.path(), Some(dir.join("source.dig").as_path()));
+        assert!(!app.session.dirty());
+        assert_eq!(*app.session.document(), old);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn path_cancel_failed_open_and_create_only_collision_never_discard_the_document() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("file-failures");
+        let mut app = ui_file_app(&dir);
+        let id = app
+            .session
+            .place(ComponentKind::Input, Position { x: 4., y: 5. })
+            .unwrap();
+        app.file_path_entry = "unused.dig".into();
+        app.file_modal = Some(FileModal::SavePath { continuation: true });
+        click_text(&ctx, &mut app, "Cancel path");
+        assert!(app.session.dirty() && app.session.path().is_none());
+        assert!(!dir.join("unused.dig").exists());
+
+        app.save_as_path("old.dig".into(), false, false);
+        let before = app.session.document().clone();
+        app.begin_pending(PendingAction::Open(dir.join("missing.dig")));
+        assert_eq!(*app.session.document(), before);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("missing.dig"))
+        );
+
+        let collision = dir.join("exists.dig");
+        std::fs::write(&collision, b"foreign bytes").unwrap();
+        app.file_modal = Some(FileModal::SavePath {
+            continuation: false,
+        });
+        app.file_path_entry = "exists.dig".into();
+        click_text(&ctx, &mut app, "Save path");
+        assert!(matches!(app.file_modal, Some(FileModal::Overwrite { .. })));
+        click_text(&ctx, &mut app, "Cancel");
+        assert_eq!(std::fs::read(&collision).unwrap(), b"foreign bytes");
+        assert_eq!(*app.session.document(), before);
+        assert_eq!(app.session.document().components[0].id, id);
+
+        app.file_modal = Some(FileModal::SavePath {
+            continuation: false,
+        });
+        app.file_path_entry = "exists.dig".into();
+        click_text(&ctx, &mut app, "Save path");
+        assert!(matches!(app.file_modal, Some(FileModal::Overwrite { .. })));
+        click_text(&ctx, &mut app, "Replace");
+        assert!(app.session.path().is_some());
+        assert!(!app.session.dirty());
+        assert_ne!(std::fs::read(&collision).unwrap(), b"foreign bytes");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_continuation_clears_pending_action_only_after_publish_and_failed_save_blocks_it() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("save-continuation");
+        let mut app = ui_file_app(&dir);
+        app.session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let original = app.session.document().clone();
+        app.begin_pending(PendingAction::New);
+        app.begin_save(true);
+        assert!(matches!(
+            app.file_modal,
+            Some(FileModal::SavePath { continuation: true })
+        ));
+        app.file_path_entry = "kept.dig".into();
+        click_text(&ctx, &mut app, "Save path");
+        assert!(dir.join("kept.dig").exists());
+        assert!(app.session.document().components.is_empty());
+        assert!(!app.session.dirty());
+
+        app.session
+            .place(ComponentKind::Output, Position { x: 1., y: 2. })
+            .unwrap();
+        let before_failure = app.session.document().clone();
+        app.begin_pending(PendingAction::New);
+        app.begin_save(true);
+        app.save_as_path("missing-dir/fail.dig".into(), true, false);
+        assert!(app.error.is_some());
+        assert_eq!(*app.session.document(), before_failure);
+        assert_eq!(app.pending_action, Some(PendingAction::New));
+        assert!(app.session.dirty());
+        assert_ne!(before_failure, original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dirty_close_save_continuation_approves_exit_only_after_publication() {
+        let dir = test_dir("close-save");
+        let mut app = ui_file_app(&dir);
+        let id = app
+            .session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        app.save_as_path("close.dig".into(), false, false);
+        app.session
+            .move_component(id, Position { x: 20., y: 30. })
+            .unwrap();
+        app.begin_pending(PendingAction::Close);
+        assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
+        app.begin_save(true);
+        assert!(app.approved_close);
+        assert!(!app.session.dirty());
+        assert!(dir.join("close.dig").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_modal_blocks_edit_simulation_and_close_cancel_preserves_runtime() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("modal-lock");
+        let mut app = ui_file_app(&dir);
+        let (input, _) = inverter_chain(&mut app, 1);
+        let before = app.session.document().clone();
+        app.selected = Some(input);
+        app.selected_wire = Some(app.session.document().wires[0].id);
+        app.placing = Some(ComponentKind::And);
+        app.wiring = true;
+        app.wire_start = Some(pin_ref(input, PinDirection::Output, 0));
+        app.focused_pin = app.wire_start;
+        app.drag = Some((input, Position { x: 0., y: 0. }, Pos2::ZERO));
+        app.begin_pending(PendingAction::New);
+        assert!(app.drag.is_none() && app.placing.is_none() && !app.wiring);
+        assert!(app.wire_start.is_none() && app.focused_pin.is_none());
+        assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
+        for (key, modifiers) in [
+            (egui::Key::Delete, egui::Modifiers::NONE),
+            (egui::Key::Z, egui::Modifiers::COMMAND),
+            (egui::Key::W, egui::Modifiers::NONE),
+            (egui::Key::F5, egui::Modifiers::NONE),
+        ] {
+            press(&ctx, &mut app, key, modifiers);
+        }
+        assert_eq!(*app.session.document(), before);
+        assert!(!app.session.simulation_active());
+        assert!(app.wire_start.is_none());
+
+        click_text(&ctx, &mut app, "Cancel");
+        app.session.start_simulation().unwrap();
+        let runtime_input =
+            app.session
+                .inspect()
+                .unwrap()
+                .pin_value(pin_ref(input, PinDirection::Output, 0));
+        app.begin_pending(PendingAction::Close);
+        assert!(matches!(app.file_modal, Some(FileModal::RunningClose)));
+        click_text(&ctx, &mut app, "Cancel");
+        assert!(app.session.simulation_active());
+        assert_eq!(
+            app.session
+                .inspect()
+                .unwrap()
+                .pin_value(pin_ref(input, PinDirection::Output, 0)),
+            runtime_input
+        );
+        assert!(!app.approved_close);
+        app.begin_pending(PendingAction::Close);
+        click_text(&ctx, &mut app, "Stop and continue closing");
+        assert!(!app.session.simulation_active());
+        assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
+        click_text(&ctx, &mut app, "Discard");
+        assert!(app.approved_close);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_close_is_cancelled_until_dirty_workflow_approves() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        app.session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
+            focused: true,
+            viewports: [(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| app.show(ctx));
+        assert!(!app.approved_close);
+        assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        click_text(&ctx, &mut app, "Cancel");
+        assert!(!app.approved_close);
+        assert!(app.session.dirty());
+
+        app.begin_pending(PendingAction::Close);
+        click_text(&ctx, &mut app, "Discard");
+        assert!(app.approved_close);
+        assert_eq!(app.session.document().components.len(), 1);
+    }
+
+    #[test]
+    fn published_warning_displays_every_diagnostic_and_blocks_continuation_until_ack() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        app.session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        app.pending_action = Some(PendingAction::New);
+        app.file_modal = Some(FileModal::PublishedWarning {
+            diagnostics: vec![
+                "first post-publish warning".into(),
+                "second post-publish warning".into(),
+            ],
+            continuation: true,
+        });
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(
+            matches!(app.file_modal, Some(FileModal::PublishedWarning { .. })),
+            "{:?}",
+            app.file_modal
+        );
+        assert!(
+            has_text(&shown, "first post-publish warning"),
+            "{:?}",
+            texts(&shown)
+        );
+        assert!(has_text(&shown, "second post-publish warning"));
+        assert_eq!(app.session.document().components.len(), 1);
+        click_text(&ctx, &mut app, "Acknowledge and continue");
+        assert!(app.file_modal.is_none(), "{:?}", app.file_modal);
+        assert!(app.session.document().components.is_empty());
+        assert!(!app.session.dirty());
+    }
+
+    #[test]
+    fn supported_document_file_lifecycle_save_new_reopen_run_toggle_inspect_stop() {
+        let dir = test_dir("m4-lifecycle");
+        let mut app = ui_file_app(&dir);
+        let (input, output) = inverter_chain(&mut app, 1);
+        app.save_as_path("fixture.dig".into(), false, false);
+        assert!(dir.join("fixture.dig").exists());
+        assert!(!app.session.dirty());
+        app.begin_pending(PendingAction::New);
+        assert!(app.session.document().components.is_empty());
+        app.begin_pending(PendingAction::Open(dir.join("fixture.dig")));
+        assert_eq!(app.session.document().components.len(), 3);
+        app.session.start_simulation().unwrap();
+        app.session.settle_simulation(100).unwrap();
+        assert_eq!(
+            app.session.inspect().unwrap().output_value(output),
+            Some(Level::High)
+        );
+        app.session.toggle_input(input).unwrap();
+        app.session.settle_simulation(100).unwrap();
+        assert_eq!(
+            app.session.inspect().unwrap().output_value(output),
+            Some(Level::Low)
+        );
+        app.session.stop_simulation().unwrap();
+        assert!(!app.session.simulation_active());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

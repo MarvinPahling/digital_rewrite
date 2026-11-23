@@ -120,6 +120,25 @@ impl std::fmt::Display for SimulationError {
 }
 impl std::error::Error for SimulationError {}
 impl Session {
+    /// Replace this document with a clean untitled document. Dirty state requires an explicit
+    /// discard intent; simulation is checked first, before any session state is changed.
+    pub fn new_document(&mut self, discard: DiscardIntent) -> Result<(), SessionDigError> {
+        if self.runtime.is_some() {
+            return Err(SessionDigError::SimulationActive);
+        }
+        if self.dirty() && discard == DiscardIntent::RefuseDirty {
+            return Err(SessionDigError::DirtyDiscardRequired);
+        }
+        self.document = Document::default();
+        self.saved = Document::default();
+        self.path = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.next_id = 0;
+        self.next_wire_id = 0;
+        Ok(())
+    }
+
     pub fn document(&self) -> &Document {
         &self.document
     }
@@ -440,6 +459,51 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_document_is_clean_transactional_and_requires_discard() {
+        let mut session = Session::default();
+        session
+            .place(ComponentKind::Input, Position { x: 1., y: 2. })
+            .unwrap();
+        session.saved = Document::default();
+        session.path = Some(PathBuf::from("/captured/document.dig"));
+        session.undo().unwrap();
+        session.redo().unwrap();
+        assert!(session.dirty());
+        assert!(matches!(
+            session.new_document(DiscardIntent::RefuseDirty),
+            Err(SessionDigError::DirtyDiscardRequired)
+        ));
+        assert_eq!(session.document().components.len(), 1);
+        session.new_document(DiscardIntent::DiscardDirty).unwrap();
+        assert!(session.document().components.is_empty());
+        assert!(!session.dirty());
+        assert!(session.path().is_none());
+        assert!(session.undo.is_empty() && session.redo.is_empty());
+        assert_eq!(
+            session
+                .place(ComponentKind::Output, Position { x: 0., y: 0. })
+                .unwrap(),
+            ComponentId(0)
+        );
+    }
+
+    #[test]
+    fn new_document_checks_simulation_before_dirty_validation_and_preserves_state() {
+        let mut session = Session::default();
+        session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        session.start_simulation().unwrap();
+        let before = snapshot(&session);
+        assert!(matches!(
+            session.new_document(DiscardIntent::DiscardDirty),
+            Err(SessionDigError::SimulationActive)
+        ));
+        assert_unchanged(&session, &before);
+        session.stop_simulation().unwrap();
+    }
+
     #[test]
     fn open_is_transactional_and_success_resets_history_ids_and_dirty_state() {
         let mut session = Session::default();
