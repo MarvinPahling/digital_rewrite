@@ -4,7 +4,7 @@ use digital_rust::{
     domain::{ComponentId, ComponentKind},
     engine::{Session, SimulationError},
     file_session::{DiscardIntent, FileIo, LocalFileIo},
-    runtime::{Level, SettleOutcome},
+    runtime::{Level, SettleOutcome, SimulationOptions},
     sim_text,
     simulation::{self, MAX_COMPONENTS, MAX_WORK},
 };
@@ -15,7 +15,7 @@ const MAX_ASSIGNMENTS: usize = 10_000;
 const MAX_BUDGET: usize = MAX_WORK;
 
 fn usage() -> &'static str {
-    "Usage:\n  digital-rust-cli open PATH\n  digital-rust-cli validate PATH\n  digital-rust-cli simulate PATH [--input ID=0|1]... [--budget N] [--oscillation-limit N]\n\nExit codes: 0 success, 1 document/operation/simulation failure, 2 usage error.\nOnly the strict editable .dig v2 subset and one-bit simulator are supported; feedback is accepted but settling is bounded and convergence is not guaranteed. This is not Digital CLI compatibility."
+    "Usage:\n  digital-rust-cli open PATH\n  digital-rust-cli validate PATH\n  digital-rust-cli simulate PATH [--input ID=0|1]... [--budget N] [--oscillation-limit N] [--seed N]\n\nExit codes: 0 success, 1 document/operation/simulation failure, 2 usage error.\nOnly the strict editable .dig v2 subset and one-bit simulator are supported; feedback is accepted but settling is bounded and convergence is not guaranteed. Startup seed defaults to 0; seeded order uses splitmix64-fy-v1 and is not Java trace-compatible. This is not Digital CLI compatibility."
 }
 fn fail(message: impl std::fmt::Display, code: u8) -> ExitCode {
     eprintln!("digital-rust-cli: {message}");
@@ -58,10 +58,12 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
     let path = args
         .next()
         .ok_or_else(|| (format!("missing PATH\n{}", usage()), 2))?;
-    let (mut assignments, mut budget, mut oscillation_limit) = (
+    let (mut assignments, mut budget, mut oscillation_limit, mut startup_seed, mut seed_seen) = (
         Vec::<(ComponentId, bool)>::new(),
         DEFAULT_BUDGET,
         digital_rust::runtime::DEFAULT_OSCILLATION_LIMIT,
+        0_u64,
+        false,
     );
     if command != "simulate" && args.next().is_some() {
         return Err((format!("unexpected argument\n{}", usage()), 2));
@@ -100,6 +102,26 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
                     if assignments.len() > MAX_ASSIGNMENTS {
                         return Err((format!("too many assignments (limit {MAX_ASSIGNMENTS})"), 2));
                     }
+                }
+                Some("--seed") => {
+                    if seed_seen {
+                        return Err(("duplicate --seed".into(), 2));
+                    }
+                    seed_seen = true;
+                    i += 1;
+                    let text = rest
+                        .get(i)
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| ("--seed requires unsigned decimal u64".into(), 2))?;
+                    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err((
+                            format!("invalid startup seed {text:?}; expected unsigned decimal u64"),
+                            2,
+                        ));
+                    }
+                    startup_seed = text
+                        .parse::<u64>()
+                        .map_err(|_| (format!("startup seed out of range: {text:?}"), 2))?;
                 }
                 Some("--oscillation-limit") => {
                     i += 1;
@@ -205,7 +227,10 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
                 return Err(("component limit exceeded".into(), 1));
             }
             session
-                .start_simulation_with_oscillation_limit(oscillation_limit)
+                .start_simulation_with_options(SimulationOptions {
+                    startup_seed,
+                    oscillation_limit,
+                })
                 .map_err(|e| {
                     (
                         sim_text::describe_simulation_error(session.document(), &e),
@@ -250,14 +275,18 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
     Ok(())
 }
 fn settle(session: &mut Session, remaining: &mut usize, total: usize) -> Result<(), (String, u8)> {
-    match session
-        .settle_simulation(*remaining)
-        .map_err(|e: SimulationError| {
-            (
-                sim_text::describe_simulation_error(session.document(), &e),
-                1,
-            )
-        })? {
+    let result = session.settle_simulation(*remaining);
+    let outcome = result.map_err(|e: SimulationError| {
+        let mut message = sim_text::describe_simulation_error(session.document(), &e);
+        if let Some(context) = session.terminal_simulation_context() {
+            message.push_str(&format!(
+                " (startup seed {}, phase {:?})",
+                context.startup_seed, context.phase
+            ));
+        }
+        (message, 1)
+    })?;
+    match outcome {
         SettleOutcome::Settled { work } => {
             *remaining -= work;
             Ok(())

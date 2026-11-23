@@ -238,72 +238,56 @@ fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
     digital_rust::formats::serialize_v2(&digital_rust::formats::from_domain(&d).unwrap()).unwrap()
 }
 #[test]
-fn cli_reports_long_chain_heuristic_oscillation_without_success_rows() {
+fn cli_reports_real_feedback_startup_oscillation_without_success_rows() {
     use digital_rust::domain::{
-        ComponentId as C, ComponentKind as K, Document, PinDirection as D, PinId, PinRef, Wire,
-        WireId,
+        Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position,
+        Wire, WireId,
     };
     let dir = TempDir::new();
-    let count = 102_u64;
-    let mut document = Document::default();
-    for id in 0..=count + 1 {
-        let kind = if id == 0 {
-            K::Input
-        } else if id == count + 1 {
-            K::Output
-        } else {
-            K::Not
-        };
-        document.components.push(digital_rust::domain::Component {
-            id: C(id),
-            kind,
-            position: digital_rust::domain::Position {
-                x: (id * 100) as f32,
-                y: 0.,
-            },
-            label: if id == 3 {
-                "collected".into()
-            } else {
-                kind.name().into()
-            },
+    let id = ComponentId(0);
+    let input = PinRef {
+        component: id,
+        pin: PinId {
+            direction: PinDirection::Input,
+            index: 0,
+        },
+    };
+    let output = PinRef {
+        component: id,
+        pin: PinId {
+            direction: PinDirection::Output,
+            index: 0,
+        },
+    };
+    let document = Document {
+        components: vec![Component {
+            id,
+            kind: ComponentKind::Not,
+            position: Position { x: 0., y: 0. },
+            label: "ring".into(),
             constant_value: true,
-        });
-    }
-    for id in 0..=count {
-        document.wires.push(Wire {
-            id: WireId(id),
-            endpoints: [
-                PinRef {
-                    component: C(id),
-                    pin: PinId {
-                        direction: D::Output,
-                        index: 0,
-                    },
-                },
-                PinRef {
-                    component: C(id + 1),
-                    pin: PinId {
-                        direction: D::Input,
-                        index: 0,
-                    },
-                },
-            ],
-        });
-    }
+        }],
+        wires: vec![Wire {
+            id: WireId(0),
+            endpoints: [output, input],
+        }],
+    };
     let encoded = digital_rust::formats::serialize_v2(
         &digital_rust::formats::from_domain(&document).unwrap(),
     )
     .unwrap();
-    fs::write(dir.0.join("chain.dig"), &encoded).unwrap();
+    fs::write(dir.0.join("ring.dig"), &encoded).unwrap();
     let output = cli(
         &dir,
         &[
             "simulate",
-            "chain.dig",
+            "ring.dig",
             "--oscillation-limit",
             "1",
             "--budget",
             "80000",
+            "--seed",
+            "91",
         ],
     );
     assert_eq!(output.status.code(), Some(1));
@@ -312,14 +296,13 @@ fn cli_reports_long_chain_heuristic_oscillation_without_success_rows() {
         "no success output may precede failure"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("appears to oscillate"), "{stderr}");
     assert!(
-        stderr.contains("limit 1")
-            && stderr.contains("NOT \"collected\" #3")
-            && !stderr.contains("#102"),
+        stderr.contains("appears to oscillate")
+            && stderr.contains("startup seed 91")
+            && stderr.contains("StartupSettling"),
         "{stderr}"
     );
-    assert_eq!(fs::read(dir.0.join("chain.dig")).unwrap(), encoded);
+    assert_eq!(fs::read(dir.0.join("ring.dig")).unwrap(), encoded);
 }
 
 #[test]
@@ -397,11 +380,11 @@ fn startup_and_input_assignment_share_one_budget_at_exact_boundary() {
     )
     .unwrap();
 
-    // One gate takes two settle work units (begin batch, evaluate); setting the input queues
-    // that gate again, taking two more. This exact cumulative total must be accepted.
+    // Startup costs one frontier-begin unit, one gate evaluation and one empty reset-release
+    // barrier. The later input propagation costs a normal begin and evaluate unit.
     let exact = cli(
         &dir,
-        &["simulate", "not.dig", "--input", "0=1", "--budget", "4"],
+        &["simulate", "not.dig", "--input", "0=1", "--budget", "5"],
     );
     assert!(
         exact.status.success(),
@@ -413,7 +396,7 @@ fn startup_and_input_assignment_share_one_budget_at_exact_boundary() {
     // One less than the cumulative startup-plus-assignment cost must fail without output.
     let short = cli(
         &dir,
-        &["simulate", "not.dig", "--input", "0=1", "--budget", "3"],
+        &["simulate", "not.dig", "--input", "0=1", "--budget", "4"],
     );
     assert_eq!(short.status.code(), Some(1));
     assert!(short.stdout.is_empty());
@@ -584,4 +567,101 @@ fn assignment_count_and_zero_budget_are_bounded_usage_errors() {
     let too_many = command.current_dir(&dir.0).output().unwrap();
     assert_eq!(too_many.status.code(), Some(2));
     assert!(too_many.stdout.is_empty());
+}
+
+#[test]
+fn startup_seed_cli_is_ascii_u64_deterministic_and_validated_before_file_access() {
+    let dir = TempDir::new();
+    let doc = gate_document(digital_rust::domain::ComponentKind::Not);
+    fs::write(dir.0.join("seed.dig"), &doc).unwrap();
+    let default = cli(&dir, &["simulate", "seed.dig", "--input", "0=1"]);
+    let zero = cli(
+        &dir,
+        &["simulate", "seed.dig", "--seed", "0", "--input", "0=1"],
+    );
+    assert!(
+        default.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    assert!(
+        zero.status.success(),
+        "{}",
+        String::from_utf8_lossy(&zero.stderr)
+    );
+    assert_eq!(default.stdout, zero.stdout);
+    let max = cli(
+        &dir,
+        &["simulate", "seed.dig", "--seed", "18446744073709551615"],
+    );
+    assert!(
+        max.status.success(),
+        "{}",
+        String::from_utf8_lossy(&max.stderr)
+    );
+    for args in [
+        vec!["simulate", "absent.dig", "--seed", ""],
+        vec!["simulate", "absent.dig", "--seed", "-1"],
+        vec!["simulate", "absent.dig", "--seed", "+1"],
+        vec!["simulate", "absent.dig", "--seed", "18446744073709551616"],
+        vec!["simulate", "absent.dig", "--seed"],
+        vec!["simulate", "absent.dig", "--seed", "1", "--seed", "2"],
+    ] {
+        let output = cli(&dir, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("seed"));
+    }
+    assert_eq!(fs::read(dir.0.join("seed.dig")).unwrap(), doc);
+}
+
+#[test]
+fn feedback_startup_exhaustion_is_an_error_with_replay_seed_and_no_rows() {
+    use digital_rust::domain::{
+        Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position,
+        Wire, WireId,
+    };
+    let dir = TempDir::new();
+    let id = ComponentId(0);
+    let input = PinRef {
+        component: id,
+        pin: PinId {
+            direction: PinDirection::Input,
+            index: 0,
+        },
+    };
+    let output = PinRef {
+        component: id,
+        pin: PinId {
+            direction: PinDirection::Output,
+            index: 0,
+        },
+    };
+    let doc = Document {
+        components: vec![Component {
+            id,
+            kind: ComponentKind::Not,
+            position: Position { x: 0., y: 0. },
+            label: "loop".into(),
+            constant_value: true,
+        }],
+        wires: vec![Wire {
+            id: WireId(0),
+            endpoints: [output, input],
+        }],
+    };
+    let dig = digital_rust::formats::from_domain(&doc).unwrap();
+    let bytes = digital_rust::formats::serialize_v2(&dig).unwrap();
+    fs::write(dir.0.join("ring.dig"), &bytes).unwrap();
+    let output = cli(&dir, &["simulate", "ring.dig", "--seed", "77"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("startup seed 77"), "{message}");
+    assert!(message.contains("StartupSettling"), "{message}");
+    assert_eq!(fs::read(dir.0.join("ring.dig")).unwrap(), bytes);
 }

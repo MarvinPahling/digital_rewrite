@@ -9,11 +9,15 @@ use crate::file_session::{
 };
 use crate::formats::{self, DigReadError, DigWriteError};
 use crate::runtime::{
-    DEFAULT_OSCILLATION_LIMIT, InputChange, OscillationDiagnostic, Runtime, RuntimeError,
-    SettleOutcome, StepOutcome,
+    InputChange, OscillationDiagnostic, Runtime, RuntimeError, SettleOutcome, SimulationOptions,
+    StartupPhase, StepOutcome,
 };
 use crate::simulation::CompileError;
 use std::path::{Path, PathBuf};
+pub struct TerminalSimulationContext {
+    pub startup_seed: u64,
+    pub phase: StartupPhase,
+}
 #[derive(Default)]
 pub struct Session {
     document: Document,
@@ -25,6 +29,7 @@ pub struct Session {
     /// Transient simulation state. Never part of the document or its history.
     runtime: Option<Runtime>,
     oscillation_diagnostic: Option<OscillationDiagnostic>,
+    terminal_simulation_context: Option<TerminalSimulationContext>,
     path: Option<PathBuf>,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -154,6 +159,7 @@ impl Session {
         }
         self.document = Document::default();
         self.oscillation_diagnostic = None;
+        self.terminal_simulation_context = None;
         self.saved = Document::default();
         self.path = None;
         self.undo.clear();
@@ -183,6 +189,7 @@ impl Session {
         })?;
         self.document = document.clone();
         self.oscillation_diagnostic = None;
+        self.terminal_simulation_context = None;
         self.saved = document;
         self.path = None;
         self.undo.clear();
@@ -260,6 +267,7 @@ impl Session {
         })?;
         self.document = document.clone();
         self.oscillation_diagnostic = None;
+        self.terminal_simulation_context = None;
         self.saved = document;
         self.undo.clear();
         self.redo.clear();
@@ -323,34 +331,77 @@ impl Session {
     pub fn simulation_active(&self) -> bool {
         self.runtime.is_some()
     }
+    pub fn startup_phase(&self) -> Option<StartupPhase> {
+        self.runtime.as_ref().map(Runtime::startup_phase)
+    }
+    pub fn startup_seed(&self) -> Option<u64> {
+        self.runtime.as_ref().map(Runtime::startup_seed)
+    }
+    pub fn startup_policy(&self) -> Option<&'static str> {
+        (self.runtime.is_some() || self.terminal_simulation_context.is_some())
+            .then_some(crate::runtime::STARTUP_RANDOM_POLICY)
+    }
+    #[cfg(test)]
+    fn start_running_for_test(&mut self) -> Result<(), SimulationError> {
+        self.start_simulation()?;
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.force_running_for_test();
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    fn start_running_with_limit_for_test(&mut self, limit: usize) -> Result<(), SimulationError> {
+        self.start_simulation_with_oscillation_limit(limit)?;
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.force_running_for_test();
+        }
+        Ok(())
+    }
     /// Read-only view of the running simulation, if any.
     pub fn inspect(&self) -> Option<&Runtime> {
         self.runtime.as_ref()
     }
     /// Compiles and starts a runtime. On failure nothing changes and no simulation is active.
     pub fn start_simulation(&mut self) -> Result<(), SimulationError> {
-        self.start_simulation_with_oscillation_limit(DEFAULT_OSCILLATION_LIMIT)
+        self.start_simulation_with_options(SimulationOptions::default())
     }
     pub fn start_simulation_with_oscillation_limit(
         &mut self,
         limit: usize,
     ) -> Result<(), SimulationError> {
+        self.start_simulation_with_options(SimulationOptions {
+            startup_seed: 0,
+            oscillation_limit: limit,
+        })
+    }
+    pub fn start_simulation_with_options(
+        &mut self,
+        options: SimulationOptions,
+    ) -> Result<(), SimulationError> {
         if self.runtime.is_some() {
             return Err(SimulationError::AlreadyActive);
         }
-        if limit == 0 || limit > crate::simulation::MAX_WORK {
-            return Err(SimulationError::InvalidOscillationLimit(limit));
+        if options.oscillation_limit == 0 || options.oscillation_limit > crate::simulation::MAX_WORK
+        {
+            return Err(SimulationError::InvalidOscillationLimit(
+                options.oscillation_limit,
+            ));
         }
-        let mut runtime = Runtime::start(&self.document).map_err(SimulationError::Compile)?;
+        let mut runtime = Runtime::start_with_seed(&self.document, options.startup_seed)
+            .map_err(SimulationError::Compile)?;
         runtime
-            .set_oscillation_limit(limit)
-            .map_err(|_| SimulationError::InvalidOscillationLimit(limit))?;
+            .set_oscillation_limit(options.oscillation_limit)
+            .map_err(|_| SimulationError::InvalidOscillationLimit(options.oscillation_limit))?;
         self.runtime = Some(runtime);
         self.oscillation_diagnostic = None;
+        self.terminal_simulation_context = None;
         Ok(())
     }
     pub fn oscillation_diagnostic(&self) -> Option<&OscillationDiagnostic> {
         self.oscillation_diagnostic.as_ref()
+    }
+    pub fn terminal_simulation_context(&self) -> Option<&TerminalSimulationContext> {
+        self.terminal_simulation_context.as_ref()
     }
     /// Discards the runtime; the document, history, dirty state and ids were never touched.
     pub fn stop_simulation(&mut self) -> Result<(), SimulationError> {
@@ -371,8 +422,14 @@ impl Session {
         }
         let outcome = self.runtime_mut()?.step();
         if let StepOutcome::Oscillating { diagnostic } = outcome {
+            let runtime = self.runtime.as_ref().ok_or(SimulationError::NotActive)?;
+            let context = TerminalSimulationContext {
+                startup_seed: runtime.startup_seed(),
+                phase: runtime.startup_phase(),
+            };
             self.runtime = None;
             self.oscillation_diagnostic = Some(diagnostic.clone());
+            self.terminal_simulation_context = Some(context);
             return Err(SimulationError::Oscillation {
                 diagnostic,
                 work: 0,
@@ -389,8 +446,14 @@ impl Session {
         }
         let outcome = self.runtime_mut()?.settle(budget);
         if let SettleOutcome::Oscillating { work, diagnostic } = outcome {
+            let runtime = self.runtime.as_ref().ok_or(SimulationError::NotActive)?;
+            let context = TerminalSimulationContext {
+                startup_seed: runtime.startup_seed(),
+                phase: runtime.startup_phase(),
+            };
             self.runtime = None;
             self.oscillation_diagnostic = Some(diagnostic.clone());
+            self.terminal_simulation_context = Some(context);
             return Err(SimulationError::Oscillation { diagnostic, work });
         }
         Ok(outcome)
@@ -419,6 +482,7 @@ impl Session {
     }
     fn edit(&mut self, next: Document) {
         self.oscillation_diagnostic = None;
+        self.terminal_simulation_context = None;
         self.undo.push(std::mem::replace(&mut self.document, next));
         self.redo.clear();
     }
@@ -578,6 +642,7 @@ impl Session {
         self.ensure_editable()?;
         if let Some(previous) = self.undo.pop() {
             self.oscillation_diagnostic = None;
+            self.terminal_simulation_context = None;
             self.redo
                 .push(std::mem::replace(&mut self.document, previous));
         }
@@ -587,6 +652,7 @@ impl Session {
         self.ensure_editable()?;
         if let Some(next) = self.redo.pop() {
             self.oscillation_diagnostic = None;
+            self.terminal_simulation_context = None;
             self.undo.push(std::mem::replace(&mut self.document, next));
         }
         Ok(())
@@ -604,7 +670,7 @@ mod tests {
         let document = session.document().clone();
         let undo_len = session.undo.len();
         let dirty = session.dirty();
-        session.start_simulation().unwrap();
+        session.start_running_for_test().unwrap();
         assert_eq!(
             session.settle_simulation(10).unwrap(),
             SettleOutcome::Settled { work: 0 }
@@ -665,7 +731,7 @@ mod tests {
         session
             .place(ComponentKind::Input, Position { x: 0., y: 0. })
             .unwrap();
-        session.start_simulation().unwrap();
+        session.start_running_for_test().unwrap();
         let before = snapshot(&session);
         assert!(matches!(
             session.new_document(DiscardIntent::DiscardDirty),
@@ -713,7 +779,7 @@ mod tests {
         let bytes = session.export_dig_bytes().unwrap();
         assert_eq!(bytes,b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes><entry><string>Label</string><string>Input</string></entry></elementAttributes><pos x=\"18\" y=\"0\"/></visualElement></visualElements><wires/></circuit>");
         assert_unchanged(&session, &before);
-        session.start_simulation().unwrap();
+        session.start_running_for_test().unwrap();
         let active = snapshot(&session);
         assert!(matches!(
             session.open_dig_bytes(b"bad"),
@@ -838,7 +904,7 @@ mod tests {
             assert_unchanged(&session, &before);
         }
         session.delete(next).unwrap();
-        session.start_simulation().unwrap();
+        session.start_running_for_test().unwrap();
         let before = snapshot(&session);
         assert!(matches!(
             session.open_path(
@@ -898,7 +964,7 @@ mod tests {
             session.save(&mut io),
             Err(SaveError::PathRequired)
         ));
-        session.start_simulation().unwrap();
+        session.start_running_for_test().unwrap();
         assert!(matches!(
             session.save(&mut io),
             Err(SaveError::SimulationActive)
@@ -955,7 +1021,7 @@ mod tests {
         let error = session.export_dig_bytes().unwrap_err();
         assert!(matches!(error, SessionDigError::Domain(_)));
         assert!(matches!(
-            session.start_simulation(),
+            session.start_running_for_test(),
             Err(SimulationError::Compile(
                 CompileError::InvalidConstantConfiguration {
                     component: ComponentId(0)
@@ -1040,7 +1106,7 @@ mod tests {
         session.open_dig_bytes(xml).unwrap();
         let output = ComponentId(2);
         let input = ComponentId(0);
-        session.start_simulation().unwrap();
+        session.start_running_for_test().unwrap();
         session.settle_simulation(100).unwrap();
         assert_eq!(
             session.inspect().unwrap().output_value(output),
@@ -1208,7 +1274,7 @@ mod tests {
             Err(EditError::WrongComponentKind)
         );
         assert_unchanged(&session, &before);
-        session.start_simulation().unwrap();
+        session.start_running_for_test().unwrap();
         let active = snapshot(&session);
         assert_eq!(
             session.set_constant_value(constant, true),
@@ -1353,7 +1419,7 @@ mod tests {
     fn label_mutation_is_locked_before_validation_and_preserves_runtime() {
         let mut session = Session::default();
         let (input, _, output) = wired_not(&mut session);
-        session.start_simulation().unwrap();
+        session.start_running_for_test().unwrap();
         session.settle_simulation(100).unwrap();
         let value = session.inspect().unwrap().output_value(output);
         let before = snapshot(&session);
@@ -1453,6 +1519,71 @@ mod tests {
         .unwrap();
         (input, not, output)
     }
+    #[test]
+    fn seeded_startup_is_a_transactional_edit_and_input_barrier_until_ready() {
+        use crate::runtime::{SimulationOptions, StartupPhase};
+        let mut session = Session::default();
+        let (input, _, output) = wired_not(&mut session);
+        let doc = session.document().clone();
+        let undo = session.undo.clone();
+        session
+            .start_simulation_with_options(SimulationOptions {
+                startup_seed: u64::MAX,
+                oscillation_limit: 100,
+            })
+            .unwrap();
+        assert_eq!(session.startup_seed(), Some(u64::MAX));
+        assert_eq!(
+            session.startup_policy(),
+            Some(crate::runtime::STARTUP_RANDOM_POLICY)
+        );
+        assert_eq!(session.startup_phase(), Some(StartupPhase::StartupSettling));
+        assert_eq!(
+            session.set_input(input, true),
+            Err(SimulationError::Runtime(RuntimeError::Pending))
+        );
+        assert_eq!(
+            session.place(ComponentKind::Input, Position { x: 2., y: 3. }),
+            Err(EditError::SimulationActive)
+        );
+        assert_eq!(
+            session.settle_simulation(0),
+            Ok(SettleOutcome::BudgetExhausted { work: 0 })
+        );
+        assert_eq!(session.startup_phase(), Some(StartupPhase::StartupSettling));
+        assert_eq!(session.document(), &doc);
+        assert_eq!(session.undo, undo);
+        loop {
+            match session.settle_simulation(1).unwrap() {
+                SettleOutcome::Settled { .. } => break,
+                SettleOutcome::BudgetExhausted { .. } => {}
+                other => panic!("unexpected startup result {other:?}"),
+            }
+        }
+        assert_eq!(session.startup_phase(), Some(StartupPhase::Running));
+        assert_eq!(session.set_input(input, true), Ok(InputChange::Changed));
+        session.settle_simulation(100).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::Low)
+        );
+        session.stop_simulation().unwrap();
+        session
+            .start_simulation_with_options(SimulationOptions {
+                startup_seed: u64::MAX,
+                oscillation_limit: 100,
+            })
+            .unwrap();
+        while session.startup_phase() != Some(StartupPhase::Running) {
+            let _ = session.settle_simulation(4096).unwrap();
+        }
+        assert_eq!(
+            session.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::High)
+        );
+        session.stop_simulation().unwrap();
+    }
+
     struct Snapshot {
         document: Document,
         saved: Document,
@@ -1514,7 +1645,7 @@ mod tests {
         ])
         .unwrap();
         let before = snapshot(&s);
-        s.start_simulation_with_oscillation_limit(1).unwrap();
+        s.start_running_with_limit_for_test(1).unwrap();
         for id in &ids {
             s.runtime
                 .as_mut()
@@ -1557,45 +1688,36 @@ mod tests {
     }
 
     #[test]
-    fn default_detection_is_reachable_on_a_1101_not_chain() {
+    fn startup_oscillation_is_bounded_on_a_real_self_not_ring() {
         use crate::domain::{PinDirection, PinId};
-        let count = 1_101_u64;
-        let pin = |id, direction| PinRef {
-            component: ComponentId(id),
+        let id = ComponentId(0);
+        let pin = PinRef {
+            component: id,
             pin: PinId {
-                direction,
+                direction: PinDirection::Input,
                 index: 0,
             },
         };
-        let mut document = Document::default();
-        for id in 0..=count + 1 {
-            let kind = if id == 0 {
-                ComponentKind::Input
-            } else if id == count + 1 {
-                ComponentKind::Output
-            } else {
-                ComponentKind::Not
-            };
-            document.components.push(Component {
-                id: ComponentId(id),
-                kind,
-                position: Position {
-                    x: id as f32,
-                    y: 0.,
-                },
-                label: kind.name().into(),
+        let output = PinRef {
+            component: id,
+            pin: PinId {
+                direction: PinDirection::Output,
+                index: 0,
+            },
+        };
+        let document = Document {
+            components: vec![Component {
+                id,
+                kind: ComponentKind::Not,
+                position: Position { x: 0., y: 0. },
+                label: "NOT".into(),
                 constant_value: true,
-            });
-        }
-        for id in 0..=count {
-            document.wires.push(Wire {
-                id: WireId(id),
-                endpoints: [
-                    pin(id, PinDirection::Output),
-                    pin(id + 1, PinDirection::Input),
-                ],
-            });
-        }
+            }],
+            wires: vec![Wire {
+                id: WireId(0),
+                endpoints: [output, pin],
+            }],
+        };
         let mut session = Session {
             document: document.clone(),
             saved: document,
@@ -1603,18 +1725,67 @@ mod tests {
         };
         session.start_simulation().unwrap();
         let error = session.settle_simulation(2_000_000).unwrap_err();
+        assert!(
+            matches!(error, SimulationError::Oscillation { diagnostic: OscillationDiagnostic { threshold: 1_000, steps, .. }, .. } if steps >= 1_000)
+        );
+        assert!(!session.simulation_active());
+        let context = session.terminal_simulation_context().unwrap();
+        assert_eq!(context.startup_seed, 0);
+        assert_eq!(context.phase, StartupPhase::StartupSettling);
+    }
+
+    #[test]
+    fn public_three_not_ring_startup_is_bounded_without_forced_state() {
+        use crate::domain::{PinDirection, PinId};
+        let pin = |id, direction| PinRef {
+            component: ComponentId(id),
+            pin: PinId {
+                direction,
+                index: 0,
+            },
+        };
+        let document = Document {
+            components: (0..3)
+                .map(|id| Component {
+                    id: ComponentId(id),
+                    kind: ComponentKind::Not,
+                    position: Position {
+                        x: id as f32,
+                        y: 0.,
+                    },
+                    label: format!("N{id}"),
+                    constant_value: true,
+                })
+                .collect(),
+            wires: (0..3)
+                .map(|id| Wire {
+                    id: WireId(id),
+                    endpoints: [
+                        pin(id, PinDirection::Output),
+                        pin((id + 1) % 3, PinDirection::Input),
+                    ],
+                })
+                .collect(),
+        };
+        let mut session = Session {
+            document: document.clone(),
+            saved: document,
+            ..Session::default()
+        };
+        session
+            .start_simulation_with_options(SimulationOptions {
+                startup_seed: 9,
+                oscillation_limit: 2,
+            })
+            .unwrap();
         assert!(matches!(
-            error,
-            SimulationError::Oscillation {
-                diagnostic: OscillationDiagnostic {
-                    threshold: 1_000,
-                    steps: 1_100,
-                    ..
-                },
-                ..
-            }
+            session.settle_simulation(10_000),
+            Err(SimulationError::Oscillation { .. })
         ));
         assert!(!session.simulation_active());
+        let context = session.terminal_simulation_context().unwrap();
+        assert_eq!(context.startup_seed, 9);
+        assert_eq!(context.phase, StartupPhase::StartupSettling);
     }
 
     #[test]
@@ -1649,7 +1820,7 @@ mod tests {
         s.connect([pin(b, PinDirection::Output), pin(a, PinDirection::Input)])
             .unwrap();
         let before = snapshot(&s);
-        s.start_simulation().unwrap();
+        s.start_running_for_test().unwrap();
         assert!(s.simulation_active());
         assert_eq!(s.undo(), Err(EditError::SimulationActive));
         assert_eq!(s.redo(), Err(EditError::SimulationActive));
@@ -1698,7 +1869,7 @@ mod tests {
             .place(ComponentKind::Input, Position { x: 9.0, y: 9.0 })
             .unwrap();
         s.undo().unwrap(); // leaves a redo entry; the document still compiles
-        s.start_simulation().unwrap();
+        s.start_running_for_test().unwrap();
         let before = snapshot(&s);
         assert!(s.dirty());
         let endpoints = [
@@ -1754,7 +1925,7 @@ mod tests {
         s.undo().unwrap();
         s.undo().unwrap();
         s.undo().unwrap();
-        s.start_simulation().unwrap(); // empty document compiles
+        s.start_running_for_test().unwrap(); // empty document compiles
         let before = snapshot(&s);
         assert_eq!(before.redo.len(), 5);
         assert_eq!(s.redo(), Err(EditError::SimulationActive));
@@ -1769,8 +1940,11 @@ mod tests {
         let mut s = Session::default();
         let (input, _, output) = wired_not(&mut s);
         let before = snapshot(&s);
-        s.start_simulation().unwrap();
-        assert_eq!(s.start_simulation(), Err(SimulationError::AlreadyActive));
+        s.start_running_for_test().unwrap();
+        assert_eq!(
+            s.start_running_for_test(),
+            Err(SimulationError::AlreadyActive)
+        );
         assert_eq!(
             s.settle_simulation(1000),
             Ok(SettleOutcome::Settled { work: 2 })
@@ -1807,7 +1981,7 @@ mod tests {
         s.undo().unwrap();
         assert_eq!(s.document, before.document);
         // A fresh start begins from the initial state, not the discarded one.
-        s.start_simulation().unwrap();
+        s.start_running_for_test().unwrap();
         assert_eq!(
             s.inspect().unwrap().output_value(output),
             Some(crate::runtime::Level::Unavailable)

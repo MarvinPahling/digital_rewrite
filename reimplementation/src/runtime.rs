@@ -1,16 +1,18 @@
 //! Headless runtime for one-bit circuits compiled by [`crate::simulation`].
 //!
-//! Runtime values live here, never in the editable [`Document`]. A microstep reads every
-//! scheduled gate's inputs before any output is published, so results do not depend on
-//! evaluation order. Acyclic initialisation is deterministic and makes no claim about
-//! randomised feedback startup; `Unavailable` idle loops are not Digital startup semantics.
-//! High-Z and buses are not modelled.
+//! Runtime values live here, never in the editable [`Document`]. Startup is a separately
+//! seeded, randomized gatewise lifecycle; normal microsteps read every scheduled gate's inputs
+//! before publishing outputs together. The seed policy is reproducible within this Rust
+//! implementation, not Java-trace-compatible. `Unavailable` is retained for explicit private
+//! Running-state fixtures and is not used as a guessed startup value. High-Z and buses are absent.
 use crate::domain::*;
 use crate::simulation::{CompileError, CompiledCircuit, compile};
 use std::collections::{BTreeMap, HashMap};
 
 pub const DEFAULT_OSCILLATION_LIMIT: usize = 1_000;
 pub const OSCILLATION_COLLECTION_OFFSET: usize = 100;
+/// Stable Rust startup randomization/shuffle contract; intentionally not Java-trace-compatible.
+pub const STARTUP_RANDOM_POLICY: &str = "splitmix64-fy-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OscillatingComponent {
@@ -161,6 +163,56 @@ struct Batch {
     staged: Vec<Level>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupPhase {
+    StartupSettling,
+    ResetRelease,
+    ResetSettling,
+    Running,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimulationOptions {
+    pub startup_seed: u64,
+    pub oscillation_limit: usize,
+}
+impl Default for SimulationOptions {
+    fn default() -> Self {
+        Self {
+            startup_seed: 0,
+            oscillation_limit: DEFAULT_OSCILLATION_LIMIT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitMix64(u64);
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, bound: usize) -> usize {
+        let bound = bound as u64;
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let value = self.next();
+            if value >= threshold {
+                return (value % bound) as usize;
+            }
+        }
+    }
+    fn shuffle(&mut self, values: &mut [usize]) {
+        for i in (1..values.len()).rev() {
+            let j = self.below(i + 1);
+            values.swap(i, j);
+        }
+    }
+}
+
 pub struct Runtime {
     roles: HashMap<ComponentId, Role>,
     pin_nets: HashMap<PinRef, usize>,
@@ -169,6 +221,15 @@ pub struct Runtime {
     values: Vec<Level>,
     queue: Vec<usize>,
     queued: Vec<bool>,
+    startup_frontier: Vec<usize>,
+    startup_next: Vec<usize>,
+    startup_queued: Vec<bool>,
+    startup_cursor: usize,
+    startup_batch_pending: bool,
+    startup_frontier_shuffled: bool,
+    startup_seed: u64,
+    startup_phase: StartupPhase,
+    rng: SplitMix64,
     batch: Option<Batch>,
     oscillation_limit: usize,
     detector: Option<OscillationDetector>,
@@ -178,11 +239,14 @@ pub struct Runtime {
 impl Runtime {
     /// Compiles `document` and schedules every gate. Inputs start false.
     pub fn start(document: &Document) -> Result<Self, CompileError> {
-        Ok(Self::new(document, &compile(document)?))
+        Self::start_with_seed(document, 0)
+    }
+    pub fn start_with_seed(document: &Document, seed: u64) -> Result<Self, CompileError> {
+        Ok(Self::new(document, &compile(document)?, seed))
     }
 
     /// `compiled` must come from compiling `document`.
-    fn new(document: &Document, compiled: &CompiledCircuit) -> Self {
+    fn new(document: &Document, compiled: &CompiledCircuit, seed: u64) -> Self {
         let mut pin_nets = HashMap::new();
         let mut consumers = vec![Vec::new(); compiled.nets.len()];
         for (index, net) in compiled.nets.iter().enumerate() {
@@ -198,7 +262,7 @@ impl Runtime {
         };
         let mut roles = HashMap::new();
         let mut gates = Vec::new();
-        let mut values = vec![Level::Unavailable; compiled.nets.len()];
+        let mut values = vec![Level::Low; compiled.nets.len()];
         for component in &document.components {
             let id = component.id;
             let role = match component.kind {
@@ -241,11 +305,23 @@ impl Runtime {
             };
             roles.insert(id, role);
         }
+        let mut startup_frontier: Vec<_> = (0..gates.len()).collect();
+        startup_frontier.sort_by_key(|&i| gates[i].id);
+        let rng = SplitMix64(seed);
         Self {
             roles,
             pin_nets,
-            queue: (0..gates.len()).collect(),
-            queued: vec![true; gates.len()],
+            queue: Vec::new(),
+            queued: vec![false; gates.len()],
+            startup_frontier,
+            startup_next: Vec::new(),
+            startup_queued: vec![false; gates.len()],
+            startup_cursor: 0,
+            startup_batch_pending: true,
+            startup_frontier_shuffled: false,
+            startup_seed: seed,
+            startup_phase: StartupPhase::StartupSettling,
+            rng,
             gates,
             consumers,
             values,
@@ -256,8 +332,16 @@ impl Runtime {
         }
     }
 
+    pub fn startup_phase(&self) -> StartupPhase {
+        self.startup_phase
+    }
+    pub fn startup_seed(&self) -> u64 {
+        self.startup_seed
+    }
     pub fn is_pending(&self) -> bool {
-        self.batch.is_some() || !self.queue.is_empty()
+        self.startup_phase != StartupPhase::Running
+            || self.batch.is_some()
+            || !self.queue.is_empty()
     }
 
     pub fn set_oscillation_limit(&mut self, limit: usize) -> Result<(), RuntimeError> {
@@ -274,6 +358,21 @@ impl Runtime {
         self.terminal.as_ref()
     }
     #[cfg(test)]
+    pub(crate) fn force_running_for_test(&mut self) {
+        self.startup_phase = StartupPhase::Running;
+        self.startup_frontier.clear();
+        self.startup_next.clear();
+        self.startup_cursor = 0;
+        self.startup_batch_pending = false;
+        self.startup_frontier_shuffled = true;
+        self.startup_queued.fill(false);
+        for gate in &self.gates {
+            self.values[gate.output] = Level::Unavailable;
+        }
+        self.queue = (0..self.gates.len()).collect();
+        self.queued.fill(true);
+    }
+    #[cfg(test)]
     pub(crate) fn seed_output_for_test(&mut self, id: ComponentId, value: Level) {
         if let Some(gate) = self.gates.iter().find(|gate| gate.id == id) {
             self.values[gate.output] = value;
@@ -282,7 +381,14 @@ impl Runtime {
 
     /// Gates scheduled or part-way through the current microstep.
     pub fn pending_gate_count(&self) -> usize {
-        self.queue.len() + self.batch.as_ref().map_or(0, |batch| batch.gates.len())
+        if self.startup_phase != StartupPhase::Running {
+            self.startup_frontier
+                .len()
+                .saturating_sub(self.startup_cursor)
+                + self.startup_next.len()
+        } else {
+            self.queue.len() + self.batch.as_ref().map_or(0, |batch| batch.gates.len())
+        }
     }
 
     pub fn net_count(&self) -> usize {
@@ -317,7 +423,7 @@ impl Runtime {
             Some(Role::Input { net }) => *net,
             Some(_) => return Err(RuntimeError::NotAnInput(component)),
         };
-        if self.is_pending() {
+        if self.startup_phase != StartupPhase::Running || self.is_pending() {
             return Err(RuntimeError::Pending);
         }
         let level = Level::from_bool(value);
@@ -345,6 +451,16 @@ impl Runtime {
     pub fn step(&mut self) -> StepOutcome {
         if let Some(diagnostic) = self.terminal.clone() {
             return StepOutcome::Oscillating { diagnostic };
+        }
+        if self.startup_phase != StartupPhase::Running {
+            return match self.advance_startup_unit() {
+                Ok(true) => StepOutcome::Stepped { evaluated: 1 },
+                Ok(false) if self.startup_phase != StartupPhase::Running => {
+                    StepOutcome::Stepped { evaluated: 0 }
+                }
+                Ok(false) => StepOutcome::Idle,
+                Err(diagnostic) => StepOutcome::Oscillating { diagnostic },
+            };
         }
         // Explicit stepping is a raw, undetected microstep; it closes any settle episode.
         self.detector = None;
@@ -378,10 +494,25 @@ impl Runtime {
                 SettleOutcome::Settled { work: 0 }
             };
         }
+        let mut work = 0;
+        while self.startup_phase != StartupPhase::Running {
+            if work == budget {
+                return SettleOutcome::BudgetExhausted { work };
+            }
+            if self.startup_phase == StartupPhase::ResetRelease {
+                // Entering ResetRelease charged its single observable barrier unit.
+                let _ = self.advance_startup_unit();
+                continue;
+            }
+            match self.advance_startup_unit() {
+                Ok(true) => work += 1,
+                Ok(false) => work += 1,
+                Err(diagnostic) => return SettleOutcome::Oscillating { work, diagnostic },
+            }
+        }
         if self.detector.is_none() {
             self.detector = Some(OscillationDetector::new(self.oscillation_limit));
         }
-        let mut work = 0;
         while self.is_pending() {
             if work == budget {
                 return SettleOutcome::BudgetExhausted { work };
@@ -411,6 +542,92 @@ impl Runtime {
         }
         self.detector = None;
         SettleOutcome::Settled { work }
+    }
+
+    /// Executes startup gatewise. Each frontier is shuffled once; its successor frontier is
+    /// kept separate so a change never runs a later gate twice in the same frontier.
+    fn advance_startup_unit(&mut self) -> Result<bool, OscillationDiagnostic> {
+        if self.startup_phase == StartupPhase::StartupSettling {
+            if self.startup_cursor >= self.startup_frontier.len() {
+                if self.startup_next.is_empty() {
+                    self.startup_phase = StartupPhase::ResetRelease;
+                    return Ok(false);
+                }
+                let mut next = std::mem::take(&mut self.startup_next);
+                for &gate in &next {
+                    self.startup_queued[gate] = false;
+                }
+                next.sort_by_key(|&i| self.gates[i].id);
+                self.startup_frontier = next;
+                self.startup_cursor = 0;
+                self.startup_batch_pending = true;
+                self.startup_frontier_shuffled = false;
+            }
+            if self.startup_batch_pending && !self.startup_frontier.is_empty() {
+                if !self.startup_frontier_shuffled {
+                    self.rng.shuffle(&mut self.startup_frontier);
+                    self.startup_frontier_shuffled = true;
+                }
+                let detector = self
+                    .detector
+                    .get_or_insert_with(|| OscillationDetector::new(self.oscillation_limit));
+                if detector.steps >= detector.limit.saturating_add(OSCILLATION_COLLECTION_OFFSET) {
+                    let diagnostic = OscillationDiagnostic {
+                        threshold: detector.limit,
+                        steps: detector.steps,
+                        components: detector.components.values().cloned().collect(),
+                    };
+                    self.terminal = Some(diagnostic.clone());
+                    return Err(diagnostic);
+                }
+                let scheduled: Vec<_> = self
+                    .startup_frontier
+                    .iter()
+                    .map(|&i| &self.gates[i])
+                    .collect();
+                detector.begin_batch(scheduled);
+                self.startup_batch_pending = false;
+                return Ok(false);
+            }
+            if let Some(&index) = self.startup_frontier.get(self.startup_cursor) {
+                self.startup_cursor += 1;
+                let gate = &self.gates[index];
+                let level = gate.evaluate(&self.values);
+                let net = gate.output;
+                if self.values[net] != level {
+                    self.values[net] = level;
+                    for &consumer in &self.consumers[net] {
+                        if !self.startup_queued[consumer] {
+                            self.startup_queued[consumer] = true;
+                            self.startup_next.push(consumer);
+                        }
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        match self.startup_phase {
+            StartupPhase::ResetRelease => {
+                self.startup_frontier.clear();
+                self.startup_cursor = 0;
+                if self.queue.is_empty() {
+                    // This catalog has no reset participants. Keep one observable barrier,
+                    // then enter Running without manufacturing a propagation step.
+                    self.startup_phase = StartupPhase::Running;
+                    self.detector = None;
+                } else {
+                    self.startup_phase = StartupPhase::ResetSettling;
+                }
+                Ok(false)
+            }
+            StartupPhase::ResetSettling => {
+                self.startup_phase = StartupPhase::Running;
+                self.detector = None;
+                Ok(false)
+            }
+            StartupPhase::Running => Ok(false),
+            StartupPhase::StartupSettling => Ok(false),
+        }
     }
 
     /// Snapshots the scheduled gates as the next microstep.
@@ -569,6 +786,274 @@ mod tests {
     fn level(value: bool) -> Level {
         if value { High } else { Low }
     }
+    // Legacy scheduler regressions are explicitly placed in a private normal-running state;
+    // Digital startup behavior is exercised separately through Runtime::start.
+    fn running(document: &Document) -> Runtime {
+        let mut runtime = Runtime::start(document).unwrap();
+        runtime.startup_phase = StartupPhase::Running;
+        runtime.startup_frontier.clear();
+        runtime.startup_next.clear();
+        runtime.startup_cursor = 0;
+        runtime.values.fill(Level::Unavailable);
+        for component in &document.components {
+            if let Some(Role::Input { net }) = runtime.roles.get(&component.id) {
+                runtime.values[*net] = Level::Low;
+            }
+            if let Some(Role::Const) = runtime.roles.get(&component.id) {
+                let net = runtime.pin_nets[&out(component.id.0)];
+                runtime.values[net] = Level::from_bool(component.constant_value);
+            }
+        }
+        runtime.queue = (0..runtime.gates.len()).collect();
+        runtime.queued.fill(true);
+        runtime
+    }
+
+    #[test]
+    fn startup_defaults_low_is_random_seeded_chunk_invariant_and_locks_inputs_until_ready() {
+        let doc = document(
+            &[(1, ComponentKind::Not), (2, ComponentKind::Not)],
+            &[(out(1), inp(2, 0)), (out(2), inp(1, 0))],
+        );
+        for seed in 0..24 {
+            let mut whole = Runtime::start_with_seed(&doc, seed).unwrap();
+            assert_eq!(whole.pin_value(out(1)), Some(Low));
+            assert_eq!(whole.pin_value(out(2)), Some(Low));
+            assert_eq!(whole.startup_phase(), StartupPhase::StartupSettling);
+            let mut input_runtime = Runtime::start(&not_chain(1)).unwrap();
+            assert_eq!(
+                input_runtime.set_input(ComponentId(1), true),
+                Err(RuntimeError::Pending)
+            );
+            assert_eq!(whole.settle(0), SettleOutcome::BudgetExhausted { work: 0 });
+            let mut chunked = Runtime::start_with_seed(&doc, seed).unwrap();
+            let mut inspected = Runtime::start_with_seed(&doc, seed).unwrap();
+            let before = snapshot(&inspected, &doc);
+            for pin in all_pins(&doc) {
+                let _ = inspected.pin_value(pin);
+            }
+            assert_eq!(snapshot(&inspected, &doc), before);
+            settled(&mut inspected);
+            settled(&mut whole);
+            loop {
+                match chunked.settle(1) {
+                    SettleOutcome::Settled { .. } => break,
+                    SettleOutcome::BudgetExhausted { .. } => {}
+                    other => panic!("unexpected startup outcome: {other:?}"),
+                }
+            }
+            let a = whole.pin_value(out(1)).unwrap();
+            let b = whole.pin_value(out(2)).unwrap();
+            assert_ne!(
+                a, b,
+                "cross-coupled NOT latch must reach a complementary state"
+            );
+            assert_eq!(snapshot(&whole, &doc), snapshot(&chunked, &doc));
+            assert_eq!(snapshot(&whole, &doc), snapshot(&inspected, &doc));
+            assert_eq!(whole.startup_phase(), StartupPhase::Running);
+            let mut repeated = Runtime::start_with_seed(&doc, seed).unwrap();
+            settled(&mut repeated);
+            assert_eq!(snapshot(&whole, &doc), snapshot(&repeated, &doc));
+            let mut reordered = doc.clone();
+            reordered.components.reverse();
+            reordered.wires.reverse();
+            let mut canonical = Runtime::start_with_seed(&reordered, seed).unwrap();
+            settled(&mut canonical);
+            assert_eq!(snapshot(&whole, &doc), snapshot(&canonical, &reordered));
+        }
+    }
+
+    #[test]
+    fn empty_circuit_has_bounded_ordered_reset_release_barrier() {
+        let mut runtime = Runtime::start(&Document::default()).unwrap();
+        assert_eq!(runtime.startup_phase(), StartupPhase::StartupSettling);
+        assert_eq!(
+            runtime.settle(0),
+            SettleOutcome::BudgetExhausted { work: 0 }
+        );
+        assert_eq!(runtime.startup_phase(), StartupPhase::StartupSettling);
+        assert_eq!(
+            runtime.settle(1),
+            SettleOutcome::BudgetExhausted { work: 1 }
+        );
+        assert_eq!(runtime.startup_phase(), StartupPhase::ResetRelease);
+        assert_eq!(runtime.settle(1), SettleOutcome::Settled { work: 0 });
+        assert_eq!(runtime.startup_phase(), StartupPhase::Running);
+    }
+
+    #[test]
+    fn nor_and_nand_latches_start_complementary_and_set_reset_hold_after_readiness() {
+        for kind in [ComponentKind::NOr, ComponentKind::NAnd] {
+            let doc = if kind == ComponentKind::NOr {
+                document(
+                    &[
+                        (1, ComponentKind::Input),
+                        (2, ComponentKind::Input),
+                        (3, kind),
+                        (4, kind),
+                    ],
+                    &[
+                        (out(2), inp(3, 0)),
+                        (out(4), inp(3, 1)),
+                        (out(1), inp(4, 0)),
+                        (out(3), inp(4, 1)),
+                    ],
+                )
+            } else {
+                document(
+                    &[
+                        (1, ComponentKind::Input),
+                        (2, ComponentKind::Input),
+                        (3, ComponentKind::Not),
+                        (4, ComponentKind::Not),
+                        (5, kind),
+                        (6, kind),
+                    ],
+                    &[
+                        (out(1), inp(3, 0)),
+                        (out(2), inp(4, 0)),
+                        (out(4), inp(5, 0)),
+                        (out(6), inp(5, 1)),
+                        (out(3), inp(6, 0)),
+                        (out(5), inp(6, 1)),
+                    ],
+                )
+            };
+            for seed in 0..24 {
+                let mut runtime = Runtime::start_with_seed(&doc, seed).unwrap();
+                settled(&mut runtime);
+                let (q, qbar) = if kind == ComponentKind::NOr {
+                    (
+                        runtime.pin_value(out(3)).unwrap(),
+                        runtime.pin_value(out(4)).unwrap(),
+                    )
+                } else {
+                    (
+                        runtime.pin_value(out(5)).unwrap(),
+                        runtime.pin_value(out(6)).unwrap(),
+                    )
+                };
+                assert_ne!(q, qbar, "{kind:?} seed {seed}");
+                // Set, hold, reset, then return to the inactive inputs and hold again.
+                let (set_id, reset_id) = if kind == ComponentKind::NOr {
+                    (1, 2)
+                } else {
+                    (2, 1)
+                };
+                runtime.set_input(ComponentId(set_id), true).unwrap();
+                settled(&mut runtime);
+                let q_set = if kind == ComponentKind::NOr {
+                    out(3)
+                } else {
+                    out(5)
+                };
+                assert_eq!(
+                    runtime.pin_value(q_set),
+                    Some(High),
+                    "{kind:?} set seed {seed}"
+                );
+                settled(&mut runtime);
+                runtime.set_input(ComponentId(set_id), false).unwrap();
+                settled(&mut runtime);
+                runtime.set_input(ComponentId(reset_id), true).unwrap();
+                settled(&mut runtime);
+                assert_eq!(
+                    runtime.pin_value(q_set),
+                    Some(Low),
+                    "{kind:?} reset seed {seed}"
+                );
+                runtime.set_input(ComponentId(reset_id), false).unwrap();
+                settled(&mut runtime);
+                assert_eq!(
+                    runtime.pin_value(q_set),
+                    Some(Low),
+                    "{kind:?} hold seed {seed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_oscillation_collection_tracks_feedback_and_downstream_but_not_stable_region() {
+        let mut doc = document(
+            &[
+                (1, ComponentKind::Not),
+                (2, ComponentKind::Not),
+                (3, ComponentKind::Not),
+                (4, ComponentKind::Const),
+            ],
+            &[
+                (out(1), inp(1, 0)),
+                (out(1), inp(2, 0)),
+                (out(4), inp(3, 0)),
+            ],
+        );
+        doc.components
+            .iter_mut()
+            .find(|component| component.id == ComponentId(4))
+            .unwrap()
+            .constant_value = false;
+        let mut runtime = Runtime::start_with_seed(&doc, 5).unwrap();
+        runtime.set_oscillation_limit(1).unwrap();
+        let SettleOutcome::Oscillating { diagnostic, .. } = runtime.settle(100_000) else {
+            panic!("expected bounded startup oscillation");
+        };
+        let ids: Vec<_> = diagnostic
+            .components
+            .iter()
+            .map(|component| component.id)
+            .collect();
+        assert!(ids.contains(&ComponentId(1)));
+        assert!(ids.contains(&ComponentId(2)));
+        assert!(!ids.contains(&ComponentId(3)));
+    }
+
+    #[test]
+    fn startup_step_observes_detector_while_running_step_remains_raw() {
+        let self_loop = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
+        let mut runtime = Runtime::start_with_seed(&self_loop, 3).unwrap();
+        runtime.set_oscillation_limit(1).unwrap();
+        let mut detected = None;
+        for _ in 0..1_000 {
+            if let StepOutcome::Oscillating { diagnostic } = runtime.step() {
+                detected = Some(diagnostic);
+                break;
+            }
+        }
+        assert!(
+            detected.is_some(),
+            "startup stepping must not bypass bounded detection"
+        );
+        let mut normal = running(&self_loop);
+        normal.values[normal.pin_nets[&out(1)]] = Low;
+        normal.set_oscillation_limit(1).unwrap();
+        for _ in 0..1_000 {
+            assert!(matches!(normal.step(), StepOutcome::Stepped { .. }));
+        }
+        assert_eq!(
+            normal.terminal_diagnostic(),
+            None,
+            "Running raw steps remain undetected"
+        );
+    }
+
+    #[test]
+    fn startup_microstep_is_immediate_gatewise_while_normal_remains_staged() {
+        let doc = document(
+            &[(1, ComponentKind::Not), (2, ComponentKind::Not)],
+            &[(out(1), inp(2, 0)), (out(2), inp(1, 0))],
+        );
+        let mut startup = Runtime::start_with_seed(&doc, 4).unwrap();
+        assert_eq!(startup.step(), StepOutcome::Stepped { evaluated: 0 }); // frontier begin
+        assert_eq!(startup.step(), StepOutcome::Stepped { evaluated: 1 });
+        assert_ne!(startup.pin_value(out(1)), startup.pin_value(out(2)));
+        let mut normal = running(&doc);
+        normal.values[normal.pin_nets[&out(1)]] = Low;
+        normal.values[normal.pin_nets[&out(2)]] = Low;
+        assert_eq!(normal.step(), StepOutcome::Stepped { evaluated: 2 });
+        assert_eq!(normal.pin_value(out(1)), Some(High));
+        assert_eq!(normal.pin_value(out(2)), Some(High));
+    }
 
     #[test]
     fn controlled_feedback_microsteps_are_staged_and_document_order_independent() {
@@ -585,7 +1070,7 @@ mod tests {
         };
         let mut traces = Vec::new();
         for doc in [make(false), make(true)] {
-            let mut runtime = Runtime::start(&doc).unwrap();
+            let mut runtime = running(&doc);
             // Controlled known state for scheduler semantics only; no startup behavior asserted.
             runtime.values[runtime.pin_nets[&out(1)]] = Low;
             runtime.values[runtime.pin_nets[&out(2)]] = Low;
@@ -607,7 +1092,7 @@ mod tests {
             &[(1, ComponentKind::Input), (2, ComponentKind::And)],
             &[(out(1), inp(2, 0)), (out(1), inp(2, 1))],
         );
-        let mut runtime = Runtime::start(&doc).unwrap();
+        let mut runtime = running(&doc);
         while runtime.step() != StepOutcome::Idle {}
         runtime.toggle_input(ComponentId(1)).unwrap();
         assert_eq!(runtime.pending_gate_count(), 1);
@@ -617,7 +1102,7 @@ mod tests {
     #[test]
     fn self_loop_reschedules_and_constant_feedback_fixed_point_idles() {
         let self_loop = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
-        let mut runtime = Runtime::start(&self_loop).unwrap();
+        let mut runtime = running(&self_loop);
         runtime.values[runtime.pin_nets[&out(1)]] = Low;
         assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
         assert_eq!(runtime.pin_value(out(1)), Some(High));
@@ -631,7 +1116,7 @@ mod tests {
             &[(out(1), inp(1, 0)), (out(2), inp(1, 1))],
         );
         fixed.components[1].constant_value = false;
-        let mut runtime = Runtime::start(&fixed).unwrap();
+        let mut runtime = running(&fixed);
         runtime.values[runtime.pin_nets[&out(1)]] = High;
         assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
         assert_eq!(runtime.pin_value(out(1)), Some(High));
@@ -641,10 +1126,10 @@ mod tests {
 
     #[test]
     fn default_limit_is_one_thousand_and_convergence_at_last_allowed_step_succeeds() {
-        let ordinary = Runtime::start(&not_chain(1)).unwrap();
+        let ordinary = running(&not_chain(1));
         assert_eq!(ordinary.oscillation_limit(), 1_000);
         let long = not_chain(101);
-        let mut runtime = Runtime::start(&long).unwrap();
+        let mut runtime = running(&long);
         runtime.set_oscillation_limit(1).unwrap();
         assert!(matches!(
             runtime.settle(10_000),
@@ -668,7 +1153,7 @@ mod tests {
                 (out(2), inp(3, 0)),
             ],
         );
-        let mut runtime = Runtime::start(&doc).unwrap();
+        let mut runtime = running(&doc);
         runtime.set_oscillation_limit(1).unwrap();
         for id in [1, 2, 3] {
             runtime.values[runtime.pin_nets[&out(id)]] = Low;
@@ -711,9 +1196,9 @@ mod tests {
             runtime.values[runtime.pin_nets[&out(1)]] = Low;
             runtime.values[runtime.pin_nets[&out(2)]] = Low;
         };
-        let mut whole = Runtime::start(&doc).unwrap();
+        let mut whole = running(&doc);
         init(&mut whole);
-        let mut chunked = Runtime::start(&doc).unwrap();
+        let mut chunked = running(&doc);
         init(&mut chunked);
         assert_eq!(
             chunked.settle(0),
@@ -744,7 +1229,7 @@ mod tests {
     #[test]
     fn explicit_raw_step_restarts_detection_episode() {
         let doc = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
-        let mut runtime = Runtime::start(&doc).unwrap();
+        let mut runtime = running(&doc);
         runtime.set_oscillation_limit(1).unwrap();
         runtime.values[runtime.pin_nets[&out(1)]] = Low;
         assert!(matches!(
@@ -767,8 +1252,8 @@ mod tests {
             &[(1, ComponentKind::Not), (2, ComponentKind::Not)],
             &[(out(1), inp(2, 0)), (out(2), inp(1, 0))],
         );
-        let mut first = Runtime::start(&doc).unwrap();
-        let mut second = Runtime::start(&doc).unwrap();
+        let mut first = running(&doc);
+        let mut second = running(&doc);
         for runtime in [&mut first, &mut second] {
             runtime.values[runtime.pin_nets[&out(1)]] = Low;
             runtime.values[runtime.pin_nets[&out(2)]] = Low;
@@ -838,7 +1323,7 @@ mod tests {
         let mut doc = doc;
         doc.components[0] = high;
         doc.components[1] = low;
-        let mut runtime = Runtime::start(&doc).unwrap();
+        let mut runtime = running(&doc);
         assert_eq!(runtime.pin_value(out(9)), Some(High));
         assert_eq!(runtime.pin_value(out(2)), Some(Low));
         assert_eq!(runtime.output_value(ComponentId(5)), Some(High));
@@ -848,7 +1333,7 @@ mod tests {
         let mut reversed = doc.clone();
         reversed.components.reverse();
         reversed.wires.reverse();
-        let mut reordered = Runtime::start(&reversed).unwrap();
+        let mut reordered = running(&reversed);
         settled(&mut reordered);
         assert_eq!(reordered.output_value(ComponentId(4)), Some(Low));
         assert_eq!(
@@ -860,7 +1345,7 @@ mod tests {
             Err(RuntimeError::NotAnInput(ComponentId(2)))
         );
         let isolated = document(&[(7, ComponentKind::Const)], &[]);
-        let mut standalone = Runtime::start(&isolated).unwrap();
+        let mut standalone = running(&isolated);
         assert_eq!(standalone.settle(0), SettleOutcome::Settled { work: 0 });
         assert_eq!(standalone.pin_value(out(7)), Some(High));
     }
@@ -892,7 +1377,7 @@ mod tests {
             ),
             (ComponentKind::Or, |a, b| a || b),
         ] {
-            let mut runtime = Runtime::start(&binary(kind)).unwrap();
+            let mut runtime = running(&binary(kind));
             settled(&mut runtime);
             let (mut a, mut b) = (false, false);
             assert_eq!(
@@ -936,7 +1421,7 @@ mod tests {
             (ComponentKind::XNOr, [true, false, false, true]),
         ] {
             let document = binary(kind);
-            let mut runtime = Runtime::start(&document).unwrap();
+            let mut runtime = running(&document);
             settled(&mut runtime);
             for (index, (a, b)) in [(false, false), (false, true), (true, false), (true, true)]
                 .into_iter()
@@ -984,7 +1469,7 @@ mod tests {
         ];
         let mut traces = Vec::new();
         for doc in &docs {
-            let mut runtime = Runtime::start(doc).unwrap();
+            let mut runtime = running(doc);
             let mut trace = Vec::new();
             while runtime.step() != StepOutcome::Idle {
                 trace.push(snapshot(&runtime, doc));
@@ -1020,9 +1505,9 @@ mod tests {
             (out(6), inp(8, 0)),
         ];
         let document = document(&kinds, &wires);
-        let mut whole = Runtime::start(&document).unwrap();
+        let mut whole = running(&document);
         settled(&mut whole);
-        let mut resumed = Runtime::start(&document).unwrap();
+        let mut resumed = running(&document);
         assert_eq!(
             resumed.settle(2),
             SettleOutcome::BudgetExhausted { work: 2 }
@@ -1086,7 +1571,7 @@ mod tests {
     fn controlling_value_does_not_short_circuit_unavailable() {
         for (kind, final_value) in [(ComponentKind::And, Low), (ComponentKind::Or, High)] {
             for swapped in [false, true] {
-                let mut runtime = Runtime::start(&known_beside_unavailable(kind, swapped)).unwrap();
+                let mut runtime = running(&known_beside_unavailable(kind, swapped));
                 assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 3 });
                 assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 2 });
                 // Gate 4 read High beside Unavailable (NOT 3 publishes only now), so
@@ -1120,7 +1605,7 @@ mod tests {
                         (out(3), inp(4, 0)),
                     ],
                 );
-                let mut runtime = Runtime::start(&document).unwrap();
+                let mut runtime = running(&document);
                 assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 2 });
                 assert_eq!(runtime.pin_value(out(2)), Some(High));
                 assert_eq!(runtime.output_value(ComponentId(4)), Some(Unavailable));
@@ -1146,7 +1631,7 @@ mod tests {
         }
         let document = document(&kinds, &wires);
         let started = std::time::Instant::now();
-        let mut runtime = Runtime::start(&document).unwrap();
+        let mut runtime = running(&document);
         settled(&mut runtime);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(runtime.pin_value(out(2)), Some(High));
@@ -1162,7 +1647,7 @@ mod tests {
 
     #[test]
     fn not_truth_table() {
-        let mut runtime = Runtime::start(&not_chain(1)).unwrap();
+        let mut runtime = running(&not_chain(1));
         settled(&mut runtime);
         assert_eq!(runtime.output_value(ComponentId(3)), Some(High));
         assert_eq!(
@@ -1182,20 +1667,19 @@ mod tests {
         assert!(runtime.is_pending());
         assert_eq!(runtime.pending_gate_count(), 2);
         assert_eq!(runtime.pin_value(out(1)), Some(Low));
-        assert_eq!(runtime.pin_value(out(2)), Some(Unavailable));
-        assert_eq!(runtime.output_value(ComponentId(4)), Some(Unavailable));
+        assert_eq!(runtime.pin_value(out(2)), Some(Low));
+        assert_eq!(runtime.output_value(ComponentId(4)), Some(Low));
         assert_eq!(runtime.output_value(ComponentId(1)), None);
         assert_eq!(runtime.output_value(ComponentId(99)), None);
         assert_eq!(runtime.pin_value(inp(99, 0)), None);
         assert_eq!(runtime.net_value(runtime.net_count()), None);
-        // Unavailable inputs yield unavailable outputs rather than a guessed value.
-        assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 2 });
-        assert_eq!(runtime.pin_value(out(2)), Some(High));
-        assert_eq!(runtime.pin_value(out(3)), Some(Unavailable));
+        assert_eq!(runtime.startup_phase(), StartupPhase::StartupSettling);
+        assert_eq!(
+            runtime.settle(0),
+            SettleOutcome::BudgetExhausted { work: 0 }
+        );
+        assert_eq!(runtime.pin_value(out(2)), Some(Low));
         assert!(runtime.is_pending());
-        assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
-        assert_eq!(runtime.output_value(ComponentId(4)), Some(Low));
-        assert!(!runtime.is_pending());
     }
 
     #[test]
@@ -1213,7 +1697,7 @@ mod tests {
 
     #[test]
     fn one_microstep_does_not_cross_two_levels() {
-        let mut runtime = Runtime::start(&not_chain(2)).unwrap();
+        let mut runtime = running(&not_chain(2));
         settled(&mut runtime);
         assert_eq!(runtime.output_value(ComponentId(4)), Some(Low));
         assert_eq!(
@@ -1313,14 +1797,14 @@ mod tests {
                 (out(5), inp(8, 0)),
             ],
         );
-        let mut whole = Runtime::start(&document).unwrap();
+        let mut whole = running(&document);
         let SettleOutcome::Settled { work: total } = whole.settle(1_000) else {
             panic!("generous budget must settle");
         };
         // Step 1: 1 + 4 gate evaluations. NOT 5 reads an unavailable net, so step 2 is 1 + 1.
         assert_eq!(total, 5 + 2);
 
-        let mut chunked = Runtime::start(&document).unwrap();
+        let mut chunked = running(&document);
         let mut spent = 0;
         let mut calls = 0;
         loop {
@@ -1352,7 +1836,7 @@ mod tests {
 
     #[test]
     fn zero_budget_makes_no_progress_while_pending() {
-        let mut runtime = Runtime::start(&not_chain(1)).unwrap();
+        let mut runtime = running(&not_chain(1));
         assert_eq!(
             runtime.settle(0),
             SettleOutcome::BudgetExhausted { work: 0 }
@@ -1364,7 +1848,7 @@ mod tests {
     #[test]
     fn idle_step_and_same_value_toggle_are_no_ops() {
         let document = binary(ComponentKind::And);
-        let mut runtime = Runtime::start(&document).unwrap();
+        let mut runtime = running(&document);
         settled(&mut runtime);
         let before = snapshot(&runtime, &document);
         assert_eq!(runtime.step(), StepOutcome::Idle);
@@ -1380,7 +1864,7 @@ mod tests {
 
     #[test]
     fn input_errors_are_typed() {
-        let mut runtime = Runtime::start(&binary(ComponentKind::Or)).unwrap();
+        let mut runtime = running(&binary(ComponentKind::Or));
         settled(&mut runtime);
         assert_eq!(
             runtime.set_input(ComponentId(99), true),

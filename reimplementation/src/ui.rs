@@ -9,7 +9,7 @@ use crate::{
     domain::{ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position, WireId},
     engine::{EditError, SaveError, Session, SimulationError},
     file_session::{DiscardIntent, FileIo, LocalFileIo, PublishOutcome, SaveAsIntent},
-    runtime::{InputChange, Level, SettleOutcome},
+    runtime::{InputChange, Level, SettleOutcome, SimulationOptions},
     sim_text::{describe_latched_oscillation, describe_simulation_error, level_badge, level_text},
     symbol_render::{PaintState, Palette, SymbolLayout, SymbolRenderer},
     symbols::{DEFAULT_STYLE, GRID_UNIT, STROKE_WIDTH, SymbolStyle},
@@ -72,6 +72,9 @@ pub struct DigitalApp {
     error: Option<String>,
     /// Work units settled per frame while `settling`.
     settle_budget: usize,
+    startup_seed_text: String,
+    seed_field_focused: bool,
+    seed_field_rect: Option<Rect>,
     /// Whether frames keep settling in bounded chunks. Step pauses it; Settle, Start and an
     /// input toggle resume it.
     settling: bool,
@@ -155,6 +158,9 @@ impl DigitalApp {
             drag: None,
             error: None,
             settle_budget: SETTLE_BUDGET_PER_FRAME,
+            startup_seed_text: "0".into(),
+            seed_field_focused: false,
+            seed_field_rect: None,
             settling: false,
             failed_start: None,
             style: DEFAULT_STYLE,
@@ -788,31 +794,59 @@ impl DigitalApp {
         }
     }
     fn report_simulation_error(&mut self, error: &SimulationError) {
-        self.error = Some(describe_simulation_error(self.session.document(), error));
+        let mut message = describe_simulation_error(self.session.document(), error);
+        if let Some(context) = self.session.terminal_simulation_context() {
+            message.push_str(&format!(
+                " (startup seed {}, phase {:?})",
+                context.startup_seed, context.phase
+            ));
+        }
+        self.error = Some(message);
     }
     /// Applies a simulation command through the engine. Starting cancels every transient
     /// editing gesture; a failed start leaves the editor exactly as it was.
     fn apply_simulation_action(&mut self, action: SimAction) {
         match action {
-            SimAction::Start => match self.session.start_simulation() {
-                Ok(()) => {
-                    self.pan_owner = None;
-                    self.placing = None;
-                    self.wiring = false;
-                    self.wire_start = None;
-                    self.focused_pin = None;
-                    self.drag = None;
-                    self.failed_start = None;
-                    self.error = None;
-                    self.settling = true;
-                }
-                Err(error) => {
-                    if matches!(error, SimulationError::Compile(_)) {
-                        self.failed_start = Some(self.session.document().clone());
+            SimAction::Start => {
+                let seed = if self.startup_seed_text.is_empty()
+                    || !self.startup_seed_text.bytes().all(|b| b.is_ascii_digit())
+                {
+                    self.error = Some("Startup seed must be unsigned decimal u64".into());
+                    return;
+                } else {
+                    match self.startup_seed_text.parse::<u64>() {
+                        Ok(seed) => seed,
+                        Err(_) => {
+                            self.error = Some("Startup seed is outside the u64 range".into());
+                            return;
+                        }
                     }
-                    self.report_simulation_error(&error);
+                };
+                match self
+                    .session
+                    .start_simulation_with_options(SimulationOptions {
+                        startup_seed: seed,
+                        oscillation_limit: crate::runtime::DEFAULT_OSCILLATION_LIMIT,
+                    }) {
+                    Ok(()) => {
+                        self.pan_owner = None;
+                        self.placing = None;
+                        self.wiring = false;
+                        self.wire_start = None;
+                        self.focused_pin = None;
+                        self.drag = None;
+                        self.failed_start = None;
+                        self.error = None;
+                        self.settling = true;
+                    }
+                    Err(error) => {
+                        if matches!(error, SimulationError::Compile(_)) {
+                            self.failed_start = Some(self.session.document().clone());
+                        }
+                        self.report_simulation_error(&error);
+                    }
                 }
-            },
+            }
             SimAction::Stop => match self.session.stop_simulation() {
                 Ok(()) => {
                     self.pan_owner = None;
@@ -862,6 +896,9 @@ impl DigitalApp {
         ctx.request_repaint();
     }
     fn simulation_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.seed_field_focused {
+            return;
+        }
         let action = ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F5) {
                 Some(SimAction::Stop)
@@ -925,16 +962,27 @@ impl DigitalApp {
                 SimState::Idle => "State: idle (not simulating)",
                 SimState::Error => "State: error (cannot start, see message)",
                 SimState::Oscillating => "State: stopped (oscillation detected; see diagnostic)",
+                SimState::Pending { settling: true } if self.session.startup_phase() == Some(crate::runtime::StartupPhase::StartupSettling) => "State: initializing (randomized startup settling)",
+                SimState::Pending { settling: false } if self.session.startup_phase() == Some(crate::runtime::StartupPhase::StartupSettling) => "State: initializing (paused; Step or Settle)",
                 SimState::Pending { settling: true } => "State: pending (settling)",
                 SimState::Pending { settling: false } => "State: pending (paused; Step or Settle)",
                 SimState::Settled => "State: settled",
             });
             if let Some(diagnostic) = self.session.oscillation_diagnostic() {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    describe_latched_oscillation(self.session.document(), diagnostic),
-                );
+                ui.colored_label(ui.visuals().error_fg_color, describe_latched_oscillation(self.session.document(), diagnostic));
+                if let Some(context) = self.session.terminal_simulation_context() {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("Startup seed {} (failure phase {:?})", context.startup_seed, context.phase));
+                }
             }
+            ui.label(format!("Randomized startup is deterministic for the displayed seed; policy: {} (SplitMix64 + Fisher–Yates, sorted component IDs). Not Java trace-compatible.", crate::runtime::STARTUP_RANDOM_POLICY));
+            ui.horizontal(|ui| {
+                ui.label("Startup seed");
+                let response = ui.add_enabled(!active, egui::TextEdit::singleline(&mut self.startup_seed_text).id_salt("simulation_startup_seed").desired_width(140.0).hint_text("unsigned decimal u64"));
+                self.seed_field_focused = response.has_focus();
+                self.seed_field_rect = Some(response.rect);
+            });
+            if let Some(seed) = self.session.startup_seed() { ui.label(format!("Active startup seed: {seed}")); }
+            if let Some(phase) = self.session.startup_phase() { ui.label(format!("Lifecycle: {phase:?}")); }
             ui.label("F5 start, Shift+F5 stop, F10 step, F6 settle.");
             if let Some(runtime) = self.session.inspect() {
                 let document = self.session.document();
@@ -2110,74 +2158,97 @@ mod tests {
     }
 
     #[test]
+    fn startup_seed_text_is_keyboard_editable_and_f5_does_not_escape_focused_field() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        inverter_chain(&mut app, 1);
+        frame(&ctx, &mut app, vec![], true);
+        let rect = app.seed_field_rect.expect("seed input was rendered");
+        let point = rect.center();
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(point), button(point, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![button(point, false)], true);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::A, egui::Modifiers::COMMAND)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![egui::Event::Text("42".into())], true);
+        assert_eq!(app.startup_seed_text, "42");
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
+        assert!(
+            !app.session.simulation_active(),
+            "F5 text must not start simulation while seed editor owns focus"
+        );
+        let canvas = Pos2::new(350., 300.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(canvas), button(canvas, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![button(canvas, false)], true);
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
+        assert_eq!(app.session.startup_seed(), Some(42));
+        app.apply_simulation_action(SimAction::Stop);
+    }
+
+    #[test]
+    fn startup_seed_control_locks_during_initialization_and_reports_phase_policy() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let (input, _) = inverter_chain(&mut app, 1);
+        app.startup_seed_text = "18446744073709551615".into();
+        app.settle_budget = 1;
+        app.apply_simulation_action(SimAction::Start);
+        assert_eq!(app.session.startup_seed(), Some(u64::MAX));
+        assert_eq!(app.startup_seed_text, u64::MAX.to_string());
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "Startup seed"));
+        assert!(has_text(&shown, "SplitMix64"));
+        assert!(has_text(&shown, "initializing"));
+        assert!(app.session.simulation_active());
+        assert_eq!(
+            app.session.set_input(input, true),
+            Err(SimulationError::Runtime(
+                crate::runtime::RuntimeError::Pending
+            ))
+        );
+        app.startup_seed_text = "not-a-seed".into();
+        app.apply_simulation_action(SimAction::Start);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|text| text.contains("unsigned decimal u64"))
+        );
+        assert_eq!(app.session.startup_seed(), Some(u64::MAX));
+        app.apply_simulation_action(SimAction::Stop);
+        assert!(!app.session.simulation_active());
+        app.startup_seed_text = "42".into();
+        app.apply_simulation_action(SimAction::Start);
+        assert_eq!(app.session.startup_seed(), Some(42));
+        app.apply_simulation_action(SimAction::Stop);
+    }
+
+    #[test]
     fn automatic_settle_surfaces_terminal_oscillation_and_keeps_runtime_out_of_ui() {
         let ctx = egui::Context::default();
         let mut app = DigitalApp::default();
-        let input = app
+        let affected = app
             .session
-            .place(ComponentKind::Input, Position { x: 0., y: 100. })
-            .unwrap();
-        let mut previous = input;
-        for index in 0..102 {
-            let gate = app
-                .session
-                .place(
-                    ComponentKind::Not,
-                    Position {
-                        x: 100. * (index + 1) as f32,
-                        y: 100.,
-                    },
-                )
-                .unwrap();
-            app.session
-                .connect([
-                    PinRef {
-                        component: previous,
-                        pin: PinId {
-                            direction: PinDirection::Output,
-                            index: 0,
-                        },
-                    },
-                    PinRef {
-                        component: gate,
-                        pin: PinId {
-                            direction: PinDirection::Input,
-                            index: 0,
-                        },
-                    },
-                ])
-                .unwrap();
-            previous = gate;
-        }
-        let output = app
-            .session
-            .place(
-                ComponentKind::Output,
-                Position {
-                    x: 10_400.,
-                    y: 100.,
-                },
-            )
+            .place(ComponentKind::Not, Position { x: 100., y: 100. })
             .unwrap();
         app.session
             .connect([
-                PinRef {
-                    component: previous,
-                    pin: PinId {
-                        direction: PinDirection::Output,
-                        index: 0,
-                    },
-                },
-                PinRef {
-                    component: output,
-                    pin: PinId {
-                        direction: PinDirection::Input,
-                        index: 0,
-                    },
-                },
+                pin_ref(affected, PinDirection::Output, 0),
+                pin_ref(affected, PinDirection::Input, 0),
             ])
             .unwrap();
-        let affected = ComponentId(3);
         app.selected = Some(affected);
         app.session
             .start_simulation_with_oscillation_limit(1)
@@ -2231,7 +2302,7 @@ mod tests {
         ));
         app.apply_simulation_action(SimAction::Stop);
 
-        assert_eq!(app.session.document().components.len(), 104);
+        assert_eq!(app.session.document().components.len(), 1);
         assert_eq!(app.session.undo().unwrap(), ());
     }
 
@@ -4078,7 +4149,7 @@ mod tests {
         app.settle_budget = 1;
         press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
         assert!(app.session.inspect().unwrap().is_pending());
-        assert_eq!(output_level(&app, output), Some(Level::Unavailable));
+        assert_eq!(output_level(&app, output), Some(Level::Low));
         press(&ctx, &mut app, egui::Key::F10, egui::Modifiers::NONE);
         assert!(!app.settling);
         let paused = app.session.inspect().unwrap().pending_gate_count();
@@ -4090,7 +4161,7 @@ mod tests {
             "a paused simulation must not advance"
         );
         // One microstep cannot carry the value through both gates.
-        assert_eq!(output_level(&app, output), Some(Level::Unavailable));
+        assert_eq!(output_level(&app, output), Some(Level::Low));
         press(&ctx, &mut app, egui::Key::F6, egui::Modifiers::NONE);
         for _ in 0..50 {
             frame(&ctx, &mut app, vec![], true);
@@ -5261,9 +5332,9 @@ mod tests {
         assert!(app.session.inspect().unwrap().is_pending());
         assert!(wants_immediate_repaint(&started));
         let shown = frame(&ctx, &mut app, vec![], true);
-        assert!(has_text(&shown, "State: pending"));
-        assert!(has_text(&shown, "= ?"));
-        assert!(has_text(&shown, "? (unavailable)"));
+        assert!(has_text(&shown, "initializing"));
+        assert!(has_text(&shown, "= 0"));
+        assert!(has_text(&shown, "0 (low)"));
         let mut frames = 1;
         while app.session.inspect().unwrap().is_pending() {
             let shown = frame(&ctx, &mut app, vec![], true);
