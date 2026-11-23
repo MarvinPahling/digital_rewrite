@@ -5,7 +5,7 @@
 use crate::{
     domain::{ComponentId, Document, PinDirection, PinRef},
     engine::SimulationError,
-    runtime::{Level, RuntimeError},
+    runtime::{Level, OscillationDiagnostic, RuntimeError},
     simulation::{CompileError, MAX_COMPONENTS, MAX_WIRES, MAX_WORK},
 };
 
@@ -93,7 +93,53 @@ pub fn describe_simulation_error(document: &Document, error: &SimulationError) -
         SimulationError::Runtime(RuntimeError::NotAnInput(id)) => {
             format!("{} is not an input.", component_name(document, *id))
         }
+        SimulationError::Runtime(RuntimeError::InvalidOscillationLimit(limit)) => {
+            format!("Oscillation limit {limit} is invalid.")
+        }
+        SimulationError::InvalidOscillationLimit(limit) => format!(
+            "Oscillation limit {limit} is invalid; choose 1–{}.",
+            crate::simulation::MAX_WORK
+        ),
+        SimulationError::Oscillation { diagnostic, work } => {
+            describe_oscillation(document, diagnostic, *work)
+        }
     }
+}
+
+pub fn describe_oscillation(
+    document: &Document,
+    diagnostic: &OscillationDiagnostic,
+    work: usize,
+) -> String {
+    let components = diagnostic
+        .components
+        .iter()
+        .map(|component| {
+            let label = document
+                .components
+                .iter()
+                .find(|item| item.id == component.id)
+                .map(|item| item.label.as_str())
+                .unwrap_or(&component.label);
+            format!(
+                "{} \"{}\" #{}",
+                component.kind.name(),
+                label,
+                component.id.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Circuit appears to oscillate after {} microsteps (limit {}); consumed {work} work units. Affected components: {}.",
+        diagnostic.steps,
+        diagnostic.threshold,
+        if components.is_empty() {
+            "none"
+        } else {
+            &components
+        }
+    )
 }
 
 /// A one-bit value as symbol plus word.

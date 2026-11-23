@@ -15,7 +15,7 @@ const MAX_ASSIGNMENTS: usize = 10_000;
 const MAX_BUDGET: usize = MAX_WORK;
 
 fn usage() -> &'static str {
-    "Usage:\n  digital-rust-cli open PATH\n  digital-rust-cli validate PATH\n  digital-rust-cli simulate PATH [--input ID=0|1]... [--budget N]\n\nExit codes: 0 success, 1 document/operation/simulation failure, 2 usage error.\nOnly the strict editable .dig v2 subset and one-bit simulator are supported; feedback is accepted but settling is bounded and convergence is not guaranteed. This is not Digital CLI compatibility."
+    "Usage:\n  digital-rust-cli open PATH\n  digital-rust-cli validate PATH\n  digital-rust-cli simulate PATH [--input ID=0|1]... [--budget N] [--oscillation-limit N]\n\nExit codes: 0 success, 1 document/operation/simulation failure, 2 usage error.\nOnly the strict editable .dig v2 subset and one-bit simulator are supported; feedback is accepted but settling is bounded and convergence is not guaranteed. This is not Digital CLI compatibility."
 }
 fn fail(message: impl std::fmt::Display, code: u8) -> ExitCode {
     eprintln!("digital-rust-cli: {message}");
@@ -58,7 +58,11 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
     let path = args
         .next()
         .ok_or_else(|| (format!("missing PATH\n{}", usage()), 2))?;
-    let (mut assignments, mut budget) = (Vec::<(ComponentId, bool)>::new(), DEFAULT_BUDGET);
+    let (mut assignments, mut budget, mut oscillation_limit) = (
+        Vec::<(ComponentId, bool)>::new(),
+        DEFAULT_BUDGET,
+        digital_rust::runtime::DEFAULT_OSCILLATION_LIMIT,
+    );
     if command != "simulate" && args.next().is_some() {
         return Err((format!("unexpected argument\n{}", usage()), 2));
     }
@@ -95,6 +99,21 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
                     assignments.push((ComponentId(id), value));
                     if assignments.len() > MAX_ASSIGNMENTS {
                         return Err((format!("too many assignments (limit {MAX_ASSIGNMENTS})"), 2));
+                    }
+                }
+                Some("--oscillation-limit") => {
+                    i += 1;
+                    let text = rest
+                        .get(i)
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| ("--oscillation-limit requires an integer".into(), 2))?;
+                    oscillation_limit =
+                        parse_number(text, "oscillation limit").map_err(|e| (e, 2))?;
+                    if oscillation_limit == 0 || oscillation_limit > MAX_WORK {
+                        return Err((
+                            format!("oscillation limit must be between 1 and {MAX_WORK}"),
+                            2,
+                        ));
                     }
                 }
                 Some("--budget") => {
@@ -185,12 +204,14 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
             if session.document().components.len() > MAX_COMPONENTS {
                 return Err(("component limit exceeded".into(), 1));
             }
-            session.start_simulation().map_err(|e| {
-                (
-                    sim_text::describe_simulation_error(session.document(), &e),
-                    1,
-                )
-            })?;
+            session
+                .start_simulation_with_oscillation_limit(oscillation_limit)
+                .map_err(|e| {
+                    (
+                        sim_text::describe_simulation_error(session.document(), &e),
+                        1,
+                    )
+                })?;
             let mut remaining = budget;
             settle(&mut session, &mut remaining, budget)?;
             for (id, value) in assignments {
@@ -231,14 +252,22 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
 fn settle(session: &mut Session, remaining: &mut usize, total: usize) -> Result<(), (String, u8)> {
     match session
         .settle_simulation(*remaining)
-        .map_err(|e: SimulationError| (e.to_string(), 1))?
-    {
+        .map_err(|e: SimulationError| {
+            (
+                sim_text::describe_simulation_error(session.document(), &e),
+                1,
+            )
+        })? {
         SettleOutcome::Settled { work } => {
             *remaining -= work;
             Ok(())
         }
         SettleOutcome::BudgetExhausted { .. } => Err((
             format!("settling work budget exhausted (limit {total}); no settled outputs reported"),
+            1,
+        )),
+        SettleOutcome::Oscillating { work, diagnostic } => Err((
+            sim_text::describe_oscillation(session.document(), &diagnostic, work),
             1,
         )),
     }

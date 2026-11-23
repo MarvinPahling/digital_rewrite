@@ -847,7 +847,13 @@ impl DigitalApp {
         }
         match self.session.settle_simulation(self.settle_budget) {
             Ok(SettleOutcome::BudgetExhausted { .. }) => {}
-            Ok(SettleOutcome::Settled { .. }) | Err(_) => self.settling = false,
+            Ok(SettleOutcome::Settled { .. }) | Ok(SettleOutcome::Oscillating { .. }) => {
+                self.settling = false
+            }
+            Err(error) => {
+                self.settling = false;
+                self.report_simulation_error(&error);
+            }
         }
         // One more frame also after the last chunk, so the settled state is displayed.
         ctx.request_repaint();
@@ -1216,6 +1222,14 @@ impl DigitalApp {
         }
     }
     fn show(&mut self, ctx: &egui::Context) {
+        if self.session.oscillation_diagnostic().is_none()
+            && self
+                .error
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Circuit appears to oscillate"))
+        {
+            self.error = None;
+        }
         self.file_actions(ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.approved_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1571,11 +1585,8 @@ impl DigitalApp {
                         y: start.y + dy,
                     };
                 }
-                let state = if self.selected == Some(c.id) {
-                    PaintState::Selection
-                } else {
-                    PaintState::Ink
-                };
+                let affected = self.session.oscillation_diagnostic().is_some_and(|diagnostic| diagnostic.components.iter().any(|component| component.id == c.id));
+                let state = if affected { PaintState::Error } else if self.selected == Some(c.id) { PaintState::Selection } else { PaintState::Ink };
                 let Some(layout) = SymbolLayout::centered_on(style, c.kind, [pos.x, pos.y]) else {
                     self.error = Some(format!("No symbol is drawn for {}", c.kind.name()));
                     continue;
@@ -1619,7 +1630,7 @@ impl DigitalApp {
                     self.error = Some(e.to_string());
                 }
                 let bounds = layout.bounds();
-                if state == PaintState::Selection {
+                if self.selected == Some(c.id) {
                     let frame = Rect::from_min_max(
                         transform.to_screen(bounds.min),
                         transform.to_screen(bounds.max),
@@ -2086,6 +2097,97 @@ mod tests {
     fn has_line(output: &egui::FullOutput, from: Pos2, to: Pos2, width: f32) -> bool {
         output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::LineSegment { points, stroke } if *points == [from, to] && stroke.width == width))
+    }
+
+    #[test]
+    fn automatic_settle_surfaces_terminal_oscillation_and_keeps_runtime_out_of_ui() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let input = app
+            .session
+            .place(ComponentKind::Input, Position { x: 0., y: 100. })
+            .unwrap();
+        let mut previous = input;
+        for index in 0..102 {
+            let gate = app
+                .session
+                .place(
+                    ComponentKind::Not,
+                    Position {
+                        x: 100. * (index + 1) as f32,
+                        y: 100.,
+                    },
+                )
+                .unwrap();
+            app.session
+                .connect([
+                    PinRef {
+                        component: previous,
+                        pin: PinId {
+                            direction: PinDirection::Output,
+                            index: 0,
+                        },
+                    },
+                    PinRef {
+                        component: gate,
+                        pin: PinId {
+                            direction: PinDirection::Input,
+                            index: 0,
+                        },
+                    },
+                ])
+                .unwrap();
+            previous = gate;
+        }
+        let output = app
+            .session
+            .place(
+                ComponentKind::Output,
+                Position {
+                    x: 10_400.,
+                    y: 100.,
+                },
+            )
+            .unwrap();
+        app.session
+            .connect([
+                PinRef {
+                    component: previous,
+                    pin: PinId {
+                        direction: PinDirection::Output,
+                        index: 0,
+                    },
+                },
+                PinRef {
+                    component: output,
+                    pin: PinId {
+                        direction: PinDirection::Input,
+                        index: 0,
+                    },
+                },
+            ])
+            .unwrap();
+        let affected = ComponentId(3);
+        app.selected = Some(affected);
+        app.session
+            .start_simulation_with_oscillation_limit(1)
+            .unwrap();
+        app.settling = true;
+        for _ in 0..3 {
+            frame(&ctx, &mut app, vec![], true);
+        }
+        assert!(!app.session.simulation_active());
+        assert!(!app.settling);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|text| text.contains("appears to oscillate")
+                    && text.contains("NOT")
+                    && text.contains(&format!("#{}", affected.0)))
+        );
+        assert!(app.session.oscillation_diagnostic().is_some());
+        assert_eq!(app.session.document().components.len(), 104);
+        assert_eq!(app.session.undo().unwrap(), ());
     }
 
     #[test]

@@ -238,6 +238,91 @@ fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
     digital_rust::formats::serialize_v2(&digital_rust::formats::from_domain(&d).unwrap()).unwrap()
 }
 #[test]
+fn cli_reports_long_chain_heuristic_oscillation_without_success_rows() {
+    use digital_rust::domain::{
+        ComponentId as C, ComponentKind as K, Document, PinDirection as D, PinId, PinRef, Wire,
+        WireId,
+    };
+    let dir = TempDir::new();
+    let count = 102_u64;
+    let mut document = Document::default();
+    for id in 0..=count + 1 {
+        let kind = if id == 0 {
+            K::Input
+        } else if id == count + 1 {
+            K::Output
+        } else {
+            K::Not
+        };
+        document.components.push(digital_rust::domain::Component {
+            id: C(id),
+            kind,
+            position: digital_rust::domain::Position {
+                x: (id * 100) as f32,
+                y: 0.,
+            },
+            label: if id == 3 {
+                "collected".into()
+            } else {
+                kind.name().into()
+            },
+            constant_value: true,
+        });
+    }
+    for id in 0..=count {
+        document.wires.push(Wire {
+            id: WireId(id),
+            endpoints: [
+                PinRef {
+                    component: C(id),
+                    pin: PinId {
+                        direction: D::Output,
+                        index: 0,
+                    },
+                },
+                PinRef {
+                    component: C(id + 1),
+                    pin: PinId {
+                        direction: D::Input,
+                        index: 0,
+                    },
+                },
+            ],
+        });
+    }
+    let encoded = digital_rust::formats::serialize_v2(
+        &digital_rust::formats::from_domain(&document).unwrap(),
+    )
+    .unwrap();
+    fs::write(dir.0.join("chain.dig"), &encoded).unwrap();
+    let output = cli(
+        &dir,
+        &[
+            "simulate",
+            "chain.dig",
+            "--oscillation-limit",
+            "1",
+            "--budget",
+            "80000",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stdout.is_empty(),
+        "no success output may precede failure"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("appears to oscillate"), "{stderr}");
+    assert!(
+        stderr.contains("limit 1")
+            && stderr.contains("NOT \"collected\" #3")
+            && !stderr.contains("#102"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(dir.0.join("chain.dig")).unwrap(), encoded);
+}
+
+#[test]
 fn inverter_and_two_input_gates_run_exhaustive_truth_tables() {
     use digital_rust::domain::ComponentKind;
     let dir = TempDir::new();

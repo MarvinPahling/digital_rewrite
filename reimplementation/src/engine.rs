@@ -8,7 +8,10 @@ use crate::file_session::{
     SaveAsIntent,
 };
 use crate::formats::{self, DigReadError, DigWriteError};
-use crate::runtime::{InputChange, Runtime, RuntimeError, SettleOutcome, StepOutcome};
+use crate::runtime::{
+    DEFAULT_OSCILLATION_LIMIT, InputChange, OscillationDiagnostic, Runtime, RuntimeError,
+    SettleOutcome, StepOutcome,
+};
 use crate::simulation::CompileError;
 use std::path::{Path, PathBuf};
 #[derive(Default)]
@@ -21,6 +24,7 @@ pub struct Session {
     next_wire_id: u64,
     /// Transient simulation state. Never part of the document or its history.
     runtime: Option<Runtime>,
+    oscillation_diagnostic: Option<OscillationDiagnostic>,
     path: Option<PathBuf>,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -111,6 +115,11 @@ pub enum SimulationError {
     NotActive,
     Compile(CompileError),
     Runtime(RuntimeError),
+    InvalidOscillationLimit(usize),
+    Oscillation {
+        diagnostic: OscillationDiagnostic,
+        work: usize,
+    },
 }
 impl std::fmt::Display for SimulationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -119,6 +128,16 @@ impl std::fmt::Display for SimulationError {
             Self::NotActive => f.write_str("Simulation is not running"),
             Self::Compile(error) => write!(f, "Circuit cannot be simulated: {error:?}"),
             Self::Runtime(error) => write!(f, "Simulation input rejected: {error:?}"),
+            Self::InvalidOscillationLimit(limit) => write!(
+                f,
+                "Oscillation limit must be between 1 and {} (got {limit})",
+                crate::simulation::MAX_WORK
+            ),
+            Self::Oscillation { diagnostic, .. } => write!(
+                f,
+                "Circuit appears to oscillate after {} microsteps (limit {})",
+                diagnostic.steps, diagnostic.threshold
+            ),
         }
     }
 }
@@ -134,6 +153,7 @@ impl Session {
             return Err(SessionDigError::DirtyDiscardRequired);
         }
         self.document = Document::default();
+        self.oscillation_diagnostic = None;
         self.saved = Document::default();
         self.path = None;
         self.undo.clear();
@@ -162,6 +182,7 @@ impl Session {
             SessionDigError::Domain(formats::DomainCodecError("wire ID counter overflow".into()))
         })?;
         self.document = document.clone();
+        self.oscillation_diagnostic = None;
         self.saved = document;
         self.path = None;
         self.undo.clear();
@@ -238,6 +259,7 @@ impl Session {
             SessionDigError::Domain(formats::DomainCodecError("wire ID counter overflow".into()))
         })?;
         self.document = document.clone();
+        self.oscillation_diagnostic = None;
         self.saved = document;
         self.undo.clear();
         self.redo.clear();
@@ -307,11 +329,28 @@ impl Session {
     }
     /// Compiles and starts a runtime. On failure nothing changes and no simulation is active.
     pub fn start_simulation(&mut self) -> Result<(), SimulationError> {
+        self.start_simulation_with_oscillation_limit(DEFAULT_OSCILLATION_LIMIT)
+    }
+    pub fn start_simulation_with_oscillation_limit(
+        &mut self,
+        limit: usize,
+    ) -> Result<(), SimulationError> {
         if self.runtime.is_some() {
             return Err(SimulationError::AlreadyActive);
         }
-        self.runtime = Some(Runtime::start(&self.document).map_err(SimulationError::Compile)?);
+        if limit == 0 || limit > crate::simulation::MAX_WORK {
+            return Err(SimulationError::InvalidOscillationLimit(limit));
+        }
+        let mut runtime = Runtime::start(&self.document).map_err(SimulationError::Compile)?;
+        runtime
+            .set_oscillation_limit(limit)
+            .map_err(|_| SimulationError::InvalidOscillationLimit(limit))?;
+        self.runtime = Some(runtime);
+        self.oscillation_diagnostic = None;
         Ok(())
+    }
+    pub fn oscillation_diagnostic(&self) -> Option<&OscillationDiagnostic> {
+        self.oscillation_diagnostic.as_ref()
     }
     /// Discards the runtime; the document, history, dirty state and ids were never touched.
     pub fn stop_simulation(&mut self) -> Result<(), SimulationError> {
@@ -324,10 +363,37 @@ impl Session {
         self.runtime.as_mut().ok_or(SimulationError::NotActive)
     }
     pub fn step_simulation(&mut self) -> Result<StepOutcome, SimulationError> {
-        Ok(self.runtime_mut()?.step())
+        if let Some(diagnostic) = self.oscillation_diagnostic.clone() {
+            return Err(SimulationError::Oscillation {
+                diagnostic,
+                work: 0,
+            });
+        }
+        let outcome = self.runtime_mut()?.step();
+        if let StepOutcome::Oscillating { diagnostic } = outcome {
+            self.runtime = None;
+            self.oscillation_diagnostic = Some(diagnostic.clone());
+            return Err(SimulationError::Oscillation {
+                diagnostic,
+                work: 0,
+            });
+        }
+        Ok(outcome)
     }
     pub fn settle_simulation(&mut self, budget: usize) -> Result<SettleOutcome, SimulationError> {
-        Ok(self.runtime_mut()?.settle(budget))
+        if let Some(diagnostic) = self.oscillation_diagnostic.clone() {
+            return Err(SimulationError::Oscillation {
+                diagnostic,
+                work: 0,
+            });
+        }
+        let outcome = self.runtime_mut()?.settle(budget);
+        if let SettleOutcome::Oscillating { work, diagnostic } = outcome {
+            self.runtime = None;
+            self.oscillation_diagnostic = Some(diagnostic.clone());
+            return Err(SimulationError::Oscillation { diagnostic, work });
+        }
+        Ok(outcome)
     }
     pub fn toggle_input(&mut self, id: ComponentId) -> Result<InputChange, SimulationError> {
         self.runtime_mut()?
@@ -352,6 +418,7 @@ impl Session {
         }
     }
     fn edit(&mut self, next: Document) {
+        self.oscillation_diagnostic = None;
         self.undo.push(std::mem::replace(&mut self.document, next));
         self.redo.clear();
     }
@@ -510,6 +577,7 @@ impl Session {
     pub fn undo(&mut self) -> Result<(), EditError> {
         self.ensure_editable()?;
         if let Some(previous) = self.undo.pop() {
+            self.oscillation_diagnostic = None;
             self.redo
                 .push(std::mem::replace(&mut self.document, previous));
         }
@@ -518,6 +586,7 @@ impl Session {
     pub fn redo(&mut self) -> Result<(), EditError> {
         self.ensure_editable()?;
         if let Some(next) = self.redo.pop() {
+            self.oscillation_diagnostic = None;
             self.undo.push(std::mem::replace(&mut self.document, next));
         }
         Ok(())
@@ -1416,6 +1485,148 @@ mod tests {
         assert_eq!(s.dirty(), before.dirty);
         assert_eq!(s.path, before.path);
     }
+    #[test]
+    fn oscillation_is_terminal_transactional_and_unlocks_edits() {
+        use crate::domain::{PinDirection, PinId};
+        let mut s = Session::default();
+        let mut ids = Vec::new();
+        for n in 0..2 {
+            ids.push(
+                s.place(ComponentKind::Not, Position { x: n as f32, y: 0. })
+                    .unwrap(),
+            );
+        }
+        let pin = |component, direction| PinRef {
+            component,
+            pin: PinId {
+                direction,
+                index: 0,
+            },
+        };
+        s.connect([
+            pin(ids[0], PinDirection::Output),
+            pin(ids[1], PinDirection::Input),
+        ])
+        .unwrap();
+        s.connect([
+            pin(ids[1], PinDirection::Output),
+            pin(ids[0], PinDirection::Input),
+        ])
+        .unwrap();
+        let before = snapshot(&s);
+        s.start_simulation_with_oscillation_limit(1).unwrap();
+        for id in &ids {
+            s.runtime
+                .as_mut()
+                .unwrap()
+                .seed_output_for_test(*id, crate::runtime::Level::Low);
+        }
+        let result = s.settle_simulation(10_000);
+        assert!(matches!(
+            result,
+            Err(SimulationError::Oscillation { work: 303, .. })
+        ));
+        assert!(!s.simulation_active());
+        assert!(s.oscillation_diagnostic().is_some());
+        assert!(matches!(
+            s.settle_simulation(1),
+            Err(SimulationError::Oscillation { work: 0, .. })
+        ));
+        assert_unchanged(&s, &before);
+        assert_eq!(s.set_label(ids[0], "NOT"), Ok(()));
+        assert!(
+            s.oscillation_diagnostic().is_some(),
+            "no-op keeps the located failure"
+        );
+        assert_eq!(
+            s.set_label(ComponentId(999), "bad"),
+            Err(EditError::UnknownComponent)
+        );
+        assert!(
+            s.oscillation_diagnostic().is_some(),
+            "failed edits keep the located failure"
+        );
+        s.undo().unwrap();
+        assert!(
+            s.oscillation_diagnostic().is_none(),
+            "real history mutation clears stale locations"
+        );
+        assert_eq!(s.set_label(ids[0], "editable after failure"), Ok(()));
+        assert_eq!(s.undo.len(), before.undo.len());
+        assert!(s.dirty());
+    }
+
+    #[test]
+    fn default_detection_is_reachable_on_a_1101_not_chain() {
+        use crate::domain::{PinDirection, PinId};
+        let count = 1_101_u64;
+        let pin = |id, direction| PinRef {
+            component: ComponentId(id),
+            pin: PinId {
+                direction,
+                index: 0,
+            },
+        };
+        let mut document = Document::default();
+        for id in 0..=count + 1 {
+            let kind = if id == 0 {
+                ComponentKind::Input
+            } else if id == count + 1 {
+                ComponentKind::Output
+            } else {
+                ComponentKind::Not
+            };
+            document.components.push(Component {
+                id: ComponentId(id),
+                kind,
+                position: Position {
+                    x: id as f32,
+                    y: 0.,
+                },
+                label: kind.name().into(),
+                constant_value: true,
+            });
+        }
+        for id in 0..=count {
+            document.wires.push(Wire {
+                id: WireId(id),
+                endpoints: [
+                    pin(id, PinDirection::Output),
+                    pin(id + 1, PinDirection::Input),
+                ],
+            });
+        }
+        let mut session = Session {
+            document: document.clone(),
+            saved: document,
+            ..Session::default()
+        };
+        session.start_simulation().unwrap();
+        let error = session.settle_simulation(2_000_000).unwrap_err();
+        assert!(matches!(
+            error,
+            SimulationError::Oscillation {
+                diagnostic: OscillationDiagnostic {
+                    threshold: 1_000,
+                    steps: 1_100,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(!session.simulation_active());
+    }
+
+    #[test]
+    fn oscillation_limit_validation_does_not_start_runtime() {
+        let mut s = Session::default();
+        assert!(matches!(
+            s.start_simulation_with_oscillation_limit(0),
+            Err(SimulationError::InvalidOscillationLimit(0))
+        ));
+        assert!(!s.simulation_active());
+    }
+
     #[test]
     fn feedback_start_is_locked_and_stop_restores_editing_and_history() {
         use crate::domain::{PinDirection, PinId};

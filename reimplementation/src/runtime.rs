@@ -7,7 +7,54 @@
 //! High-Z and buses are not modelled.
 use crate::domain::*;
 use crate::simulation::{CompileError, CompiledCircuit, compile};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+pub const DEFAULT_OSCILLATION_LIMIT: usize = 1_000;
+pub const OSCILLATION_COLLECTION_OFFSET: usize = 100;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OscillatingComponent {
+    pub id: ComponentId,
+    pub kind: ComponentKind,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OscillationDiagnostic {
+    pub threshold: usize,
+    pub steps: usize,
+    pub components: Vec<OscillatingComponent>,
+}
+
+#[derive(Clone, Debug)]
+struct OscillationDetector {
+    limit: usize,
+    steps: usize,
+    components: BTreeMap<ComponentId, OscillatingComponent>,
+}
+impl OscillationDetector {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            steps: 0,
+            components: BTreeMap::new(),
+        }
+    }
+    fn begin_batch<'a>(&mut self, gates: impl IntoIterator<Item = &'a Gate>) {
+        self.steps += 1;
+        if self.steps > self.limit + 1 {
+            for gate in gates {
+                self.components
+                    .entry(gate.id)
+                    .or_insert_with(|| OscillatingComponent {
+                        id: gate.id,
+                        kind: gate.kind,
+                        label: gate.label.clone(),
+                    });
+            }
+        }
+    }
+}
 
 /// A one-bit net value. `Unavailable` means no gate has computed it yet; it is not false.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +76,7 @@ pub enum RuntimeError {
     Pending,
     UnknownComponent(ComponentId),
     NotAnInput(ComponentId),
+    InvalidOscillationLimit(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,16 +85,18 @@ pub enum InputChange {
     Changed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StepOutcome {
     /// Nothing was pending; state is untouched.
     Idle,
     /// One microstep published the outputs of `evaluated` gates.
     Stepped { evaluated: usize },
+    /// A previous settle latched terminal oscillation; no more work is permitted.
+    Oscillating { diagnostic: OscillationDiagnostic },
 }
 
 /// Work is counted in gate evaluations plus one unit per microstep started.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettleOutcome {
     Settled {
         work: usize,
@@ -55,6 +105,10 @@ pub enum SettleOutcome {
     /// This says nothing about oscillation.
     BudgetExhausted {
         work: usize,
+    },
+    Oscillating {
+        work: usize,
+        diagnostic: OscillationDiagnostic,
     },
 }
 
@@ -67,6 +121,8 @@ enum Role {
 }
 
 struct Gate {
+    id: ComponentId,
+    label: String,
     kind: ComponentKind,
     inputs: [usize; 2],
     output: usize,
@@ -114,6 +170,9 @@ pub struct Runtime {
     queue: Vec<usize>,
     queued: Vec<bool>,
     batch: Option<Batch>,
+    oscillation_limit: usize,
+    detector: Option<OscillationDetector>,
+    terminal: Option<OscillationDiagnostic>,
 }
 
 impl Runtime {
@@ -171,6 +230,8 @@ impl Runtime {
                         consumers[second].push(gate);
                     }
                     gates.push(Gate {
+                        id,
+                        label: component.label.clone(),
                         kind,
                         inputs: [first, second],
                         output: net_of(id, PinDirection::Output, 0),
@@ -189,11 +250,34 @@ impl Runtime {
             consumers,
             values,
             batch: None,
+            oscillation_limit: DEFAULT_OSCILLATION_LIMIT,
+            detector: None,
+            terminal: None,
         }
     }
 
     pub fn is_pending(&self) -> bool {
         self.batch.is_some() || !self.queue.is_empty()
+    }
+
+    pub fn set_oscillation_limit(&mut self, limit: usize) -> Result<(), RuntimeError> {
+        if limit == 0 || limit > crate::simulation::MAX_WORK {
+            return Err(RuntimeError::InvalidOscillationLimit(limit));
+        }
+        self.oscillation_limit = limit;
+        Ok(())
+    }
+    pub fn oscillation_limit(&self) -> usize {
+        self.oscillation_limit
+    }
+    pub fn terminal_diagnostic(&self) -> Option<&OscillationDiagnostic> {
+        self.terminal.as_ref()
+    }
+    #[cfg(test)]
+    pub(crate) fn seed_output_for_test(&mut self, id: ComponentId, value: Level) {
+        if let Some(gate) = self.gates.iter().find(|gate| gate.id == id) {
+            self.values[gate.output] = value;
+        }
     }
 
     /// Gates scheduled or part-way through the current microstep.
@@ -259,6 +343,11 @@ impl Runtime {
     /// Runs one complete microstep (finishing one already begun by a bounded settle).
     /// Its cost is bounded by the compiled gate count.
     pub fn step(&mut self) -> StepOutcome {
+        if let Some(diagnostic) = self.terminal.clone() {
+            return StepOutcome::Oscillating { diagnostic };
+        }
+        // Explicit stepping is a raw, undetected microstep; it closes any settle episode.
+        self.detector = None;
         if !self.is_pending() {
             return StepOutcome::Idle;
         }
@@ -267,6 +356,7 @@ impl Runtime {
         }
         loop {
             if let Some(evaluated) = self.evaluate_next() {
+                self.detector = None;
                 return StepOutcome::Stepped { evaluated };
             }
         }
@@ -275,18 +365,51 @@ impl Runtime {
     /// Microsteps until idle or `budget` work units are spent. A microstep in progress is
     /// resumed, so a large frontier is evaluated across calls without partial publication.
     pub fn settle(&mut self, budget: usize) -> SettleOutcome {
+        if let Some(diagnostic) = self.terminal.clone() {
+            return SettleOutcome::Oscillating {
+                work: 0,
+                diagnostic,
+            };
+        }
+        if budget == 0 {
+            return if self.is_pending() {
+                SettleOutcome::BudgetExhausted { work: 0 }
+            } else {
+                SettleOutcome::Settled { work: 0 }
+            };
+        }
+        if self.detector.is_none() {
+            self.detector = Some(OscillationDetector::new(self.oscillation_limit));
+        }
         let mut work = 0;
         while self.is_pending() {
             if work == budget {
                 return SettleOutcome::BudgetExhausted { work };
             }
-            work += 1;
             if self.batch.is_none() {
+                let scheduled: Vec<_> = self.queue.iter().map(|&gate| &self.gates[gate]).collect();
+                let detector = self
+                    .detector
+                    .get_or_insert_with(|| OscillationDetector::new(self.oscillation_limit));
+                if detector.steps >= detector.limit.saturating_add(OSCILLATION_COLLECTION_OFFSET) {
+                    let components = detector.components.values().cloned().collect();
+                    let diagnostic = OscillationDiagnostic {
+                        threshold: detector.limit,
+                        steps: detector.steps,
+                        components,
+                    };
+                    self.terminal = Some(diagnostic.clone());
+                    return SettleOutcome::Oscillating { work, diagnostic };
+                }
+                detector.begin_batch(scheduled);
+                work += 1;
                 self.begin_batch();
             } else {
+                work += 1;
                 self.evaluate_next();
             }
         }
+        self.detector = None;
         SettleOutcome::Settled { work }
     }
 
@@ -514,6 +637,126 @@ mod tests {
         assert_eq!(runtime.pin_value(out(1)), Some(High));
         assert_eq!(runtime.step(), StepOutcome::Idle);
         assert!(!runtime.is_pending());
+    }
+
+    #[test]
+    fn default_limit_is_one_thousand_and_convergence_at_last_allowed_step_succeeds() {
+        let ordinary = Runtime::start(&not_chain(1)).unwrap();
+        assert_eq!(ordinary.oscillation_limit(), 1_000);
+        let long = not_chain(101);
+        let mut runtime = Runtime::start(&long).unwrap();
+        runtime.set_oscillation_limit(1).unwrap();
+        assert!(matches!(
+            runtime.settle(10_000),
+            SettleOutcome::Settled { .. }
+        ));
+        assert!(!runtime.is_pending());
+        assert_eq!(runtime.output_value(ComponentId(103)), Some(High));
+    }
+
+    #[test]
+    fn oscillation_boundary_collects_only_late_scheduled_gate_union() {
+        let doc = document(
+            &[
+                (1, ComponentKind::Not),
+                (2, ComponentKind::Not),
+                (3, ComponentKind::Not),
+            ],
+            &[
+                (out(1), inp(2, 0)),
+                (out(2), inp(1, 0)),
+                (out(2), inp(3, 0)),
+            ],
+        );
+        let mut runtime = Runtime::start(&doc).unwrap();
+        runtime.set_oscillation_limit(1).unwrap();
+        for id in [1, 2, 3] {
+            runtime.values[runtime.pin_nets[&out(id)]] = Low;
+        }
+        // Two normal microsteps, then 99 collection batches. The forbidden next batch
+        // is rejected before its frontier is executed or included.
+        let outcome = runtime.settle(10_000);
+        let SettleOutcome::Oscillating { work, diagnostic } = outcome else {
+            panic!("expected oscillation");
+        };
+        assert_eq!(diagnostic.threshold, 1);
+        assert_eq!(diagnostic.steps, 101);
+        assert_eq!(work, 404);
+        assert_eq!(
+            diagnostic
+                .components
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            vec![ComponentId(1), ComponentId(2), ComponentId(3)]
+        );
+        assert_eq!(
+            runtime.settle(10),
+            SettleOutcome::Oscillating {
+                work: 0,
+                diagnostic: diagnostic.clone()
+            }
+        );
+        assert_eq!(runtime.step(), StepOutcome::Oscillating { diagnostic });
+    }
+
+    #[test]
+    fn zero_budget_and_partial_batch_preserve_oscillation_detector_partition() {
+        let doc = document(
+            &[(1, ComponentKind::Not), (2, ComponentKind::Not)],
+            &[(out(1), inp(2, 0)), (out(2), inp(1, 0))],
+        );
+        let init = |runtime: &mut Runtime| {
+            runtime.set_oscillation_limit(1).unwrap();
+            runtime.values[runtime.pin_nets[&out(1)]] = Low;
+            runtime.values[runtime.pin_nets[&out(2)]] = Low;
+        };
+        let mut whole = Runtime::start(&doc).unwrap();
+        init(&mut whole);
+        let mut chunked = Runtime::start(&doc).unwrap();
+        init(&mut chunked);
+        assert_eq!(
+            chunked.settle(0),
+            SettleOutcome::BudgetExhausted { work: 0 }
+        );
+        assert_eq!(
+            chunked.settle(2),
+            SettleOutcome::BudgetExhausted { work: 2 }
+        );
+        let expected = whole.settle(10_000);
+        let resumed = chunked.settle(10_000);
+        let SettleOutcome::Oscillating {
+            work: expected_work,
+            diagnostic: expected_diagnostic,
+        } = expected
+        else {
+            panic!("expected oscillation");
+        };
+        let SettleOutcome::Oscillating { work, diagnostic } = resumed else {
+            panic!("expected oscillation");
+        };
+        assert_eq!(diagnostic, expected_diagnostic);
+        assert_eq!(diagnostic.steps, 101);
+        assert_eq!(expected_work, work + 2);
+        assert_eq!(work, 301);
+    }
+
+    #[test]
+    fn explicit_raw_step_restarts_detection_episode() {
+        let doc = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
+        let mut runtime = Runtime::start(&doc).unwrap();
+        runtime.set_oscillation_limit(1).unwrap();
+        runtime.values[runtime.pin_nets[&out(1)]] = Low;
+        assert!(matches!(
+            runtime.settle(1),
+            SettleOutcome::BudgetExhausted { .. }
+        ));
+        assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
+        assert!(matches!(
+            runtime.settle(1),
+            SettleOutcome::BudgetExhausted { .. }
+        ));
+        assert_eq!(runtime.detector.as_ref().map(|d| d.steps), Some(1));
     }
 
     #[test]
@@ -798,6 +1041,8 @@ mod tests {
         use Level::*;
         for kind in [ComponentKind::And, ComponentKind::Or] {
             let gate = Gate {
+                id: ComponentId(1),
+                label: String::new(),
                 kind,
                 inputs: [0, 1],
                 output: 2,
@@ -1095,6 +1340,7 @@ mod tests {
                     spent += work;
                     break;
                 }
+                SettleOutcome::Oscillating { .. } => panic!("no detector configured"),
             }
             assert!(calls < 1_000, "bounded calls must make progress");
         }
