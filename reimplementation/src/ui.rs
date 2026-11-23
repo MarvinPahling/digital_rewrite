@@ -78,6 +78,14 @@ pub struct DigitalApp {
     pending_action: Option<PendingAction>,
     file_modal: Option<FileModal>,
     approved_close: bool,
+    label_modal: Option<LabelDraft>,
+    restore_canvas_focus: bool,
+}
+#[derive(Clone, Debug)]
+struct LabelDraft {
+    id: ComponentId,
+    text: String,
+    error: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingAction {
@@ -145,6 +153,8 @@ impl DigitalApp {
             pending_action: None,
             file_modal: None,
             approved_close: false,
+            label_modal: None,
+            restore_canvas_focus: false,
         }
     }
 }
@@ -183,6 +193,59 @@ fn draw_grid(
     }
 }
 impl DigitalApp {
+    fn modality_active(&self) -> bool {
+        self.file_modal.is_some() || self.label_modal.is_some()
+    }
+    fn begin_label_edit(&mut self) {
+        if self.session.simulation_active() || self.file_modal.is_some() {
+            self.error = Some(EDIT_LOCK_NOTE.into());
+            return;
+        }
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(text) = self
+            .session
+            .document()
+            .components
+            .iter()
+            .find(|component| component.id == id)
+            .map(|component| component.label.clone())
+        else {
+            return;
+        };
+        self.cancel_gestures();
+        self.label_modal = Some(LabelDraft {
+            id,
+            text,
+            error: None,
+        });
+    }
+    fn cancel_label_edit(&mut self) {
+        if self.label_modal.take().is_some() {
+            self.restore_canvas_focus = true;
+        }
+    }
+    fn finish_label_edit(&mut self) {
+        let Some((id, text)) = self
+            .label_modal
+            .as_ref()
+            .map(|draft| (draft.id, draft.text.clone()))
+        else {
+            return;
+        };
+        match self.session.set_label(id, &text) {
+            Ok(()) => {
+                self.error = None;
+                self.cancel_label_edit();
+            }
+            Err(error) => {
+                if let Some(draft) = self.label_modal.as_mut() {
+                    draft.error = Some(error.to_string());
+                }
+            }
+        }
+    }
     fn cancel_gestures(&mut self) {
         self.placing = None;
         self.wiring = false;
@@ -258,6 +321,7 @@ impl DigitalApp {
         }
     }
     fn reset_document_ui(&mut self) {
+        self.cancel_label_edit();
         self.selected = None;
         self.selected_wire = None;
         self.cancel_gestures();
@@ -346,7 +410,7 @@ impl DigitalApp {
         }
     }
     fn file_actions(&mut self, ctx: &egui::Context) {
-        let locked = self.session.simulation_active() || self.file_modal.is_some();
+        let locked = self.session.simulation_active() || self.modality_active();
         let shortcut = ctx.input_mut(|i| {
             let command = egui::Modifiers::COMMAND;
             let shift = egui::Modifiers {
@@ -510,6 +574,58 @@ impl DigitalApp {
             }
         }
     }
+    fn label_modal_ui(&mut self, ctx: &egui::Context) {
+        if self.label_modal.is_none() {
+            return;
+        }
+        let close =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let apply = ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)
+                || input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
+        });
+        if close {
+            self.cancel_label_edit();
+            return;
+        }
+        if apply {
+            self.finish_label_edit();
+        }
+        let mut action = None;
+        egui::Modal::new(egui::Id::new("component_label_modal")).show(ctx, |ui| {
+            ui.set_min_width(380.);
+            if let Some(draft) = self.label_modal.as_mut() {
+                ui.heading(format!("Edit label — component #{}", draft.id.0));
+                ui.add(
+                    egui::TextEdit::multiline(&mut draft.text)
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Component label"),
+                );
+                ui.label(format!("{} / 4096 UTF-8 bytes", draft.text.len()));
+                if let Err(error) = crate::domain::validate_label(&draft.text) {
+                    ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                }
+                if let Some(error) = &draft.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        action = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(false);
+                    }
+                });
+                ui.label("Ctrl/Cmd+Enter applies; Esc cancels.");
+            }
+        });
+        match action {
+            Some(true) => self.finish_label_edit(),
+            Some(false) => self.cancel_label_edit(),
+            None => {}
+        }
+    }
     fn choose_pin(&mut self, pin: PinRef) {
         if let Some(start) = self.wire_start {
             match self.session.connect([start, pin]) {
@@ -621,7 +737,7 @@ impl DigitalApp {
         egui::SidePanel::right("simulation").show(ctx, |ui| {
             ui.heading("Simulation");
             let active = self.session.simulation_active();
-            let modal_blocked = self.file_modal.is_some();
+            let modal_blocked = self.modality_active();
             let mut action = None;
             ui.horizontal_wrapped(|ui| {
                 for (label, enabled, hint, command) in [
@@ -757,7 +873,7 @@ impl DigitalApp {
         let mut running_close_choice = None;
         egui::SidePanel::left("palette").show(ctx, |ui| {
             ui.heading("Components");
-            let locked = self.session.simulation_active() || self.file_modal.is_some();
+            let locked = self.session.simulation_active() || self.modality_active();
             ui.add_enabled_ui(!locked, |ui| {
                 for kind in KINDS {
                     if ui
@@ -788,6 +904,15 @@ impl DigitalApp {
             ui.separator();
             ui.label("Click canvas to place. Drag to move. Escape cancels. Delete removes; Ctrl/Cmd-Z undoes; Shift-Ctrl/Cmd-Z redoes.");
             ui.label(if self.session.dirty() { "Modified" } else { "Unmodified" });
+            if let Some(id) = self.selected {
+                let label = self.session.document().components.iter().find(|component| component.id == id).map(|component| component.label.clone());
+                if let Some(label) = label {
+                    ui.label(format!("Selected label: {label}"));
+                    if ui.add_enabled(!locked, egui::Button::new("Edit label… (F2)")).clicked() {
+                        self.begin_label_edit();
+                    }
+                }
+            }
             if let Some(error) = &self.error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
@@ -854,7 +979,7 @@ impl DigitalApp {
                 document_name
             ));
             let mut file_action = None;
-            if self.file_modal.is_none() {
+            if !self.modality_active() {
             ui.menu_button("File", |ui| {
                 for (label, enabled, action) in [("New  Ctrl/Cmd+N", !locked, 0), ("Open…  Ctrl/Cmd+O", !locked, 1), ("Save  Ctrl/Cmd+S", !locked, 2), ("Save As…  Shift+Ctrl/Cmd+S", !locked, 3)] {
                     if ui.add_enabled(enabled, egui::Button::new(label)).clicked() { file_action = Some(action); ui.close_menu(); }
@@ -932,12 +1057,16 @@ impl DigitalApp {
         self.file_actions(ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.approved_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.cancel_label_edit();
             self.begin_pending(PendingAction::Close);
         }
         if self.approved_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let modal_open = self.file_modal.is_some();
+        if self.label_modal.is_some() && ctx.input(|input| !input.focused) {
+            self.cancel_label_edit();
+        }
+        let modal_open = self.modality_active();
         if !modal_open {
             self.simulation_shortcuts(ctx);
         }
@@ -1259,7 +1388,14 @@ impl DigitalApp {
                     );
                 }
             }
-            let owns_keyboard = response.has_focus() && self.file_modal.is_none();
+            if self.restore_canvas_focus
+                && !self.modality_active()
+                && ctx.input(|input| input.focused)
+            {
+                response.request_focus();
+                self.restore_canvas_focus = false;
+            }
+            let owns_keyboard = response.has_focus() && !self.modality_active();
             if owns_keyboard {
                 ui.memory_mut(|m| {
                     m.set_focus_lock_filter(
@@ -1281,6 +1417,7 @@ impl DigitalApp {
                 let attempted = ctx.input_mut(|i| {
                     [
                         (egui::Modifiers::NONE, egui::Key::W),
+                        (egui::Modifiers::NONE, egui::Key::F2),
                         (egui::Modifiers::NONE, egui::Key::Delete),
                         (command, egui::Key::Z),
                         (shifted, egui::Key::Z),
@@ -1305,6 +1442,12 @@ impl DigitalApp {
                 {
                     self.apply_simulation_action(SimAction::Toggle(id));
                 }
+            }
+            if owns_keyboard
+                && !locked
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2))
+            {
+                self.begin_label_edit();
             }
             if owns_keyboard
                 && !locked
@@ -1422,6 +1565,7 @@ impl DigitalApp {
             self.advance_simulation(ctx);
         }
         self.file_modal_ui(ctx);
+        self.label_modal_ui(ctx);
     }
 }
 impl eframe::App for DigitalApp {
@@ -3142,6 +3286,388 @@ mod tests {
         assert!(app.file_modal.is_none(), "{:?}", app.file_modal);
         assert!(app.session.document().components.is_empty());
         assert!(!app.session.dirty());
+    }
+
+    #[test]
+    fn label_editor_modal_applies_cancels_validates_and_blocks_every_background_route() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let id = app
+            .session
+            .place(ComponentKind::Output, Position { x: 100., y: 100. })
+            .unwrap();
+        app.selected = Some(id);
+        let original = app.session.document().clone();
+        click_text(&ctx, &mut app, "Edit label… (F2)");
+        assert!(app.label_modal.is_some());
+        assert_eq!(app.label_modal.as_ref().unwrap().text, "Output");
+        app.label_modal.as_mut().unwrap().text = "invalid\u{1}".into();
+        let shown = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(&shown, "U+0001"), "{:?}", texts(&shown));
+        assert!(has_text(&shown, "Apply") && has_text(&shown, "Cancel"));
+        ctx.set_visuals(egui::Visuals::light());
+        assert!(has_text(&frame(&ctx, &mut app, vec![], true), "U+0001"));
+        ctx.set_visuals(egui::Visuals::dark());
+        assert!(has_text(&frame(&ctx, &mut app, vec![], true), "U+0001"));
+        let before = app.session.document().clone();
+        for (pressed, modifiers) in [
+            (egui::Key::F5, egui::Modifiers::NONE),
+            (egui::Key::Delete, egui::Modifiers::NONE),
+            (egui::Key::Z, egui::Modifiers::COMMAND),
+            (egui::Key::N, egui::Modifiers::COMMAND),
+            (egui::Key::O, egui::Modifiers::COMMAND),
+            (egui::Key::S, egui::Modifiers::COMMAND),
+        ] {
+            press(&ctx, &mut app, pressed, modifiers);
+        }
+        assert_eq!(*app.session.document(), before);
+        assert!(!app.session.simulation_active());
+        assert!(app.label_modal.is_some());
+        assert!(app.file_modal.is_none());
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+            true,
+        );
+        assert!(app.label_modal.is_none());
+        assert_eq!(*app.session.document(), original);
+        press(&ctx, &mut app, egui::Key::F2, egui::Modifiers::NONE);
+        assert!(
+            app.label_modal.is_some(),
+            "F2 should open the selected component label editor"
+        );
+        press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(app.label_modal.is_none());
+
+        app.selected = Some(id);
+        click_text(&ctx, &mut app, "Edit label… (F2)");
+        app.label_modal.as_mut().unwrap().text = "Résultat & <Q>".into();
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::COMMAND)],
+            true,
+        );
+        assert!(app.label_modal.is_none());
+        assert_eq!(app.session.document().components[0].label, "Résultat & <Q>");
+        assert!(app.session.dirty());
+        app.session.undo().unwrap();
+        assert_eq!(*app.session.document(), original);
+        assert!(app.session.dirty());
+        app.session.redo().unwrap();
+        assert!(app.session.dirty());
+    }
+
+    #[test]
+    fn label_modal_focus_loss_cancels_and_running_simulation_blocks_open() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let input = app
+            .session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let id = app
+            .session
+            .place(ComponentKind::Output, Position { x: 100., y: 0. })
+            .unwrap();
+        app.session
+            .connect([
+                pin_ref(input, PinDirection::Output, 0),
+                pin_ref(id, PinDirection::Input, 0),
+            ])
+            .unwrap();
+        app.selected = Some(id);
+        app.begin_label_edit();
+        app.label_modal.as_mut().unwrap().text = "draft".into();
+        frame(&ctx, &mut app, vec![], false);
+        assert!(app.label_modal.is_none());
+        assert_eq!(
+            app.session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == id)
+                .unwrap()
+                .label,
+            "Output"
+        );
+        app.session.start_simulation().unwrap();
+        app.selected = Some(id);
+        app.begin_label_edit();
+        assert!(app.label_modal.is_none());
+        assert!(app.session.simulation_active());
+        assert_eq!(
+            app.session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == id)
+                .unwrap()
+                .label,
+            "Output"
+        );
+        app.session.stop_simulation().unwrap();
+    }
+
+    #[test]
+    fn label_editing_full_editor_workflow_through_production_ui_events() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("m4-label-ui");
+        let mut app = ui_file_app(&dir);
+        // Construct a small inverter circuit solely with the visible palette and canvas controls.
+        for (palette, canvas) in [
+            ("Input", Pos2::new(308., 108.)),
+            ("NOT", Pos2::new(408., 108.)),
+            ("Output", Pos2::new(508., 108.)),
+        ] {
+            click_text(&ctx, &mut app, palette);
+            click_at(&ctx, &mut app, canvas);
+        }
+        assert_eq!(app.session.document().components.len(), 3);
+        click_text(&ctx, &mut app, "Wire (W)");
+        let screen_pin = |kind, center, pin| {
+            let point = SymbolLayout::centered_on(app.style, kind, center)
+                .unwrap()
+                .pin_position(pin)
+                .unwrap();
+            Pos2::new(point[0] + 208., point[1] + 8.)
+        };
+        let routes = [
+            (
+                screen_pin(
+                    ComponentKind::Input,
+                    [100., 100.],
+                    PinId {
+                        direction: PinDirection::Output,
+                        index: 0,
+                    },
+                ),
+                screen_pin(
+                    ComponentKind::Not,
+                    [200., 100.],
+                    PinId {
+                        direction: PinDirection::Input,
+                        index: 0,
+                    },
+                ),
+            ),
+            (
+                screen_pin(
+                    ComponentKind::Not,
+                    [200., 100.],
+                    PinId {
+                        direction: PinDirection::Output,
+                        index: 0,
+                    },
+                ),
+                screen_pin(
+                    ComponentKind::Output,
+                    [300., 100.],
+                    PinId {
+                        direction: PinDirection::Input,
+                        index: 0,
+                    },
+                ),
+            ),
+        ];
+        for (start, end) in routes {
+            click_at(&ctx, &mut app, start);
+            click_at(&ctx, &mut app, end);
+        }
+        click_text(&ctx, &mut app, "Wire (W)");
+        assert_eq!(app.session.document().wires.len(), 2);
+        let output = app
+            .session
+            .document()
+            .components
+            .iter()
+            .find(|component| component.kind == ComponentKind::Output)
+            .unwrap()
+            .id;
+        click_at(&ctx, &mut app, Pos2::new(508., 108.));
+        assert_eq!(app.selected, Some(output));
+        click_text(&ctx, &mut app, "Edit label… (F2)");
+        assert!(app.label_modal.is_some());
+        let modal = frame(&ctx, &mut app, vec![], true);
+        let text_pos = modal
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Output" => Some(text.pos),
+                _ => None,
+            })
+            .unwrap();
+        click_at(&ctx, &mut app, text_pos + Vec2::new(8., 8.));
+        let document_before_text_undo = app.session.document().clone();
+        press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(
+            *app.session.document(),
+            document_before_text_undo,
+            "text-editor undo must not reach document history"
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                key(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("Résultat & <Q>".into()),
+            ],
+            true,
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::COMMAND)],
+            true,
+        );
+        assert_eq!(
+            app.session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == output)
+                .unwrap()
+                .label,
+            "Résultat & <Q>"
+        );
+        assert!(has_text(
+            &frame(&ctx, &mut app, vec![], true),
+            "Résultat & <Q>"
+        ));
+        press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(
+            app.session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == output)
+                .unwrap()
+                .label,
+            "Output"
+        );
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::Z,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        );
+        assert_eq!(
+            app.session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == output)
+                .unwrap()
+                .label,
+            "Résultat & <Q>"
+        );
+        click_text(&ctx, &mut app, "Save As");
+        app.file_path_entry = "ui-demo.dig".into();
+        click_text(&ctx, &mut app, "Save path");
+        assert_eq!(app.session.path(), Some(dir.join("ui-demo.dig").as_path()));
+        assert!(!app.session.dirty());
+        let xml = std::fs::read_to_string(dir.join("ui-demo.dig")).unwrap();
+        assert!(xml.contains("Résultat &amp; &lt;Q&gt;"));
+        click_text(&ctx, &mut app, "New");
+        assert!(app.session.document().components.is_empty());
+        click_text(&ctx, &mut app, "Open");
+        app.file_path_entry = "ui-demo.dig".into();
+        click_text(&ctx, &mut app, "Open path");
+        assert_eq!(app.session.document().components.len(), 3);
+        assert_eq!(app.session.document().wires.len(), 2);
+        assert_eq!(
+            app.session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == output)
+                .unwrap()
+                .label,
+            "Résultat & <Q>"
+        );
+        click_text(&ctx, &mut app, "Start");
+        let mut frames = 0;
+        while app
+            .session
+            .inspect()
+            .is_some_and(|runtime| runtime.is_pending())
+        {
+            let output_frame = frame(&ctx, &mut app, vec![], true);
+            frames += 1;
+            assert!(frames < 100, "settling stalled: {:?}", app.error);
+            if app.session.inspect().unwrap().is_pending() {
+                assert!(wants_immediate_repaint(&output_frame));
+            }
+        }
+        assert_eq!(
+            app.session.inspect().unwrap().output_value(output),
+            Some(Level::High)
+        );
+        assert!(has_text(
+            &frame(&ctx, &mut app, vec![], true),
+            "Résultat & <Q>"
+        ));
+        click_text(&ctx, &mut app, "Input #0: 0 (low)");
+        let settled = frame(&ctx, &mut app, vec![], true);
+        assert_eq!(
+            app.session.inspect().unwrap().output_value(output),
+            Some(Level::Low)
+        );
+        assert!(has_text(&settled, "Résultat & <Q>"));
+        let document = app.session.document().clone();
+        app.selected = Some(output);
+        click_text(&ctx, &mut app, "Edit label… (F2)");
+        assert!(
+            app.label_modal.is_none(),
+            "label editing must be disabled during simulation"
+        );
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
+        assert!(app.session.simulation_active());
+        assert_eq!(*app.session.document(), document);
+        press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::SHIFT);
+        click_text(&ctx, &mut app, "Edit label… (F2)");
+        let modal = frame(&ctx, &mut app, vec![], true);
+        let text_pos = modal
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Résultat & <Q>" => {
+                    Some(text.pos)
+                }
+                _ => None,
+            })
+            .unwrap();
+        click_at(&ctx, &mut app, text_pos + Vec2::new(8., 8.));
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                key(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("Final".into()),
+            ],
+            true,
+        );
+        press(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert!(app.session.dirty());
+        press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert!(!app.session.dirty());
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::Z,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        );
+        assert!(app.session.dirty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

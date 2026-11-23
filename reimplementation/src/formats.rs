@@ -128,6 +128,19 @@ pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
     for (index, element) in document.elements.iter().enumerate() {
         validate_write_string(&element.name, &format!("elements[{index}].name"))?;
         if let Some(label) = &element.label {
+            if let Err(validation) = crate::domain::validate_label(label) {
+                let kind = match validation {
+                    crate::domain::LabelError::TooLong { .. } => DigWriteErrorKind::Limit,
+                    crate::domain::LabelError::InvalidXmlCharacter { .. } => {
+                        DigWriteErrorKind::InvalidXmlCharacter
+                    }
+                };
+                return Err(write_error(
+                    kind,
+                    format!("elements[{index}].label"),
+                    validation.to_string(),
+                ));
+            }
             validate_write_string(label, &format!("elements[{index}].label"))?;
         }
     }
@@ -537,6 +550,14 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
         }
         let value = leaf(&entry.children[1], "Label")?;
         bounded_string(value, entry.children[1].offset, "Label")?;
+        crate::domain::validate_label(value).map_err(|validation| {
+            error(
+                DigReadErrorKind::InvalidValue,
+                entry.children[1].offset,
+                "Label",
+                validation.to_string(),
+            )
+        })?;
         label = Some(value.to_owned());
     }
     let pos_node = pos.ok_or_else(|| {

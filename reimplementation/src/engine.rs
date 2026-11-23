@@ -1,7 +1,7 @@
 //! Validated document mutations and snapshot history.
 #![allow(dead_code)] // Wire editing is exposed to the UI in a later stage.
 use crate::domain::{
-    Component, ComponentId, ComponentKind, Document, PinRef, Position, Wire, WireId,
+    Component, ComponentId, ComponentKind, Document, LabelError, PinRef, Position, Wire, WireId,
 };
 use crate::file_session::{
     self, DiscardIntent, FileIo, FileOperationError, FileStage, PublishFailure, PublishOutcome,
@@ -29,6 +29,7 @@ pub enum EditError {
     SimulationActive,
     InvalidPosition,
     UnknownComponent,
+    InvalidLabel(LabelError),
     IdExhausted,
     InvalidPin,
     SameEndpoint,
@@ -42,6 +43,7 @@ impl std::fmt::Display for EditError {
             Self::SimulationActive => "Stop the simulation before editing",
             Self::InvalidPosition => "Invalid position",
             Self::UnknownComponent => "Unknown component",
+            Self::InvalidLabel(error) => return write!(f, "Invalid component label: {error}"),
             Self::IdExhausted => "No component IDs remaining",
             Self::InvalidPin => "Invalid pin",
             Self::SameEndpoint => "Wire endpoints must differ",
@@ -371,6 +373,32 @@ impl Session {
         });
         self.edit(next);
         Ok(id)
+    }
+    /// Change only the selected component's label. Lock and identity checks precede validation;
+    /// validation completes before any document/history mutation.
+    pub fn set_label(&mut self, id: ComponentId, label: &str) -> Result<(), EditError> {
+        self.ensure_editable()?;
+        let Some(component) = self
+            .document
+            .components
+            .iter()
+            .find(|component| component.id == id)
+        else {
+            return Err(EditError::UnknownComponent);
+        };
+        crate::domain::validate_label(label).map_err(EditError::InvalidLabel)?;
+        if component.label == label {
+            return Ok(());
+        }
+        let mut next = self.document.clone();
+        let component = next
+            .components
+            .iter_mut()
+            .find(|component| component.id == id)
+            .ok_or(EditError::UnknownComponent)?;
+        component.label = label.to_owned();
+        self.edit(next);
+        Ok(())
     }
     pub fn move_component(&mut self, id: ComponentId, position: Position) -> Result<(), EditError> {
         self.ensure_editable()?;
@@ -1016,6 +1044,166 @@ mod tests {
         session.redo().unwrap();
         assert_eq!(*session.document(), snapshot);
     }
+    #[test]
+    fn label_edits_validate_atomically_and_have_one_undo_snapshot() {
+        let mut session = Session::default();
+        let ids: Vec<_> = crate::components::KINDS
+            .iter()
+            .map(|kind| session.place(*kind, Position { x: 10.0, y: 20.0 }).unwrap())
+            .collect();
+        let id = ids[1];
+        session.saved = session.document.clone();
+        let original = session.document.clone();
+        let before = snapshot(&session);
+        assert_eq!(
+            session.set_label(ComponentId(u64::MAX), "bad\0"),
+            Err(EditError::UnknownComponent)
+        );
+        assert_unchanged(&session, &before);
+        for label in ["x".repeat(4097), "bad\u{1}".into(), "bad\u{FFFE}".into()] {
+            assert!(matches!(
+                session.set_label(id, &label),
+                Err(EditError::InvalidLabel(_))
+            ));
+            assert_unchanged(&session, &before);
+        }
+        let unicode = "é".repeat(2048);
+        session.set_label(id, &unicode).unwrap();
+        assert_eq!(
+            session
+                .document
+                .components
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .label,
+            unicode
+        );
+        assert!(session.dirty());
+        assert_eq!(
+            session
+                .document
+                .components
+                .iter()
+                .map(|c| (c.id, c.kind, c.position))
+                .collect::<Vec<_>>(),
+            original
+                .components
+                .iter()
+                .map(|c| (c.id, c.kind, c.position))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(session.document.wires, original.wires);
+        session.undo().unwrap();
+        assert_eq!(session.document, original);
+        assert!(!session.dirty());
+        session.redo().unwrap();
+        assert_eq!(
+            session
+                .document
+                .components
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .label,
+            unicode
+        );
+        assert!(session.dirty());
+    }
+
+    #[test]
+    fn labels_for_every_supported_kind_export_and_import_without_loss() {
+        let mut session = Session::default();
+        let ids: Vec<_> = crate::components::KINDS
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                session
+                    .place(
+                        *kind,
+                        Position {
+                            x: index as f32 * 100.0,
+                            y: 60.0,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect();
+        for (id, label) in
+            ids.iter()
+                .zip(["", "\u{2003} ", "Résultat & <Q>", "λ input", "line\nfeed"])
+        {
+            session.set_label(*id, label).unwrap();
+        }
+        let bytes = session.export_dig_bytes().unwrap();
+        let mut imported = Session::default();
+        imported.open_dig_bytes(&bytes).unwrap();
+        assert_eq!(
+            session
+                .document()
+                .components
+                .iter()
+                .map(|component| (&component.kind, &component.label))
+                .collect::<Vec<_>>(),
+            imported
+                .document()
+                .components
+                .iter()
+                .map(|component| (&component.kind, &component.label))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn label_noop_preserves_redo_and_edit_after_undo_clears_redo() {
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::Output, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        session.set_label(id, "  \u{2003}").unwrap();
+        session.undo().unwrap();
+        assert_eq!(session.document.components[0].label, "Output");
+        assert_eq!(session.redo.len(), 1);
+        let before = snapshot(&session);
+        session.set_label(id, "Output").unwrap();
+        assert_unchanged(&session, &before);
+        session.redo().unwrap();
+        assert_eq!(session.document.components[0].label, "  \u{2003}");
+        session.undo().unwrap();
+        session.set_label(id, "Renamed").unwrap();
+        assert!(session.redo.is_empty());
+        assert_eq!(session.document.components[0].label, "Renamed");
+    }
+
+    #[test]
+    fn label_mutation_is_locked_before_validation_and_preserves_runtime() {
+        let mut session = Session::default();
+        let (input, _, output) = wired_not(&mut session);
+        session.start_simulation().unwrap();
+        session.settle_simulation(100).unwrap();
+        let value = session.inspect().unwrap().output_value(output);
+        let before = snapshot(&session);
+        assert_eq!(
+            session.set_label(input, "ok"),
+            Err(EditError::SimulationActive)
+        );
+        assert_eq!(
+            session.set_label(input, "Input"),
+            Err(EditError::SimulationActive)
+        );
+        assert_eq!(
+            session.set_label(ComponentId(u64::MAX), "\0"),
+            Err(EditError::SimulationActive)
+        );
+        assert_eq!(
+            session.set_label(input, "\0"),
+            Err(EditError::SimulationActive)
+        );
+        assert_unchanged(&session, &before);
+        assert!(session.simulation_active());
+        assert_eq!(session.inspect().unwrap().output_value(output), value);
+    }
+
     #[test]
     fn history_and_branch_ids() {
         let mut s = Session::default();

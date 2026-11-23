@@ -1,5 +1,48 @@
 //! Editable component documents.
 #![allow(dead_code)] // Wire editing is exposed to the UI in a later stage.
+
+pub const MAX_LABEL_BYTES: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabelError {
+    TooLong { bytes: usize },
+    InvalidXmlCharacter { character: char },
+}
+impl std::fmt::Display for LabelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong { bytes } => write!(
+                f,
+                "Label is {bytes} UTF-8 bytes; maximum is {MAX_LABEL_BYTES}"
+            ),
+            Self::InvalidXmlCharacter { character } => write!(
+                f,
+                "Label contains character U+{:04X}, which XML 1.0 cannot represent",
+                *character as u32
+            ),
+        }
+    }
+}
+impl std::error::Error for LabelError {}
+
+/// Validate exactly the XML 1.0 character repertoire used by `.dig` labels. Unicode whitespace
+/// is meaningful and is deliberately neither trimmed nor rejected.
+pub fn validate_label(label: &str) -> Result<(), LabelError> {
+    if label.len() > MAX_LABEL_BYTES {
+        return Err(LabelError::TooLong { bytes: label.len() });
+    }
+    for character in label.chars() {
+        let code = character as u32;
+        let allowed = matches!(code, 0x9 | 0xA | 0xD)
+            || (0x20..=0xD7FF).contains(&code)
+            || (0xE000..=0xFFFD).contains(&code)
+            || (0x10000..=0x10FFFF).contains(&code);
+        if !allowed {
+            return Err(LabelError::InvalidXmlCharacter { character });
+        }
+    }
+    Ok(())
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,4 +109,37 @@ pub struct Component {
 pub struct Document {
     pub components: Vec<Component>,
     pub wires: Vec<Wire>,
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn label_limits_are_utf8_bytes_and_xml_10_characters_without_trimming() {
+        assert!(validate_label("").is_ok());
+        assert!(validate_label(" \u{2003}\t\n\r").is_ok());
+        assert!(validate_label(&"é".repeat(2048)).is_ok());
+        assert!(matches!(
+            validate_label(&format!("{}x", "é".repeat(2048))),
+            Err(LabelError::TooLong { bytes: 4097 })
+        ));
+        assert!(matches!(
+            validate_label(&"é".repeat(2049)),
+            Err(LabelError::TooLong { bytes: 4098 })
+        ));
+        assert!(matches!(
+            validate_label(&"x".repeat(4097)),
+            Err(LabelError::TooLong { bytes: 4097 })
+        ));
+        for forbidden in [
+            '\u{0}', '\u{1}', '\u{8}', '\u{B}', '\u{C}', '\u{1F}', '\u{FFFE}', '\u{FFFF}',
+        ] {
+            assert!(matches!(
+                validate_label(&forbidden.to_string()),
+                Err(LabelError::InvalidXmlCharacter { .. })
+            ));
+        }
+        assert!(validate_label("tab\tline\nreturn\r & < > 💡").is_ok());
+    }
 }
