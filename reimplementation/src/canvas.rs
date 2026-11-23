@@ -1,4 +1,4 @@
-//! Toolkit-neutral, bounded canvas camera and world-to-screen mapping.
+//! Bounded canvas camera and world-to-screen mapping, independent of the circuit session.
 //!
 //! Camera state is transient view state: it is never part of the document or engine history.
 //! The camera is anchored at a world point and a canvas-relative screen point, which keeps fitting

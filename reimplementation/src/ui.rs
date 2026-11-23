@@ -1038,7 +1038,7 @@ impl DigitalApp {
                 });
             });
             ui.horizontal_wrapped(|ui| {
-                let nav_enabled = self.drag.is_none();
+                let nav_enabled = self.drag.is_none() && !self.modality_active();
                 if ui.add_enabled(nav_enabled, egui::Button::new("− Zoom out")).on_hover_text("Zoom out (−)").clicked() { self.view_action = Some(ViewAction::ZoomOut); }
                 if ui.add_enabled(nav_enabled, egui::Button::new("+ Zoom in")).on_hover_text("Zoom in (+)").clicked() { self.view_action = Some(ViewAction::ZoomIn); }
                 if ui.add_enabled(nav_enabled, egui::Button::new("Fit")).on_hover_text("Fit circuit (F)").clicked() { self.view_action = Some(ViewAction::Fit); }
@@ -1239,9 +1239,18 @@ impl DigitalApp {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
             let painter = ui.painter_at(rect);
+            if self.modality_active() {
+                self.view_action = None;
+            }
             if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 { self.canvas_rect = None; return; }
             self.canvas_rect = Some(rect);
-            if let Some(action) = self.view_action.take().filter(|_| self.drag.is_none()) {
+            // A queued navigation action may outlive the frame/UI event that created it.
+            // Revalidate modality at the point of execution, just like the toolbar controls.
+            if let Some(action) = self
+                .view_action
+                .take()
+                .filter(|_| self.drag.is_none() && !self.modality_active())
+            {
                 match action {
                     ViewAction::Reset => self.view.reset(),
                     ViewAction::ZoomIn | ViewAction::ZoomOut => {
@@ -1274,7 +1283,9 @@ impl DigitalApp {
                 self.placing = None;
                 self.wire_start = None;
             }
-            let pan_start = (!cancelled && self.drag.is_none()).then(|| ctx.input(|i| i.events.iter().find_map(|event| match event {
+            // Gesture ownership is acquired only when unowned. A chorded/extra press must
+            // never replace the button whose release terminates the current pan.
+            let pan_start = (self.pan_owner.is_none() && !cancelled && self.drag.is_none()).then(|| ctx.input(|i| i.events.iter().find_map(|event| match event {
                 egui::Event::PointerButton { pos, button: egui::PointerButton::Middle, pressed: true, .. } if rect.contains(*pos) => Some((egui::PointerButton::Middle, *pos)),
                 egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers, .. } if modifiers.alt && rect.contains(*pos) => Some((egui::PointerButton::Primary, *pos)),
                 _ => None,
@@ -2430,6 +2441,54 @@ mod tests {
         assert_eq!(*app.session.document(), before);
     }
     #[test]
+    fn file_and_label_modals_reject_toolbar_and_stale_camera_actions() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let rect = camera_rect(&ctx, &mut app);
+        assert!(app.view.zoom_at(rect, rect.center(), 2.0));
+        click_text(&ctx, &mut app, "Save As");
+        assert!(matches!(app.file_modal, Some(FileModal::SavePath { .. })));
+        type_file_path(&ctx, &mut app, "pending.dig");
+        assert_eq!(app.file_path_entry, "pending.dig");
+        let snapshot = app.view;
+        for label in ["Reset", "Fit", "+ Zoom in", "− Zoom out"] {
+            click_text(&ctx, &mut app, label);
+            assert_eq!(app.view, snapshot, "file modal blocks {label}");
+        }
+        app.view_action = Some(ViewAction::Reset);
+        let _ = frame(&ctx, &mut app, vec![], true);
+        assert_eq!(
+            app.view, snapshot,
+            "stale queued action is rejected under file modality"
+        );
+        assert_eq!(
+            app.view_action, None,
+            "rejected queued actions are discarded"
+        );
+        assert!(matches!(app.file_modal, Some(FileModal::SavePath { .. })));
+        assert_eq!(app.file_path_entry, "pending.dig");
+
+        app.file_modal = None;
+        let id = app
+            .session
+            .place(ComponentKind::Output, Position { x: 0., y: 0. })
+            .unwrap();
+        app.selected = Some(id);
+        app.begin_label_edit();
+        assert!(app.label_modal.is_some());
+        app.view_action = Some(ViewAction::Fit);
+        let _ = frame(&ctx, &mut app, vec![], true);
+        assert_eq!(
+            app.view, snapshot,
+            "stale queued action is rejected under label modality"
+        );
+        assert_eq!(app.view_action, None);
+        for label in ["Reset", "Fit", "+ Zoom in", "− Zoom out"] {
+            click_text(&ctx, &mut app, label);
+            assert_eq!(app.view, snapshot, "label modal blocks {label}");
+        }
+    }
+    #[test]
     fn pan_owns_its_button_and_suppresses_canvas_edits_until_release() {
         for owner in [egui::PointerButton::Middle, egui::PointerButton::Primary] {
             let ctx = egui::Context::default();
@@ -2511,6 +2570,161 @@ mod tests {
             assert!(
                 app.wiring && app.wire_start.is_some(),
                 "pending wire intent survives navigation"
+            );
+        }
+    }
+    #[test]
+    fn camera_lifecycle_save_history_simulation_and_open_outcomes() {
+        let dir = test_dir("camera-lifecycle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = ui_file_app(&dir);
+        let id = app
+            .session
+            .place(ComponentKind::Input, Position { x: 600., y: 400. })
+            .unwrap();
+        let path = dir.join("camera.dig");
+        app.save_as_path(path.clone(), false, false);
+        assert!(path.exists());
+        let rect = camera_rect(&ctx, &mut app);
+        assert!(app.view.zoom_at(rect, rect.center(), 2.0));
+        assert!(app.view.pan(Vec2::new(30., -12.)));
+        let view = app.view;
+
+        app.session.undo().unwrap();
+        app.session.redo().unwrap();
+        assert_eq!(
+            app.view, view,
+            "document history does not affect the camera"
+        );
+        app.apply_simulation_action(SimAction::Start);
+        assert!(app.session.simulation_active());
+        app.apply_simulation_action(SimAction::Stop);
+        assert_eq!(
+            app.view, view,
+            "simulation lifecycle does not affect the camera"
+        );
+        app.save_current(false);
+        assert_eq!(app.view, view, "save does not affect the camera");
+
+        app.pending_action = Some(PendingAction::Open(dir.join("missing.dig")));
+        app.complete_pending();
+        assert_eq!(app.view, view, "failed Open preserves the camera");
+        assert!(app.pending_action.is_some());
+        app.pending_action = None;
+        app.open_path_dialog();
+        type_file_path(&ctx, &mut app, "cancelled.dig");
+        click_text(&ctx, &mut app, "Cancel path");
+        assert!(app.file_modal.is_none());
+        assert_eq!(app.view, view, "cancelled Open preserves the camera");
+
+        app.pending_action = Some(PendingAction::New);
+        app.complete_pending();
+        assert_eq!(
+            app.view,
+            CanvasViewState::default(),
+            "New resets the camera"
+        );
+        app.pending_action = Some(PendingAction::Open(path));
+        app.complete_pending();
+        assert!(app.fit_view_pending, "successful Open schedules fit");
+        assert_eq!(app.session.document().components[0].id, id);
+        let _ = camera_rect(&ctx, &mut app);
+        assert!(!app.fit_view_pending);
+        let rect = app.canvas_rect.unwrap();
+        let component = app.session.document().components.first().unwrap();
+        let layout = SymbolLayout::centered_on(
+            app.style,
+            component.kind,
+            [component.position.x, component.position.y],
+        )
+        .unwrap();
+        let transform = app.view.transform(rect).unwrap();
+        assert!(rect.contains(transform.to_screen(layout.bounds().min)));
+        assert!(rect.contains(transform.to_screen(layout.bounds().max)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn additional_chorded_press_cannot_steal_pan_ownership_in_either_order() {
+        for (owner, extra, owner_modifiers) in [
+            (
+                egui::PointerButton::Middle,
+                egui::PointerButton::Primary,
+                egui::Modifiers::NONE,
+            ),
+            (
+                egui::PointerButton::Primary,
+                egui::PointerButton::Middle,
+                egui::Modifiers::ALT,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = DigitalApp::default();
+            let id = app
+                .session
+                .place(ComponentKind::Input, Position { x: 80., y: 80. })
+                .unwrap();
+            let rect = camera_rect(&ctx, &mut app);
+            let point = app.view.transform(rect).unwrap().to_screen([80., 80.]);
+            frame(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    pointer_button(point, owner, true, owner_modifiers),
+                ],
+                true,
+            );
+            assert_eq!(app.pan_owner, Some(owner));
+
+            let extra_modifiers = if extra == egui::PointerButton::Primary {
+                egui::Modifiers::ALT
+            } else {
+                egui::Modifiers::NONE
+            };
+            frame(
+                &ctx,
+                &mut app,
+                vec![pointer_button(point, extra, true, extra_modifiers)],
+                true,
+            );
+            assert_eq!(
+                app.pan_owner,
+                Some(owner),
+                "extra press cannot steal the gesture"
+            );
+            frame(
+                &ctx,
+                &mut app,
+                vec![pointer_button(point, extra, false, extra_modifiers)],
+                true,
+            );
+            assert_eq!(
+                app.pan_owner,
+                Some(owner),
+                "extra release cannot finish the gesture"
+            );
+            assert_eq!(app.selected, None, "chorded actions remain navigation-only");
+            assert_eq!(
+                app.session.document().components[0].position,
+                Position { x: 80., y: 80. }
+            );
+
+            frame(
+                &ctx,
+                &mut app,
+                vec![pointer_button(point, owner, false, egui::Modifiers::NONE)],
+                true,
+            );
+            assert_eq!(
+                app.pan_owner, None,
+                "only the owner release ends navigation"
+            );
+            click_at(&ctx, &mut app, point);
+            assert_eq!(
+                app.selected,
+                Some(id),
+                "ordinary pointer interaction resumes after owner release"
             );
         }
     }
@@ -3266,6 +3480,125 @@ mod tests {
         );
         frame(&ctx, &mut app, vec![button(p, false)], true);
         assert!(app.selected.is_some());
+    }
+    #[test]
+    fn transformed_symbol_and_wire_picking_keep_screen_space_tolerances() {
+        for zoom in [0.5, 3.0] {
+            let ctx = egui::Context::default();
+            let mut app = DigitalApp::default();
+            let rect = camera_rect(&ctx, &mut app);
+            let anchor = app.view.transform(rect).unwrap().to_world(rect.center());
+            let input_position = Position {
+                x: anchor[0],
+                y: anchor[1],
+            };
+            let output_position = Position {
+                x: anchor[0] + 100.,
+                y: anchor[1],
+            };
+            let input = app
+                .session
+                .place(ComponentKind::Input, input_position)
+                .unwrap();
+            let output = app
+                .session
+                .place(ComponentKind::Output, output_position)
+                .unwrap();
+            let pins = [
+                PinRef {
+                    component: input,
+                    pin: PinId {
+                        direction: PinDirection::Output,
+                        index: 0,
+                    },
+                },
+                PinRef {
+                    component: output,
+                    pin: PinId {
+                        direction: PinDirection::Input,
+                        index: 0,
+                    },
+                },
+            ];
+            let wire = app.session.connect(pins).unwrap();
+            assert!(app.view.zoom_at(rect, rect.center(), zoom));
+            assert!(app.view.pan(Vec2::new(17., -9.)));
+            let rect = camera_rect(&ctx, &mut app);
+            let transform = app.view.transform(rect).unwrap();
+            let symbol = SymbolLayout::centered_on(
+                app.style,
+                ComponentKind::Input,
+                [input_position.x, input_position.y],
+            )
+            .unwrap();
+            let bounds = symbol.bounds();
+            let inside = transform
+                .to_screen([bounds.max[0], (bounds.min[1] + bounds.max[1]) * 0.5])
+                + Vec2::new(1.75, 0.);
+            click_at(&ctx, &mut app, inside);
+            assert_eq!(
+                app.selected,
+                Some(input),
+                "symbol pick includes 1.75 screen points at zoom {zoom}; point={inside:?}, rect={rect:?}, world={:?}, bounds={bounds:?}",
+                transform.to_world(inside)
+            );
+            let outside = transform
+                .to_screen([bounds.max[0], (bounds.min[1] + bounds.max[1]) * 0.5])
+                + Vec2::new(2.25, 0.);
+            click_at(&ctx, &mut app, outside);
+            assert_eq!(
+                app.selected, None,
+                "symbol pick excludes 2.25 screen points at zoom {zoom}"
+            );
+
+            let a = SymbolLayout::centered_on(
+                app.style,
+                ComponentKind::Input,
+                [input_position.x, input_position.y],
+            )
+            .unwrap()
+            .pin_position(pins[0].pin)
+            .unwrap();
+            let b = SymbolLayout::centered_on(
+                app.style,
+                ComponentKind::Output,
+                [output_position.x, output_position.y],
+            )
+            .unwrap()
+            .pin_position(pins[1].pin)
+            .unwrap();
+            let path = crate::wire_geometry::path((pins[0], a), (pins[1], b));
+            let (from, to) = path
+                .windows(2)
+                .max_by(|a, b| {
+                    Pos2::new(a[0][0], a[0][1])
+                        .distance(Pos2::new(a[1][0], a[1][1]))
+                        .total_cmp(
+                            &Pos2::new(b[0][0], b[0][1]).distance(Pos2::new(b[1][0], b[1][1])),
+                        )
+                })
+                .map(|pair| (pair[0], pair[1]))
+                .unwrap();
+            let mid = [(from[0] + to[0]) * 0.5, (from[1] + to[1]) * 0.5];
+            let along = if (to[0] - from[0]).abs() >= (to[1] - from[1]).abs() {
+                Vec2::new(0., 1.)
+            } else {
+                Vec2::new(1., 0.)
+            };
+            let wire_inside = transform.to_screen(mid) + along * 5.5;
+            click_at(&ctx, &mut app, wire_inside);
+            assert_eq!(
+                app.selected_wire,
+                Some(wire),
+                "wire pick includes 5.5 screen points at zoom {zoom}"
+            );
+            let wire_outside = transform.to_screen(mid) + along * 6.5;
+            click_at(&ctx, &mut app, wire_outside);
+            assert_eq!(
+                app.selected_wire, None,
+                "wire pick excludes 6.5 screen points at zoom {zoom}"
+            );
+        }
     }
     fn pin_ref(component: ComponentId, direction: PinDirection, index: u8) -> PinRef {
         PinRef {
