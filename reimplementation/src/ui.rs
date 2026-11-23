@@ -191,6 +191,13 @@ impl DigitalApp {
         self.drag = None;
     }
     fn begin_pending(&mut self, action: PendingAction) {
+        // A published warning is an acknowledgement barrier. In particular, a window-manager
+        // close must not replace the New/Open continuation attached to the warning.
+        if action == PendingAction::Close
+            && matches!(self.file_modal, Some(FileModal::PublishedWarning { .. }))
+        {
+            return;
+        }
         if self.session.simulation_active() && !matches!(action, PendingAction::Close) {
             self.error = Some("Stop the simulation before changing files".into());
             return;
@@ -2598,6 +2605,67 @@ mod tests {
     fn ui_file_app(dir: &std::path::Path) -> DigitalApp {
         DigitalApp::with_file_io(Some(Box::new(LocalFileIo::new(dir))), None)
     }
+
+    struct PostPublishFailureIo(LocalFileIo);
+    struct DelegatingStage(Box<dyn crate::file_session::StagedFile>);
+    impl crate::file_session::StagedFile for DelegatingStage {
+        fn path(&self) -> &std::path::Path {
+            self.0.path()
+        }
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.write_all(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+        fn sync_close(self: Box<Self>) -> std::io::Result<()> {
+            self.0.sync_close()
+        }
+    }
+    impl FileIo for PostPublishFailureIo {
+        fn base_dir(&self) -> &std::path::Path {
+            self.0.base_dir()
+        }
+        fn read_bounded_regular(
+            &mut self,
+            path: &std::path::Path,
+            limit: usize,
+        ) -> std::io::Result<Vec<u8>> {
+            self.0.read_bounded_regular(path, limit)
+        }
+        fn validate_target(
+            &mut self,
+            target: &std::path::Path,
+            intent: SaveAsIntent,
+        ) -> std::io::Result<()> {
+            self.0.validate_target(target, intent)
+        }
+        fn create_temp(
+            &mut self,
+            path: &std::path::Path,
+        ) -> std::io::Result<Box<dyn crate::file_session::StagedFile>> {
+            self.0.create_temp(path).map(|stage| {
+                Box::new(DelegatingStage(stage)) as Box<dyn crate::file_session::StagedFile>
+            })
+        }
+        fn publish(
+            &mut self,
+            temp: &std::path::Path,
+            target: &std::path::Path,
+            intent: SaveAsIntent,
+        ) -> std::io::Result<()> {
+            self.0.publish(temp, target, intent)
+        }
+        fn sync_parent(&mut self, parent: &std::path::Path) -> std::io::Result<()> {
+            self.0.sync_parent(parent)
+        }
+        fn remove_temp(&mut self, _temp: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::other(
+                "injected post-publish cleanup failure",
+            ))
+        }
+    }
+
     fn test_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("digital-ui-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2890,6 +2958,156 @@ mod tests {
         click_text(&ctx, &mut app, "Discard");
         assert!(app.approved_close);
         assert_eq!(app.session.document().components.len(), 1);
+    }
+
+    #[test]
+    fn published_warning_close_keeps_original_open_continuation_until_acknowledged() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("published-warning-close");
+        let destination = dir.join("destination.dig");
+        let mut destination_session = Session::default();
+        destination_session
+            .place(ComponentKind::Output, Position { x: 40., y: 50. })
+            .unwrap();
+        destination_session
+            .save_as(
+                &mut LocalFileIo::new(&dir),
+                &destination,
+                SaveAsIntent::CreateOnly,
+            )
+            .unwrap();
+
+        let mut app = DigitalApp::with_file_io(
+            Some(Box::new(PostPublishFailureIo(LocalFileIo::new(&dir)))),
+            None,
+        );
+        app.session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        app.begin_pending(PendingAction::Open(destination.clone()));
+        assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
+        app.begin_save(true);
+        app.file_path_entry = "current.dig".into();
+        click_text(&ctx, &mut app, "Save path");
+
+        assert!(destination.exists());
+        assert!(dir.join("current.dig").exists());
+        assert!(
+            !app.session.dirty(),
+            "the published save commits the baseline"
+        );
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Open(destination.clone()))
+        );
+        assert!(matches!(
+            app.file_modal,
+            Some(FileModal::PublishedWarning {
+                continuation: true,
+                ..
+            })
+        ));
+        let warning_frame = frame(&ctx, &mut app, vec![], true);
+        assert!(has_text(
+            &warning_frame,
+            "Published; durability unconfirmed"
+        ));
+        let close_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
+            focused: true,
+            viewports: [(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let output = ctx.run(close_input, |ctx| app.show(ctx));
+        assert!(!app.approved_close);
+        assert_eq!(
+            app.pending_action,
+            Some(PendingAction::Open(destination.clone()))
+        );
+        assert!(matches!(
+            app.file_modal,
+            Some(FileModal::PublishedWarning {
+                continuation: true,
+                ..
+            })
+        ));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert_eq!(
+            app.session.document().components[0].kind,
+            ComponentKind::Input
+        );
+
+        click_text(&ctx, &mut app, "Acknowledge and continue");
+        assert_eq!(
+            app.session.document().components[0].kind,
+            ComponentKind::Output
+        );
+        assert_eq!(app.session.path(), Some(destination.as_path()));
+        assert!(app.pending_action.is_none());
+        assert!(app.file_modal.is_none());
+        assert!(
+            !app.approved_close,
+            "the original Open, not Close, continues"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn close_without_pending_warning_continuation_only_dismisses_after_ack() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp {
+            file_modal: Some(FileModal::PublishedWarning {
+                diagnostics: vec!["post-publish warning".into()],
+                continuation: false,
+            }),
+            pending_action: None,
+            ..Default::default()
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
+            focused: true,
+            viewports: [(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| app.show(ctx));
+        assert!(!app.approved_close);
+        assert!(app.pending_action.is_none());
+        assert!(matches!(
+            app.file_modal,
+            Some(FileModal::PublishedWarning {
+                continuation: false,
+                ..
+            })
+        ));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        click_text(&ctx, &mut app, "Acknowledge and continue");
+        assert!(app.file_modal.is_none());
+        assert!(!app.approved_close);
+        assert!(app.pending_action.is_none());
     }
 
     #[test]
