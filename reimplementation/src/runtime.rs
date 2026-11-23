@@ -382,9 +382,17 @@ impl Runtime {
     }
     fn trace_frontier_remaining(&self) -> usize {
         if self.startup_phase != StartupPhase::Running {
-            self.startup_frontier
+            let remaining = self
+                .startup_frontier
                 .len()
-                .saturating_sub(self.startup_cursor)
+                .saturating_sub(self.startup_cursor);
+            // At a completed startup frontier, the next call may install and evaluate the
+            // queued successor before returning. Include it in the preflight reservation.
+            if remaining == 0 {
+                self.startup_next.len()
+            } else {
+                remaining
+            }
         } else {
             // Normal frontiers publish every gate's value together when the last remaining
             // gate evaluates, including values staged by prior calls.
@@ -2475,6 +2483,92 @@ mod tests {
         let before = snapshot(&runtime, &doc);
         assert_eq!(runtime.step(), StepOutcome::TraceSequenceExhausted);
         assert_eq!(snapshot(&runtime, &doc), before);
+    }
+
+    fn completed_startup_frontier_with_successor() -> (Document, Runtime) {
+        let mut kinds = Vec::new();
+        let mut wires = Vec::new();
+        for id in 1..=8 {
+            kinds.push((id, ComponentKind::Not));
+            wires.push((out(id), inp(id, 0)));
+        }
+        let doc = document(&kinds, &wires);
+        let mut runtime =
+            Runtime::start_with_trace(&doc, 17, crate::trace::TraceLog::new(128, 17, 0).unwrap())
+                .unwrap();
+        assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 0 });
+        for _ in 0..8 {
+            assert_eq!(runtime.step(), StepOutcome::Stepped { evaluated: 1 });
+        }
+        assert_eq!(runtime.startup_cursor, runtime.startup_frontier.len());
+        assert_eq!(runtime.startup_next.len(), 8);
+        (doc, runtime)
+    }
+
+    #[test]
+    fn startup_successor_frontier_trace_headroom_is_preflighted() {
+        for bounded in [false, true] {
+            let (doc, mut runtime) = completed_startup_frontier_with_successor();
+            runtime.force_trace_sequence_for_test(u64::MAX - 5);
+            let before_values = snapshot(&runtime, &doc);
+            let before_pending = runtime.pending_inspection();
+            let before_frontier = runtime.startup_frontier.clone();
+            let before_next = runtime.startup_next.clone();
+            let before_cursor = runtime.startup_cursor;
+            let before_queued = runtime.startup_queued.clone();
+            let before_batch_pending = runtime.startup_batch_pending;
+            let before_shuffled = runtime.startup_frontier_shuffled;
+            let before_phase = runtime.startup_phase;
+            let before_detector_active = runtime.detector.is_some();
+            let before_microstep_active = runtime.microstep_active;
+            let before_rng = runtime.rng.0;
+            let before_trace = runtime
+                .trace
+                .as_ref()
+                .unwrap()
+                .records()
+                .collect::<Vec<_>>();
+
+            if bounded {
+                assert_eq!(
+                    runtime.micro_step_bounded(100),
+                    SettleOutcome::TraceSequenceExhausted { work: 0 }
+                );
+            } else {
+                assert_eq!(runtime.micro_step(), StepOutcome::TraceSequenceExhausted);
+            }
+            assert_eq!(snapshot(&runtime, &doc), before_values);
+            assert_eq!(runtime.pending_inspection(), before_pending);
+            assert_eq!(runtime.startup_frontier, before_frontier);
+            assert_eq!(runtime.startup_next, before_next);
+            assert_eq!(runtime.startup_cursor, before_cursor);
+            assert_eq!(runtime.startup_queued, before_queued);
+            assert_eq!(runtime.startup_batch_pending, before_batch_pending);
+            assert_eq!(runtime.startup_frontier_shuffled, before_shuffled);
+            assert_eq!(runtime.startup_phase, before_phase);
+            assert_eq!(runtime.detector.is_some(), before_detector_active);
+            assert_eq!(runtime.microstep_active, before_microstep_active);
+            assert_eq!(runtime.rng.0, before_rng);
+            assert_eq!(
+                runtime
+                    .trace
+                    .as_ref()
+                    .unwrap()
+                    .records()
+                    .collect::<Vec<_>>(),
+                before_trace
+            );
+
+            runtime.force_trace_sequence_for_test(u64::MAX - 100);
+            if bounded {
+                assert!(matches!(
+                    runtime.micro_step_bounded(100),
+                    SettleOutcome::Settled { work: 9 }
+                ));
+            } else {
+                assert_eq!(runtime.micro_step(), StepOutcome::Stepped { evaluated: 8 });
+            }
+        }
     }
 
     #[test]
