@@ -17,10 +17,100 @@ pub enum SaveAsIntent {
     CreateOnly,
     Replace,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileStage {
+    ResolvePath,
+    ValidateTarget,
+    Read,
+    CreateTemp,
+    Write,
+    Flush,
+    SyncFile,
+    Publish,
+    RemoveTemp,
+    SyncParent,
+}
+impl std::fmt::Display for FileStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ResolvePath => "resolve path",
+            Self::ValidateTarget => "validate target",
+            Self::Read => "read",
+            Self::CreateTemp => "create staging file",
+            Self::Write => "write staging file",
+            Self::Flush => "flush staging file",
+            Self::SyncFile => "sync staging file",
+            Self::Publish => "publish",
+            Self::RemoveTemp => "remove staging file",
+            Self::SyncParent => "sync parent directory",
+        })
+    }
+}
+#[derive(Debug)]
+pub struct FileOperationError {
+    pub stage: FileStage,
+    pub path: PathBuf,
+    pub source: io::Error,
+}
+impl std::fmt::Display for FileOperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} '{}' failed: {}",
+            self.stage,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+impl std::error::Error for FileOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+#[derive(Debug)]
+pub struct FileDiagnostic {
+    pub stage: FileStage,
+    pub path: PathBuf,
+    pub source: io::Error,
+}
+impl std::fmt::Display for FileDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} '{}' failed: {}",
+            self.stage,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+impl std::error::Error for FileDiagnostic {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+#[derive(Debug)]
 pub enum PublishOutcome {
     Published,
-    PublishedDurabilityUnconfirmed(String),
+    PublishedDurabilityUnconfirmed(Vec<FileDiagnostic>),
+}
+impl PartialEq for PublishOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Published, Self::Published) => true,
+            (Self::PublishedDurabilityUnconfirmed(a), Self::PublishedDurabilityUnconfirmed(b)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(a, b)| {
+                        a.stage == b.stage
+                            && a.path == b.path
+                            && a.source.kind() == b.source.kind()
+                            && a.source.to_string() == b.source.to_string()
+                    })
+            }
+            _ => false,
+        }
+    }
 }
 
 pub trait StagedFile {
@@ -196,6 +286,8 @@ pub fn publish_bytes(
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| {
             PublishFailure::not_published(
+                FileStage::ValidateTarget,
+                target.to_path_buf(),
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "target has no parent directory",
@@ -203,8 +295,9 @@ pub fn publish_bytes(
                 None,
             )
         })?;
-    io.validate_target(target, intent)
-        .map_err(|e| PublishFailure::not_published(e, None))?;
+    io.validate_target(target, intent).map_err(|e| {
+        PublishFailure::not_published(FileStage::ValidateTarget, target.to_path_buf(), e, None)
+    })?;
     let mut staged = None;
     let mut collision = None;
     for _ in 0..TEMP_ATTEMPTS {
@@ -215,85 +308,154 @@ pub fn publish_bytes(
                 staged = Some(file);
                 break;
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => collision = Some(e),
-            Err(e) => return Err(PublishFailure::not_published(e, None)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => collision = Some((candidate, e)),
+            Err(e) => {
+                return Err(PublishFailure::not_published(
+                    FileStage::CreateTemp,
+                    candidate,
+                    e,
+                    None,
+                ));
+            }
         }
     }
     let Some(mut file) = staged else {
-        return Err(PublishFailure::not_published(
-            collision.unwrap_or_else(|| {
+        let (path, error) = collision.unwrap_or_else(|| {
+            (
+                target.to_path_buf(),
                 io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "could not reserve unique staging file",
-                )
-            }),
+                ),
+            )
+        });
+        return Err(PublishFailure::not_published(
+            FileStage::CreateTemp,
+            path,
+            error,
             None,
         ));
     };
     let temp = file.path().to_path_buf();
     if let Err(primary) = file.write_all(bytes) {
         drop(file);
+        let cleanup = io
+            .remove_temp(&temp)
+            .err()
+            .map(|source| (FileStage::RemoveTemp, temp.clone(), source));
         return Err(PublishFailure::not_published(
+            FileStage::Write,
+            temp,
             primary,
-            io.remove_temp(&temp).err(),
+            cleanup,
         ));
     }
     if let Err(primary) = file.flush() {
         drop(file);
+        let cleanup = io
+            .remove_temp(&temp)
+            .err()
+            .map(|source| (FileStage::RemoveTemp, temp.clone(), source));
         return Err(PublishFailure::not_published(
+            FileStage::Flush,
+            temp,
             primary,
-            io.remove_temp(&temp).err(),
+            cleanup,
         ));
     }
     if let Err(primary) = file.sync_close() {
+        let cleanup = io
+            .remove_temp(&temp)
+            .err()
+            .map(|source| (FileStage::RemoveTemp, temp.clone(), source));
         return Err(PublishFailure::not_published(
+            FileStage::SyncFile,
+            temp,
             primary,
-            io.remove_temp(&temp).err(),
+            cleanup,
         ));
     }
     if let Err(primary) = io.publish(&temp, target, intent) {
+        let cleanup = io
+            .remove_temp(&temp)
+            .err()
+            .map(|source| (FileStage::RemoveTemp, temp.clone(), source));
         return Err(PublishFailure::not_published(
+            FileStage::Publish,
+            target.to_path_buf(),
             primary,
-            io.remove_temp(&temp).err(),
+            cleanup,
         ));
     }
-    let cleanup = if intent == SaveAsIntent::CreateOnly {
-        io.remove_temp(&temp).err()
-    } else {
-        None
-    };
-    let mut warning = io
-        .sync_parent(parent)
-        .err()
-        .map(|e| format!("parent directory sync failed: {e}"));
-    if let Some(e) = cleanup {
-        warning.get_or_insert_with(|| format!("published temporary link cleanup failed: {e}"));
+    let mut warnings = Vec::new();
+    if intent == SaveAsIntent::CreateOnly
+        && let Err(source) = io.remove_temp(&temp)
+    {
+        warnings.push(FileDiagnostic {
+            stage: FileStage::RemoveTemp,
+            path: temp.clone(),
+            source,
+        });
     }
-    Ok(warning.map_or(
-        PublishOutcome::Published,
-        PublishOutcome::PublishedDurabilityUnconfirmed,
-    ))
+    if let Err(source) = io.sync_parent(parent) {
+        warnings.push(FileDiagnostic {
+            stage: FileStage::SyncParent,
+            path: parent.to_path_buf(),
+            source,
+        });
+    }
+    Ok(if warnings.is_empty() {
+        PublishOutcome::Published
+    } else {
+        PublishOutcome::PublishedDurabilityUnconfirmed(warnings)
+    })
 }
 #[derive(Debug)]
 pub struct PublishFailure {
+    pub stage: FileStage,
+    pub path: PathBuf,
     pub primary: io::Error,
-    pub cleanup: Option<io::Error>,
+    pub cleanup: Option<FileDiagnostic>,
 }
 impl PublishFailure {
-    fn not_published(primary: io::Error, cleanup: Option<io::Error>) -> Self {
-        Self { primary, cleanup }
+    fn not_published(
+        stage: FileStage,
+        path: PathBuf,
+        primary: io::Error,
+        cleanup: Option<(FileStage, PathBuf, io::Error)>,
+    ) -> Self {
+        Self {
+            stage,
+            path,
+            primary,
+            cleanup: cleanup.map(|(stage, path, source)| FileDiagnostic {
+                stage,
+                path,
+                source,
+            }),
+        }
     }
 }
 impl std::fmt::Display for PublishFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "save was not published: {}", self.primary)?;
-        if let Some(e) = &self.cleanup {
-            write!(f, "; staging cleanup also failed: {e}")?;
+        write!(
+            f,
+            "save failed during {} at '{}': {}",
+            self.stage,
+            self.path.display(),
+            self.primary
+        )?;
+        if let Some(warning) = &self.cleanup {
+            write!(f, "; cleanup also failed: {warning}")?;
         }
         Ok(())
     }
 }
-impl std::error::Error for PublishFailure {}
+impl std::error::Error for PublishFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -317,6 +479,9 @@ mod tests {
         Publish,
         SyncParent,
         Cleanup,
+        PostPublishCleanup,
+        BothPostPublish,
+        ReadPermission,
     }
     struct FaultFs {
         real: LocalFileIo,
@@ -356,6 +521,12 @@ mod tests {
             self.real.base_dir()
         }
         fn read_bounded_regular(&mut self, p: &Path, n: usize) -> io::Result<Vec<u8>> {
+            if self.fail == Fail::ReadPermission {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected read permission failure",
+                ));
+            }
             self.real.read_bounded_regular(p, n)
         }
         fn validate_target(&mut self, p: &Path, i: SaveAsIntent) -> io::Result<()> {
@@ -391,13 +562,16 @@ mod tests {
             self.real.publish(t, p, i)
         }
         fn sync_parent(&mut self, p: &Path) -> io::Result<()> {
-            if self.fail == Fail::SyncParent {
+            if matches!(self.fail, Fail::SyncParent | Fail::BothPostPublish) {
                 return Err(io::Error::other("injected directory sync failure"));
             }
             self.real.sync_parent(p)
         }
         fn remove_temp(&mut self, p: &Path) -> io::Result<()> {
-            if self.fail == Fail::Cleanup {
+            if matches!(
+                self.fail,
+                Fail::Cleanup | Fail::PostPublishCleanup | Fail::BothPostPublish
+            ) {
                 return Err(io::Error::other("injected cleanup failure"));
             }
             self.real.remove_temp(p)
@@ -444,6 +618,109 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn open_failures_retain_stage_path_and_underlying_error_kind() {
+        let dir = temp_dir("open-error-context");
+        let mut session = crate::engine::Session::default();
+        let missing = dir.join("missing.dig");
+        let error = session
+            .open_path(
+                &mut adapter(&dir, Fail::None),
+                Path::new("missing.dig"),
+                crate::file_session::DiscardIntent::DiscardDirty,
+            )
+            .unwrap_err();
+        let crate::engine::SessionDigError::File(error) = error else {
+            panic!("expected file error")
+        };
+        assert_eq!(error.stage, FileStage::Read);
+        assert_eq!(error.path, missing);
+        assert_eq!(error.source.kind(), io::ErrorKind::NotFound);
+        let denied_path = dir.join("private.dig");
+        let error = session
+            .open_path(
+                &mut adapter(&dir, Fail::ReadPermission),
+                Path::new("private.dig"),
+                crate::file_session::DiscardIntent::DiscardDirty,
+            )
+            .unwrap_err();
+        let crate::engine::SessionDigError::File(error) = error else {
+            panic!("expected file error")
+        };
+        assert_eq!(error.stage, FileStage::Read);
+        assert_eq!(error.path, denied_path);
+        assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("private.dig"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn post_publish_cleanup_failure_is_warning_and_commits_session() {
+        let dir = temp_dir("published-cleanup");
+        let mut session = crate::engine::Session::default();
+        session
+            .place(
+                crate::domain::ComponentKind::Input,
+                crate::domain::Position { x: 0.0, y: 0.0 },
+            )
+            .unwrap();
+        let target = dir.join("created.dig");
+        let outcome = session
+            .save_as(
+                &mut adapter(&dir, Fail::PostPublishCleanup),
+                Path::new("created.dig"),
+                SaveAsIntent::CreateOnly,
+            )
+            .unwrap();
+        let PublishOutcome::PublishedDurabilityUnconfirmed(warnings) = outcome else {
+            panic!("expected published-with-cleanup-warning outcome");
+        };
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].stage, FileStage::RemoveTemp);
+        assert!(warnings[0].path.exists());
+        assert!(target.exists());
+        assert!(!session.dirty());
+        assert_eq!(session.path(), Some(target.as_path()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn post_publish_cleanup_and_directory_sync_keep_both_structured_warnings_and_commit_session() {
+        let dir = temp_dir("published-cleanup-and-sync");
+        let mut session = crate::engine::Session::default();
+        session
+            .place(
+                crate::domain::ComponentKind::Input,
+                crate::domain::Position { x: 0.0, y: 0.0 },
+            )
+            .unwrap();
+        let target = dir.join("created.dig");
+        let outcome = session
+            .save_as(
+                &mut adapter(&dir, Fail::BothPostPublish),
+                Path::new("created.dig"),
+                SaveAsIntent::CreateOnly,
+            )
+            .unwrap();
+        let PublishOutcome::PublishedDurabilityUnconfirmed(warnings) = outcome else {
+            panic!("expected published-with-warnings outcome");
+        };
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].stage, FileStage::RemoveTemp);
+        assert_eq!(warnings[0].path.parent(), Some(dir.as_path()));
+        assert!(
+            warnings[0].path.exists(),
+            "leftover temp path must be reported and retained"
+        );
+        assert_eq!(warnings[1].stage, FileStage::SyncParent);
+        assert_eq!(warnings[1].path, dir);
+        assert!(
+            target.exists(),
+            "publication must succeed despite post-publish failures"
+        );
+        assert!(!session.dirty());
+        assert_eq!(session.path(), Some(target.as_path()));
+        assert!(!fs::read(target).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn retries_foreign_temp_collision_and_create_only_race_without_overwrite() {
         let dir = temp_dir("collision");
         let target = dir.join("doc.dig");
@@ -475,16 +752,18 @@ mod tests {
     fn directory_sync_failure_is_a_published_warning_and_read_is_bounded() {
         let dir = temp_dir("sync-warning");
         let target = dir.join("doc.dig");
-        assert!(matches!(
-            publish_bytes(
-                &mut adapter(&dir, Fail::SyncParent),
-                &target,
-                b"x",
-                SaveAsIntent::CreateOnly
-            )
-            .unwrap(),
-            PublishOutcome::PublishedDurabilityUnconfirmed(_)
-        ));
+        let PublishOutcome::PublishedDurabilityUnconfirmed(warnings) = publish_bytes(
+            &mut adapter(&dir, Fail::SyncParent),
+            &target,
+            b"x",
+            SaveAsIntent::CreateOnly,
+        )
+        .unwrap() else {
+            panic!("expected durability warning")
+        };
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].stage, FileStage::SyncParent);
+        assert_eq!(warnings[0].path, dir);
         assert_eq!(fs::read(&target).unwrap(), b"x");
         let mut session = crate::engine::Session::default();
         session

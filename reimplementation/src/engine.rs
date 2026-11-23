@@ -4,7 +4,8 @@ use crate::domain::{
     Component, ComponentId, ComponentKind, Document, PinRef, Position, Wire, WireId,
 };
 use crate::file_session::{
-    self, DiscardIntent, FileIo, PublishFailure, PublishOutcome, SaveAsIntent,
+    self, DiscardIntent, FileIo, FileOperationError, FileStage, PublishFailure, PublishOutcome,
+    SaveAsIntent,
 };
 use crate::formats::{self, DigReadError, DigWriteError};
 use crate::runtime::{InputChange, Runtime, RuntimeError, SettleOutcome, StepOutcome};
@@ -58,8 +59,8 @@ pub enum SessionDigError {
     Domain(formats::DomainCodecError),
     Write(DigWriteError),
     DirtyDiscardRequired,
-    Path(std::io::Error),
-    File(std::io::Error),
+    Path(FileOperationError),
+    File(FileOperationError),
 }
 impl std::fmt::Display for SessionDigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,7 +82,7 @@ impl std::error::Error for SessionDigError {}
 pub enum SaveError {
     SimulationActive,
     PathRequired,
-    Path(std::io::Error),
+    Path(FileOperationError),
     Codec(SessionDigError),
     NotPublished(PublishFailure),
 }
@@ -171,11 +172,22 @@ impl Session {
         if self.dirty() && matches!(discard, DiscardIntent::RefuseDirty) {
             return Err(SessionDigError::DirtyDiscardRequired);
         }
-        let path =
-            file_session::resolve_path(io.base_dir(), path).map_err(SessionDigError::Path)?;
+        let path = file_session::resolve_path(io.base_dir(), path).map_err(|source| {
+            SessionDigError::Path(FileOperationError {
+                stage: FileStage::ResolvePath,
+                path: path.to_path_buf(),
+                source,
+            })
+        })?;
         let bytes = io
             .read_bounded_regular(&path, file_session::MAX_OPEN_BYTES)
-            .map_err(SessionDigError::File)?;
+            .map_err(|source| {
+                SessionDigError::File(FileOperationError {
+                    stage: FileStage::Read,
+                    path: path.clone(),
+                    source,
+                })
+            })?;
         if bytes.len() > file_session::MAX_OPEN_BYTES {
             return Err(SessionDigError::Read(DigReadError {
                 kind: formats::DigReadErrorKind::InputLimit,
@@ -228,7 +240,13 @@ impl Session {
         intent: SaveAsIntent,
     ) -> Result<PublishOutcome, SaveError> {
         self.ensure_file_editable()?;
-        let target = file_session::resolve_path(io.base_dir(), path).map_err(SaveError::Path)?;
+        let target = file_session::resolve_path(io.base_dir(), path).map_err(|source| {
+            SaveError::Path(FileOperationError {
+                stage: FileStage::ResolvePath,
+                path: path.to_path_buf(),
+                source,
+            })
+        })?;
         self.save_encoded(io, target, intent)
     }
 
