@@ -80,6 +80,7 @@ pub struct TraceLog {
     len: usize,
     next_sequence: u64,
     sequence_exhausted: bool,
+    unrecorded_stop: bool,
     dropped: u64,
 }
 impl TraceLog {
@@ -112,6 +113,7 @@ impl TraceLog {
             len: 0,
             next_sequence: 1,
             sequence_exhausted: false,
+            unrecorded_stop: false,
             dropped: 0,
         })
     }
@@ -126,6 +128,13 @@ impl TraceLog {
     }
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+    /// True when simulation stopped but sequence exhaustion prevented recording `Stop`.
+    pub fn has_unrecorded_stop(&self) -> bool {
+        self.unrecorded_stop
+    }
+    pub(crate) fn mark_unrecorded_stop(&mut self) {
+        self.unrecorded_stop = true;
     }
     pub fn first_sequence(&self) -> Option<u64> {
         self.records().next().map(|r| r.sequence)

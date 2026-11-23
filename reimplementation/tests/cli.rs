@@ -71,6 +71,52 @@ fn open_validate_simulate_are_headless_read_only_and_use_relative_unicode_paths(
     assert_eq!(fs::read(path).unwrap(), original);
 }
 #[test]
+fn trace_cli_uses_actual_bounded_microstep_work_and_rejects_numeric_duplicates() {
+    let dir = TempDir::new();
+    fs::write(dir.0.join("idle.dig"), fixture("idle")).unwrap();
+    let affordable = cli(
+        &dir,
+        &["trace", "idle.dig", "--budget", "1", "--op", "micro"],
+    );
+    assert!(
+        affordable.status.success(),
+        "{}",
+        String::from_utf8_lossy(&affordable.stderr)
+    );
+    for args in [
+        vec!["trace", "missing.dig", "--budget", "1", "--budget", "2"],
+        vec![
+            "trace",
+            "missing.dig",
+            "--oscillation-limit",
+            "1",
+            "--oscillation-limit",
+            "2",
+        ],
+        vec![
+            "trace",
+            "missing.dig",
+            "--trace-capacity",
+            "1",
+            "--trace-capacity",
+            "2",
+        ],
+        vec!["trace", "missing.dig", "--budget", "+1"],
+        vec!["trace", "missing.dig", "--oscillation-limit", "+1"],
+        vec!["trace", "missing.dig", "--trace-capacity", "+1"],
+    ] {
+        let result = cli(&dir, &args);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "args={args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("cannot open document"));
+    }
+}
+
+#[test]
 fn const_cli_open_reports_both_configured_values_and_assignment_is_rejected_read_only() {
     let dir = TempDir::new();
     for value in ["0", "1"] {

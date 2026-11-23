@@ -254,6 +254,7 @@ pub struct Runtime {
     terminal: Option<OscillationDiagnostic>,
     trace: Option<TraceLog>,
     trace_stable: bool,
+    microstep_active: bool,
 }
 
 impl Runtime {
@@ -351,6 +352,7 @@ impl Runtime {
             terminal: None,
             trace: None,
             trace_stable: false,
+            microstep_active: false,
         }
     }
 
@@ -373,6 +375,24 @@ impl Runtime {
             .as_ref()
             .is_none_or(|trace| trace.can_record(count))
     }
+    fn trace_stability_records(&self) -> usize {
+        usize::from(
+            !self.trace_stable && self.startup_phase == StartupPhase::Running && !self.is_pending(),
+        )
+    }
+    fn trace_frontier_remaining(&self) -> usize {
+        if self.startup_phase != StartupPhase::Running {
+            self.startup_frontier
+                .len()
+                .saturating_sub(self.startup_cursor)
+        } else {
+            // Normal frontiers publish every gate's value together when the last remaining
+            // gate evaluates, including values staged by prior calls.
+            self.batch
+                .as_ref()
+                .map_or_else(|| self.queue.len(), |batch| batch.gates.len())
+        }
+    }
     pub fn trace(&self) -> Option<&TraceLog> {
         self.trace.as_ref()
     }
@@ -385,11 +405,21 @@ impl Runtime {
             trace.force_sequence(sequence);
         }
     }
-    pub(crate) fn trace_stop(&mut self) {
-        self.trace_event(TraceEvent::Stop);
+    #[cfg(test)]
+    pub(crate) fn force_trace_exhausted_for_test(&mut self) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.force_sequence(u64::MAX);
+            trace.record(TraceEvent::Stable);
+        }
     }
-    pub(crate) fn can_trace_stop(&self) -> bool {
-        self.trace_can_record(1)
+    pub(crate) fn trace_stop(&mut self) {
+        if let Some(trace) = self.trace.as_mut() {
+            if trace.can_record(1) {
+                trace.record(TraceEvent::Stop);
+            } else {
+                trace.mark_unrecorded_stop();
+            }
+        }
     }
     fn trace_event(&mut self, event: TraceEvent) {
         if let Some(trace) = self.trace.as_mut() {
@@ -588,11 +618,16 @@ impl Runtime {
         if let Some(diagnostic) = self.terminal.clone() {
             return StepOutcome::Oscillating { diagnostic };
         }
-        if self.is_pending()
-            && !self.trace_can_record(self.gates.len().saturating_mul(2).saturating_add(4))
-        {
+        let frontier = self.trace_frontier_remaining();
+        let required = if self.is_pending() {
+            frontier.saturating_mul(2).saturating_add(6)
+        } else {
+            self.trace_stability_records()
+        };
+        if !self.trace_can_record(required) {
             return StepOutcome::TraceSequenceExhausted;
         }
+        self.microstep_active = false;
         if self.startup_phase != StartupPhase::Running {
             let outcome = match self.advance_startup_unit() {
                 Ok(true) => StepOutcome::Stepped { evaluated: 1 },
@@ -630,11 +665,16 @@ impl Runtime {
         if let Some(diagnostic) = self.terminal.clone() {
             return StepOutcome::Oscillating { diagnostic };
         }
-        if self.is_pending()
-            && !self.trace_can_record(self.gates.len().saturating_mul(2).saturating_add(4))
-        {
+        let frontier = self.trace_frontier_remaining();
+        let required = if self.is_pending() {
+            frontier.saturating_mul(2).saturating_add(6)
+        } else {
+            self.trace_stability_records()
+        };
+        if !self.trace_can_record(required) {
             return StepOutcome::TraceSequenceExhausted;
         }
+        self.microstep_active = false;
         if self.startup_phase != StartupPhase::Running {
             if self.startup_phase == StartupPhase::ResetRelease {
                 let _ = self.advance_startup_unit();
@@ -694,9 +734,94 @@ impl Runtime {
         StepOutcome::Stepped { evaluated }
     }
 
+    /// Continues one logical microstep within the caller's per-frame work budget.
+    /// Repeated calls after `BudgetExhausted` resume the same frontier; a fresh request resets
+    /// oscillation detection once. Publication of the final gate is atomic and preflighted.
+    pub fn micro_step_bounded(&mut self, budget: usize) -> SettleOutcome {
+        if let Some(diagnostic) = self.terminal.clone() {
+            return SettleOutcome::Oscillating {
+                work: 0,
+                diagnostic,
+            };
+        }
+        if budget == 0 {
+            return SettleOutcome::BudgetExhausted { work: 0 };
+        }
+        let remaining_frontier = self.trace_frontier_remaining();
+        let required = if self.is_pending() {
+            remaining_frontier.saturating_mul(2).saturating_add(6)
+        } else {
+            self.trace_stability_records()
+        };
+        if !self.trace_can_record(required) {
+            return SettleOutcome::TraceSequenceExhausted { work: 0 };
+        }
+        if !self.microstep_active {
+            self.detector = None;
+            self.microstep_active = true;
+        }
+        let mut work = 0;
+        while self.startup_phase == StartupPhase::Running {
+            if !self.is_pending() {
+                self.microstep_active = false;
+                self.trace_stability_if_reached();
+                return SettleOutcome::Settled { work };
+            }
+            if work == budget {
+                return SettleOutcome::BudgetExhausted { work };
+            }
+            if self.batch.is_none() {
+                self.begin_batch();
+                work += 1;
+                if work == budget {
+                    return SettleOutcome::BudgetExhausted { work };
+                }
+            }
+            let count = self.batch.as_ref().map_or(0, |batch| batch.gates.len());
+            let evaluated = self.batch.as_ref().map_or(0, |batch| batch.staged.len());
+            if evaluated == count {
+                self.microstep_active = false;
+                self.trace_stability_if_reached();
+                return SettleOutcome::Settled { work };
+            }
+            self.evaluate_next();
+            work += 1;
+            if self.batch.is_none() {
+                self.microstep_active = false;
+                self.trace_stability_if_reached();
+                return SettleOutcome::Settled { work };
+            }
+        }
+        // Startup policy publishes gatewise. One startup scheduler unit is one frame work unit;
+        // unlike the legacy complete-frontier helper, this never loops over the entire frontier.
+        while work < budget && self.startup_phase != StartupPhase::Running {
+            match self.advance_startup_unit() {
+                Ok(true) => work += 1,
+                Ok(false) => work += 1,
+                Err(diagnostic) => {
+                    self.microstep_active = false;
+                    return SettleOutcome::Oscillating { work, diagnostic };
+                }
+            }
+            if self.startup_phase == StartupPhase::Running
+                || self.startup_cursor >= self.startup_frontier.len()
+            {
+                self.microstep_active = false;
+                self.trace_stability_if_reached();
+                return SettleOutcome::Settled { work };
+            }
+        }
+        SettleOutcome::BudgetExhausted { work }
+    }
+
     /// Bounded full-settle episode; chunks resume one unchanged detection episode.
     pub fn settle(&mut self, budget: usize) -> SettleOutcome {
-        let trace_headroom = budget.saturating_mul(4).saturating_add(8);
+        // Completion can atomically publish every changed output in the current frontier.
+        let frontier = self.trace_frontier_remaining();
+        let trace_headroom = budget
+            .saturating_mul(4)
+            .saturating_add(frontier.saturating_mul(2))
+            .saturating_add(12);
         if budget > 0 && !self.trace_can_record(trace_headroom) {
             return SettleOutcome::TraceSequenceExhausted { work: 0 };
         }
@@ -713,6 +838,7 @@ impl Runtime {
                 SettleOutcome::Settled { work: 0 }
             };
         }
+        self.microstep_active = false;
         let mut work = 0;
         while self.startup_phase != StartupPhase::Running {
             if work == budget {
@@ -2291,6 +2417,64 @@ mod tests {
             Runtime::start(&document),
             Err(CompileError::MissingDriver { .. })
         ));
+    }
+
+    #[test]
+    fn settle_preflights_atomic_publication_for_a_wide_partially_staged_frontier() {
+        let mut kinds = vec![(1, ComponentKind::Input)];
+        let mut wires = Vec::new();
+        for i in 0..300_u64 {
+            let gate = 2 + i * 2;
+            let output = gate + 1;
+            kinds.push((gate, ComponentKind::Not));
+            kinds.push((output, ComponentKind::Output));
+            wires.push((out(1), inp(gate, 0)));
+            wires.push((out(gate), inp(output, 0)));
+        }
+        let doc = document(&kinds, &wires);
+        let mut runtime =
+            Runtime::start_with_trace(&doc, 7, crate::trace::TraceLog::new(1024, 7, 0).unwrap())
+                .unwrap();
+        runtime.force_running_for_test();
+        // Stage all but the final gate. Outputs still publish together at frontier completion.
+        assert_eq!(
+            runtime.settle(300),
+            SettleOutcome::BudgetExhausted { work: 300 }
+        );
+        assert_eq!(runtime.batch.as_ref().unwrap().staged.len(), 299);
+        runtime.force_trace_sequence_for_test(u64::MAX - 100);
+        let before = runtime.pending_inspection();
+        assert_eq!(
+            runtime.settle(1),
+            SettleOutcome::TraceSequenceExhausted { work: 0 }
+        );
+        assert_eq!(runtime.pending_inspection(), before);
+        assert!(
+            runtime
+                .gates
+                .iter()
+                .all(|gate| runtime.values[gate.output] == Level::Unavailable)
+        );
+    }
+
+    #[test]
+    fn idle_step_preflights_stable_event_after_final_input_sequence() {
+        let doc = document(
+            &[(1, ComponentKind::Input), (2, ComponentKind::Output)],
+            &[(out(1), inp(2, 0))],
+        );
+        let mut runtime =
+            Runtime::start_with_trace(&doc, 4, crate::trace::TraceLog::new(16, 4, 0).unwrap())
+                .unwrap();
+        runtime.force_running_for_test();
+        runtime.force_trace_sequence_for_test(u64::MAX);
+        assert_eq!(
+            runtime.set_input(ComponentId(1), true),
+            Ok(InputChange::Changed)
+        );
+        let before = snapshot(&runtime, &doc);
+        assert_eq!(runtime.step(), StepOutcome::TraceSequenceExhausted);
+        assert_eq!(snapshot(&runtime, &doc), before);
     }
 
     #[test]

@@ -212,6 +212,111 @@ fn trace_is_partition_invariant_capture_observational_and_retained_after_stop() 
 }
 
 #[test]
+fn bounded_microstep_resumes_partial_frontier_without_publishing_or_crossing_successor() {
+    let mut session = Session::default();
+    let input = session.place(K::Input, Position { x: 0., y: 0. }).unwrap();
+    let mut outputs = Vec::new();
+    for index in 0..8 {
+        let gate = session
+            .place(
+                K::Not,
+                Position {
+                    x: 1.,
+                    y: index as f32,
+                },
+            )
+            .unwrap();
+        let output = session
+            .place(
+                K::Output,
+                Position {
+                    x: 2.,
+                    y: index as f32,
+                },
+            )
+            .unwrap();
+        session
+            .connect([pin(input.0, D::Output), pin(gate.0, D::Input)])
+            .unwrap();
+        session
+            .connect([pin(gate.0, D::Output), pin(output.0, D::Input)])
+            .unwrap();
+        outputs.push(output);
+    }
+    session.start_simulation().unwrap();
+    loop {
+        if matches!(
+            session.settle_simulation(100),
+            Ok(SettleOutcome::Settled { .. })
+        ) {
+            break;
+        }
+    }
+    session.set_input(input, true).unwrap();
+    let mut frames = 0;
+    loop {
+        frames += 1;
+        let result = session.micro_step_simulation_bounded(2).unwrap();
+        if matches!(result, SettleOutcome::Settled { .. }) {
+            break;
+        }
+        assert!(matches!(result, SettleOutcome::BudgetExhausted { .. }));
+        assert!(
+            outputs
+                .iter()
+                .all(|&id| session.inspect().unwrap().output_value(id) == Some(Level::High))
+        );
+        assert!(frames < 10);
+    }
+    assert!(frames > 1);
+    assert!(
+        outputs
+            .iter()
+            .all(|&id| session.inspect().unwrap().output_value(id) == Some(Level::Low))
+    );
+}
+
+#[test]
+fn stopping_a_partially_staged_bounded_microstep_unlocks_without_losing_document() {
+    let mut session = Session::default();
+    let input = session.place(K::Input, Position { x: 0., y: 0. }).unwrap();
+    let mut gates = Vec::new();
+    for index in 0..4 {
+        let gate = session
+            .place(
+                K::Not,
+                Position {
+                    x: 1.,
+                    y: index as f32,
+                },
+            )
+            .unwrap();
+        session
+            .connect([pin(input.0, D::Output), pin(gate.0, D::Input)])
+            .unwrap();
+        gates.push(gate);
+    }
+    session.start_simulation().unwrap();
+    assert!(matches!(
+        session.settle_simulation(100),
+        Ok(SettleOutcome::Settled { .. })
+    ));
+    session.set_input(input, true).unwrap();
+    assert!(matches!(
+        session.micro_step_simulation_bounded(2),
+        Ok(SettleOutcome::BudgetExhausted { .. })
+    ));
+    let inspection = session.inspect().unwrap().pending_inspection();
+    assert!(!inspection.staged_unpublished.is_empty());
+    let saved_document = session.document().clone();
+    session.stop_simulation().unwrap();
+    assert!(!session.simulation_active());
+    assert_eq!(session.document(), &saved_document);
+    assert!(session.place(K::Output, Position { x: 5., y: 0. }).is_ok());
+    assert_eq!(gates.len(), 4);
+}
+
+#[test]
 fn terminal_startup_keeps_trace_after_runtime_removal() {
     let mut session = Session::default();
     let gate = session.place(K::Not, Position { x: 0., y: 0. }).unwrap();

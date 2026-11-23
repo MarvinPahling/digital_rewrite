@@ -28,8 +28,22 @@ fn kind_name(kind: ComponentKind) -> &'static str {
     kind.name()
 }
 fn parse_number(text: &str, what: &str) -> Result<usize, String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "invalid {what}: {text:?}; expected unsigned ASCII decimal"
+        ));
+    }
     text.parse::<usize>()
         .map_err(|_| format!("invalid {what}: {text:?}"))
+}
+fn parse_u64(text: &str, what: &str) -> Result<u64, String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "invalid {what}: {text:?}; expected unsigned ASCII decimal"
+        ));
+    }
+    text.parse::<u64>()
+        .map_err(|_| format!("{what} out of range: {text:?}"))
 }
 fn run(args: Vec<OsString>) -> Result<(), (String, u8)> {
     let base =
@@ -79,6 +93,7 @@ fn run_with_io_output(
         false,
     );
     let mut trace_capacity = 1024usize;
+    let (mut budget_seen, mut limit_seen, mut capacity_seen) = (false, false, false);
     let mut trace_ops = Vec::<String>::new();
     if !matches!(command, "simulate" | "trace") && args.next().is_some() {
         return Err((format!("unexpected argument\n{}", usage()), 2));
@@ -100,9 +115,7 @@ fn run_with_io_output(
                             2,
                         )
                     })?;
-                    let id = id
-                        .parse::<u64>()
-                        .map_err(|_| (format!("invalid component ID {id:?}"), 2))?;
+                    let id = parse_u64(id, "component ID").map_err(|e| (e, 2))?;
                     let value = match value {
                         "0" => false,
                         "1" => true,
@@ -136,8 +149,7 @@ fn run_with_io_output(
                                 2,
                             )
                         })?;
-                        id.parse::<u64>()
-                            .map_err(|_| (format!("invalid component ID {id:?}"), 2))?;
+                        parse_u64(id, "component ID").map_err(|e| (e, 2))?;
                         if !matches!(value, "0" | "1") {
                             return Err((
                                 format!("invalid input value {value:?}; expected 0 or 1"),
@@ -151,6 +163,10 @@ fn run_with_io_output(
                     }
                 }
                 Some("--trace-capacity") if command == "trace" => {
+                    if capacity_seen {
+                        return Err(("duplicate --trace-capacity".into(), 2));
+                    }
+                    capacity_seen = true;
                     i += 1;
                     let text = rest
                         .get(i)
@@ -188,6 +204,10 @@ fn run_with_io_output(
                         .map_err(|_| (format!("startup seed out of range: {text:?}"), 2))?;
                 }
                 Some("--oscillation-limit") => {
+                    if limit_seen {
+                        return Err(("duplicate --oscillation-limit".into(), 2));
+                    }
+                    limit_seen = true;
                     i += 1;
                     let text = rest
                         .get(i)
@@ -203,6 +223,10 @@ fn run_with_io_output(
                     }
                 }
                 Some("--budget") => {
+                    if budget_seen {
+                        return Err(("duplicate --budget".into(), 2));
+                    }
+                    budget_seen = true;
                     i += 1;
                     let text = rest
                         .get(i)
@@ -311,44 +335,35 @@ fn run_with_io_output(
                 let mut remaining = budget;
                 for (number, op) in trace_ops.iter().enumerate() {
                     if op == "micro" {
-                        let max_micro = 1 + session
-                            .document()
-                            .components
-                            .iter()
-                            .filter(|c| {
-                                matches!(
-                                    c.kind,
-                                    ComponentKind::And
-                                        | ComponentKind::NAnd
-                                        | ComponentKind::Or
-                                        | ComponentKind::NOr
-                                        | ComponentKind::XOr
-                                        | ComponentKind::XNOr
-                                        | ComponentKind::Not
-                                )
-                            })
-                            .count();
-                        if remaining < max_micro {
-                            return Err((
-                                format!(
-                                    "trace work budget exhausted before operation {} (needs up to {max_micro} work units)",
-                                    number + 1
-                                ),
-                                1,
-                            ));
-                        }
-                        match session.micro_step_simulation().map_err(|e| {
-                            (
-                                sim_text::describe_simulation_error(session.document(), &e),
-                                1,
-                            )
-                        })? {
-                            digital_rust::runtime::StepOutcome::Stepped { evaluated } => {
-                                remaining = remaining.saturating_sub(evaluated.saturating_add(1));
+                        loop {
+                            if remaining == 0 {
+                                return Err((
+                                    format!(
+                                        "trace work budget exhausted before operation {}",
+                                        number + 1
+                                    ),
+                                    1,
+                                ));
                             }
-                            digital_rust::runtime::StepOutcome::Idle => {}
-                            other => {
-                                return Err((format!("microstep did not complete: {other:?}"), 1));
+                            let outcome = session
+                                .micro_step_simulation_bounded(remaining)
+                                .map_err(|e| {
+                                    (
+                                        sim_text::describe_simulation_error(session.document(), &e),
+                                        1,
+                                    )
+                                })?;
+                            let consumed = match outcome {
+                                SettleOutcome::BudgetExhausted { work } => work,
+                                SettleOutcome::Settled { work } => {
+                                    remaining = remaining.saturating_sub(work);
+                                    break;
+                                }
+                                other => return Err((format!("microstep failed: {other:?}"), 1)),
+                            };
+                            remaining = remaining.saturating_sub(consumed);
+                            if consumed == 0 {
+                                return Err(("microstep made no progress".into(), 1));
                             }
                         }
                     } else if op == "full" {
@@ -371,10 +386,7 @@ fn run_with_io_output(
                                 2,
                             )
                         })?;
-                        let id = ComponentId(
-                            id.parse::<u64>()
-                                .map_err(|_| (format!("invalid component ID {id:?}"), 2))?,
-                        );
+                        let id = ComponentId(parse_u64(id, "component ID").map_err(|e| (e, 2))?);
                         let value = match value {
                             "0" => false,
                             "1" => true,

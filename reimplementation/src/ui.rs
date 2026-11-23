@@ -83,6 +83,8 @@ pub struct DigitalApp {
     /// Whether frames keep settling in bounded chunks. Step pauses it; Settle, Start and an
     /// input toggle resume it.
     settling: bool,
+    /// One logical F10 frontier is continued in bounded frame work units.
+    microstepping: bool,
     /// The document whose compilation last failed; the error state ends when it changes.
     failed_start: Option<Document>,
     style: SymbolStyle,
@@ -170,6 +172,7 @@ impl DigitalApp {
             canvas_id: None,
             seed_focus_requested: false,
             settling: false,
+            microstepping: false,
             failed_start: None,
             style: DEFAULT_STYLE,
             renderer: SymbolRenderer::default(),
@@ -846,6 +849,7 @@ impl DigitalApp {
                         self.failed_start = None;
                         self.error = None;
                         self.settling = action == SimAction::Start;
+                        self.microstepping = false;
                     }
                     Err(error) => {
                         if matches!(error, SimulationError::Compile(_)) {
@@ -859,23 +863,24 @@ impl DigitalApp {
                 Ok(()) => {
                     self.pan_owner = None;
                     self.settling = false;
+                    self.microstepping = false;
                     self.error = None;
                 }
                 Err(error) => self.report_simulation_error(&error),
             },
             SimAction::Step => {
                 self.settling = false;
-                if let Err(error) = self.session.micro_step_simulation() {
-                    self.report_simulation_error(&error);
-                }
+                self.microstepping = true;
             }
             SimAction::Settle => {
+                self.microstepping = false;
                 if self.session.simulation_active() {
                     self.settling = true;
                 }
             }
             SimAction::Pause => {
                 self.settling = false;
+                self.microstepping = false;
             }
             SimAction::Toggle(id) => match self.session.toggle_input(id) {
                 Ok(InputChange::Changed) => {
@@ -890,6 +895,27 @@ impl DigitalApp {
     /// Runs one bounded settle chunk. While work remains a repaint is requested, so the next
     /// frame continues and Stop is handled in between.
     fn advance_simulation(&mut self, ctx: &egui::Context) {
+        if self.microstepping {
+            match self
+                .session
+                .micro_step_simulation_bounded(self.settle_budget)
+            {
+                Ok(SettleOutcome::BudgetExhausted { .. }) => {}
+                Ok(SettleOutcome::TraceSequenceExhausted { .. }) => {
+                    self.microstepping = false;
+                    self.error =
+                        Some("Trace sequence exhausted; simulation was not advanced".into());
+                }
+                Ok(SettleOutcome::Settled { .. }) => self.microstepping = false,
+                Ok(SettleOutcome::Oscillating { .. }) => self.microstepping = false,
+                Err(error) => {
+                    self.microstepping = false;
+                    self.report_simulation_error(&error);
+                }
+            }
+            ctx.request_repaint();
+            return;
+        }
         if !self.settling {
             return;
         }
@@ -4228,6 +4254,14 @@ mod tests {
         assert_eq!(output_level(&app, output), Some(Level::Low));
         press(&ctx, &mut app, egui::Key::F10, egui::Modifiers::NONE);
         assert!(!app.settling);
+        // F10's logical request can span frames when the per-frame work budget is one.
+        for _ in 0..50 {
+            frame(&ctx, &mut app, vec![], true);
+            if !app.microstepping {
+                break;
+            }
+        }
+        assert!(!app.microstepping, "bounded microstep eventually completes");
         let paused = app.session.inspect().unwrap().pending_gate_count();
         let shown = frame(&ctx, &mut app, vec![], true);
         assert!(has_text(&shown, "paused"));

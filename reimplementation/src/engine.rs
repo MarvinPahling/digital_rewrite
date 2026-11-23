@@ -463,16 +463,11 @@ impl Session {
     }
     /// Discards the runtime; the document, history, dirty state and ids were never touched.
     pub fn stop_simulation(&mut self) -> Result<(), SimulationError> {
-        if self
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| !runtime.can_trace_stop())
-        {
-            return Err(SimulationError::TraceSequenceExhausted);
-        }
         let Some(mut runtime) = self.runtime.take() else {
             return Err(SimulationError::NotActive);
         };
+        // Stop is a lifecycle safety operation: it always releases the edit lock. If the trace
+        // sequence has no room, preserve the trace and expose its missing-stop metadata instead.
         runtime.trace_stop();
         self.trace = runtime.take_trace();
         drop(runtime);
@@ -520,6 +515,37 @@ impl Session {
         }
         let outcome = self.runtime_mut()?.micro_step();
         self.retain_terminal(outcome)
+    }
+
+    /// Start/continue one logical microstep, bounded to `budget` scheduler work units.
+    /// Call again when `BudgetExhausted`; stop/pause between calls leaves staged state intact.
+    pub fn micro_step_simulation_bounded(
+        &mut self,
+        budget: usize,
+    ) -> Result<SettleOutcome, SimulationError> {
+        if let Some(diagnostic) = self.oscillation_diagnostic.clone() {
+            return Err(SimulationError::Oscillation {
+                diagnostic,
+                work: 0,
+            });
+        }
+        let outcome = self.runtime_mut()?.micro_step_bounded(budget);
+        if let SettleOutcome::Oscillating { work, diagnostic } = outcome {
+            let mut runtime = self.runtime.take().ok_or(SimulationError::NotActive)?;
+            let context = TerminalSimulationContext {
+                startup_seed: runtime.startup_seed(),
+                phase: runtime.startup_phase(),
+            };
+            self.trace = runtime.take_trace();
+            drop(runtime);
+            self.oscillation_diagnostic = Some(diagnostic.clone());
+            self.terminal_simulation_context = Some(context);
+            return Err(SimulationError::Oscillation { diagnostic, work });
+        }
+        if matches!(outcome, SettleOutcome::TraceSequenceExhausted { .. }) {
+            return Err(SimulationError::TraceSequenceExhausted);
+        }
+        Ok(outcome)
     }
 
     fn retain_terminal(&mut self, outcome: StepOutcome) -> Result<StepOutcome, SimulationError> {
@@ -1367,6 +1393,27 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn stop_always_unlocks_when_trace_sequence_is_exhausted() {
+        let mut session = Session::default();
+        session
+            .start_simulation_with_trace(SimulationOptions::default(), 8)
+            .unwrap();
+        session
+            .runtime
+            .as_mut()
+            .unwrap()
+            .force_trace_exhausted_for_test();
+        session.stop_simulation().unwrap();
+        assert!(!session.simulation_active());
+        assert!(session.trace().unwrap().has_unrecorded_stop());
+        assert!(
+            session
+                .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+                .is_ok()
+        );
+    }
+
     #[test]
     fn typed_errors_and_id_exhaustion_leave_state_unchanged() {
         let mut session = Session::default();
