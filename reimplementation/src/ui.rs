@@ -1088,9 +1088,11 @@ impl DigitalApp {
                 transform,
                 ui.visuals().widgets.noninteractive.bg_stroke.color,
             );
-            let pointer = response.interact_pointer_pos();
-            let cancelled = self.file_modal.is_some()
-                || ctx.input(|i| !i.focused || i.key_pressed(egui::Key::Escape));
+            let cancelled =
+                modal_open || ctx.input(|i| !i.focused || i.key_pressed(egui::Key::Escape));
+            let pointer = (!cancelled)
+                .then(|| response.interact_pointer_pos())
+                .flatten();
             if cancelled {
                 self.drag = None;
                 self.placing = None;
@@ -1215,7 +1217,7 @@ impl DigitalApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            if response.clicked() {
+            if !cancelled && response.clicked() {
                 self.drag = None;
             }
             if !cancelled
@@ -1295,7 +1297,8 @@ impl DigitalApp {
                         Stroke::new(2_f32, palette.selection),
                     );
                 }
-                if let Some(start) = self.wire_start
+                if !cancelled
+                    && let Some(start) = self.wire_start
                     && let Some(a) = wire_pins.iter().find(|v| v.0 == start)
                     && let Some(p) = response.hover_pos()
                 {
@@ -3360,6 +3363,56 @@ mod tests {
     }
 
     #[test]
+    fn label_modal_blocks_canvas_pointer_gestures_everywhere() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let selected = app
+            .session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        let underlying = app
+            .session
+            .place(ComponentKind::Output, Position { x: 192., y: 292. })
+            .unwrap();
+        app.selected = Some(selected);
+        app.begin_label_edit();
+        assert!(app.label_modal.is_some());
+        let before = app.session.document().clone();
+
+        // The first click is on empty canvas behind the dialog; the second is on a
+        // component whose symbol is underneath the dialog itself.
+        for (start, end) in [
+            (Pos2::new(700., 500.), Pos2::new(740., 530.)),
+            (Pos2::new(400., 300.), Pos2::new(470., 350.)),
+        ] {
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerMoved(start), button(start, true)],
+                true,
+            );
+            frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
+            frame(&ctx, &mut app, vec![button(end, false)], true);
+            assert_eq!(app.selected, Some(selected));
+            assert!(app.drag.is_none());
+            assert!(app.placing.is_none());
+            assert!(!app.wiring);
+            assert!(app.wire_start.is_none());
+            assert_eq!(*app.session.document(), before);
+        }
+        assert_eq!(
+            app.session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == underlying)
+                .unwrap()
+                .position,
+            Position { x: 192., y: 292. }
+        );
+    }
+
+    #[test]
     fn label_modal_focus_loss_cancels_and_running_simulation_blocks_open() {
         let ctx = egui::Context::default();
         let mut app = DigitalApp::default();
@@ -3620,7 +3673,8 @@ mod tests {
         );
         assert!(has_text(&settled, "Résultat & <Q>"));
         let document = app.session.document().clone();
-        app.selected = Some(output);
+        click_at(&ctx, &mut app, Pos2::new(508., 108.));
+        assert_eq!(app.selected, Some(output));
         click_text(&ctx, &mut app, "Edit label… (F2)");
         assert!(
             app.label_modal.is_none(),
