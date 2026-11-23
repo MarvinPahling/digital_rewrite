@@ -41,6 +41,19 @@ fn run(args: Vec<OsString>) -> Result<(), (String, u8)> {
     run_with_io(args, &mut io)
 }
 fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, u8)> {
+    run_with_io_output(args, io, &mut std::io::stdout().lock())
+}
+fn run_with_io_output(
+    args: Vec<OsString>,
+    io: &mut dyn FileIo,
+    output: &mut dyn std::io::Write,
+) -> Result<(), (String, u8)> {
+    macro_rules! outln {
+        ($($arg:tt)*) => {
+            writeln!(output, $($arg)*)
+                .map_err(|error| (format!("cannot write CLI output: {error}"), 1))?
+        };
+    }
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
         return Err((usage().into(), 2));
@@ -49,7 +62,7 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
         .to_str()
         .ok_or_else(|| ("command must be UTF-8".into(), 2))?;
     if command == "--help" || command == "-h" {
-        println!("{}", usage());
+        outln!("{}", usage());
         return Ok(());
     }
     if !matches!(command, "open" | "validate" | "simulate") {
@@ -161,9 +174,9 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
         .map_err(|e| (format!("cannot open document: {e}"), 1))?;
     match command {
         "open" => {
-            println!("Opened supported editable .dig v2 subset; NOT simulator-validated.");
+            outln!("Opened supported editable .dig v2 subset; NOT simulator-validated.");
             for c in &session.document().components {
-                println!(
+                outln!(
                     "component id={} kind={} label=\"{}\"{}",
                     c.id.0,
                     kind_name(c.kind),
@@ -175,7 +188,7 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
                     }
                 );
             }
-            println!("wires={}", session.document().wires.len());
+            outln!("wires={}", session.document().wires.len());
             for wire in &session.document().wires {
                 let endpoint = |pin: &digital_rust::domain::PinRef| {
                     let direction = match pin.pin.direction {
@@ -188,7 +201,7 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
                         u16::from(pin.pin.index) + 1
                     )
                 };
-                println!(
+                outln!(
                     "wire id={} {}--{}",
                     wire.id.0,
                     endpoint(&wire.endpoints[0]),
@@ -199,7 +212,7 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
         "validate" => {
             simulation::compile(session.document())
                 .map_err(|e| (sim_text::describe_compile_error(session.document(), &e), 1))?;
-            println!(
+            outln!(
                 "valid: supported one-bit circuit structure (not full Digital validation; feedback convergence is not assessed)"
             );
         }
@@ -267,7 +280,7 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
                     Level::High => "1",
                     Level::Unavailable => "?",
                 };
-                println!("output id={} label=\"{}\" value={value}", id.0, label);
+                outln!("output id={} label=\"{}\" value={value}", id.0, label);
             }
         }
         _ => return Err((format!("unknown command {command:?}"), 2)),
@@ -318,12 +331,14 @@ mod tests {
         base: PathBuf,
         bytes: Vec<u8>,
         writes: Cell<bool>,
+        reads: Cell<usize>,
     }
     impl FileIo for FakeIo {
         fn base_dir(&self) -> &Path {
             &self.base
         }
         fn read_bounded_regular(&mut self, _: &Path, limit: usize) -> io::Result<Vec<u8>> {
+            self.reads.set(self.reads.get() + 1);
             if self.bytes.len() > limit {
                 return Err(io::Error::other("fixture exceeds read bound"));
             }
@@ -351,6 +366,106 @@ mod tests {
         }
     }
 
+    fn feedback_with_output_dig() -> Vec<u8> {
+        use digital_rust::domain::{
+            Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position,
+            Wire, WireId,
+        };
+        let not = Component {
+            id: ComponentId(1),
+            kind: ComponentKind::Not,
+            position: Position { x: 0., y: 0. },
+            label: String::new(),
+            constant_value: true,
+        };
+        let output = Component {
+            id: ComponentId(2),
+            kind: ComponentKind::Output,
+            position: Position { x: 100., y: 0. },
+            label: "oscillating output".into(),
+            constant_value: true,
+        };
+        let pin = |component, direction| PinRef {
+            component: ComponentId(component),
+            pin: PinId {
+                direction,
+                index: 0,
+            },
+        };
+        let document = Document {
+            components: vec![not, output],
+            wires: vec![
+                Wire {
+                    id: WireId(1),
+                    endpoints: [pin(1, PinDirection::Output), pin(1, PinDirection::Input)],
+                },
+                Wire {
+                    id: WireId(2),
+                    endpoints: [pin(1, PinDirection::Output), pin(2, PinDirection::Input)],
+                },
+            ],
+        };
+        let dig = digital_rust::formats::from_domain(&document).unwrap();
+        digital_rust::formats::serialize_v2(&dig).unwrap()
+    }
+
+    #[test]
+    fn open_validate_reject_seed_and_simulate_seed_parser_rejects_non_ascii_whitespace_before_io() {
+        for args in [
+            vec!["open", "input.dig", "--seed", "0"],
+            vec!["validate", "input.dig", "--seed", "0"],
+            vec!["simulate", "input.dig", "--seed", " 1"],
+            vec!["simulate", "input.dig", "--seed", "1 "],
+            vec!["simulate", "input.dig", "--seed", "１"],
+            vec!["simulate", "input.dig", "--seed", " 1"],
+        ] {
+            let mut io = FakeIo {
+                base: PathBuf::from("/virtual"),
+                bytes: vec![],
+                writes: Cell::new(false),
+                reads: Cell::new(0),
+            };
+            let result = run_with_io(args.iter().map(OsString::from).collect(), &mut io);
+            assert!(result.is_err(), "accepted arguments {args:?}");
+            assert_eq!(result.unwrap_err().1, 2);
+            assert_eq!(
+                io.reads.get(),
+                0,
+                "invalid seed/option must fail before file access"
+            );
+        }
+    }
+
+    #[test]
+    fn feedback_ring_with_output_fails_without_returning_success_rows() {
+        let mut io = FakeIo {
+            base: PathBuf::from("/virtual"),
+            bytes: feedback_with_output_dig(),
+            writes: Cell::new(false),
+            reads: Cell::new(0),
+        };
+        let mut stdout = Vec::new();
+        let result = run_with_io_output(
+            vec![OsString::from("simulate"), OsString::from("ring.dig")],
+            &mut io,
+            &mut stdout,
+        );
+        let (message, code) = result.unwrap_err();
+        assert_eq!(code, 1);
+        assert!(message.contains("oscillat"), "{message}");
+        assert!(
+            stdout.is_empty(),
+            "failure printed output rows: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+        assert!(
+            !message.contains("output id="),
+            "failure cannot report success rows"
+        );
+        assert_eq!(io.reads.get(), 1);
+        assert!(!io.writes.get());
+    }
+
     #[test]
     fn every_command_uses_injected_io_read_only() {
         let bytes = b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>".to_vec();
@@ -359,6 +474,7 @@ mod tests {
                 base: PathBuf::from("/virtual"),
                 bytes: bytes.clone(),
                 writes: Cell::new(false),
+                reads: Cell::new(0),
             };
             let mut args = vec![OsString::from(command), OsString::from("input.dig")];
             if command == "simulate" {

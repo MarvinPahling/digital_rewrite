@@ -1009,6 +1009,112 @@ mod tests {
     }
 
     #[test]
+    fn startup_detector_uses_exact_collection_window_and_excludes_rejected_frontier() {
+        let doc = document(
+            &[(1, ComponentKind::Not), (2, ComponentKind::Not)],
+            &[(out(1), inp(1, 0)), (out(2), inp(2, 0))],
+        );
+        let runtime = Runtime::start(&doc).unwrap();
+        let mut detector = OscillationDetector::new(3);
+        for step in 1..=4 {
+            detector.begin_batch(std::iter::once(&runtime.gates[0]));
+            assert_eq!(detector.steps, step);
+            assert!(detector.components.is_empty(), "T+1 is not collected");
+        }
+        for step in 5..=103 {
+            detector.begin_batch(std::iter::once(&runtime.gates[0]));
+            assert_eq!(detector.steps, step);
+            assert_eq!(detector.components.len(), 1, "collect T+2 through T+100");
+        }
+        // The scheduler rejects before opening the next batch. In particular, its
+        // scheduled gates are not added to the already-collected diagnostic.
+        let rejected_frontier = &runtime.gates[1];
+        assert!(detector.steps >= detector.limit + OSCILLATION_COLLECTION_OFFSET);
+        assert!(!detector.components.contains_key(&rejected_frontier.id));
+        assert_eq!(
+            detector.components.keys().copied().collect::<Vec<_>>(),
+            vec![ComponentId(1)]
+        );
+    }
+
+    #[test]
+    fn startup_converges_on_the_last_permitted_frontier() {
+        let doc = document(
+            &[(1, ComponentKind::Input), (2, ComponentKind::Not)],
+            &[(out(1), inp(2, 0))],
+        );
+        let mut runtime = Runtime::start(&doc).unwrap();
+        runtime.set_oscillation_limit(1).unwrap();
+        let output_net = runtime.pin_nets[&out(2)];
+        runtime.values[output_net] = High;
+        runtime.detector = Some(OscillationDetector {
+            limit: 1,
+            steps: 100,
+            components: BTreeMap::new(),
+        });
+        assert!(matches!(runtime.settle(10), SettleOutcome::Settled { .. }));
+        assert_eq!(runtime.startup_phase(), StartupPhase::Running);
+        assert_eq!(runtime.terminal_diagnostic(), None);
+        assert!(runtime.detector.is_none());
+    }
+
+    #[test]
+    fn startup_detector_matches_mixed_single_step_and_chunked_settle() {
+        let doc = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
+        let mut whole = Runtime::start_with_seed(&doc, 17).unwrap();
+        let mut mixed = Runtime::start_with_seed(&doc, 17).unwrap();
+        whole.set_oscillation_limit(2).unwrap();
+        mixed.set_oscillation_limit(2).unwrap();
+        let mut expected = None;
+        for _ in 0..1_000 {
+            if let StepOutcome::Oscillating { diagnostic } = whole.step() {
+                expected = Some(diagnostic);
+                break;
+            }
+        }
+        let expected = expected.expect("startup self-ring is detected");
+        let mut actual = None;
+        for (step_once, budget) in [(true, 1), (false, 2), (true, 1), (false, 3)] {
+            if step_once {
+                if let StepOutcome::Oscillating { diagnostic } = mixed.step() {
+                    actual = Some(diagnostic);
+                    break;
+                }
+            } else if let SettleOutcome::Oscillating { diagnostic, .. } = mixed.settle(budget) {
+                actual = Some(diagnostic);
+                break;
+            }
+        }
+        for _ in 0..1_000 {
+            if actual.is_some() {
+                break;
+            }
+            if let SettleOutcome::Oscillating { diagnostic, .. } = mixed.settle(1) {
+                actual = Some(diagnostic);
+            }
+        }
+        assert_eq!(actual, Some(expected));
+    }
+
+    #[test]
+    fn startup_prng_and_shuffle_policy_has_versioned_golden_vectors() {
+        assert_eq!(STARTUP_RANDOM_POLICY, "splitmix64-fy-v1");
+        let mut rng = SplitMix64(0);
+        assert_eq!(
+            [rng.next(), rng.next(), rng.next()],
+            [
+                16294208416658607535,
+                7960286522194355700,
+                487617019471545679
+            ]
+        );
+        let mut rng = SplitMix64(42);
+        let mut order = (0..8).collect::<Vec<_>>();
+        rng.shuffle(&mut order);
+        assert_eq!(order, vec![3, 1, 6, 2, 4, 0, 7, 5]);
+    }
+
+    #[test]
     fn startup_step_observes_detector_while_running_step_remains_raw() {
         let self_loop = document(&[(1, ComponentKind::Not)], &[(out(1), inp(1, 0))]);
         let mut runtime = Runtime::start_with_seed(&self_loop, 3).unwrap();

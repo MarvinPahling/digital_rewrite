@@ -989,6 +989,47 @@ mod tests {
     }
 
     #[test]
+    fn public_file_and_history_operations_remain_locked_at_reset_release_barrier() {
+        use crate::runtime::StartupPhase;
+        let mut session = Session::default();
+        session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let mut io = NoFileAccess;
+        session
+            .start_simulation_with_options(crate::runtime::SimulationOptions::default())
+            .unwrap();
+        assert_eq!(
+            session.settle_simulation(1),
+            Ok(SettleOutcome::BudgetExhausted { work: 1 })
+        );
+        assert_eq!(session.startup_phase(), Some(StartupPhase::ResetRelease));
+        assert!(matches!(session.undo(), Err(EditError::SimulationActive)));
+        assert!(matches!(session.redo(), Err(EditError::SimulationActive)));
+        assert!(matches!(
+            session.save(&mut io),
+            Err(SaveError::SimulationActive)
+        ));
+        assert!(matches!(
+            session.save_as(
+                &mut io,
+                Path::new("blocked.dig"),
+                crate::file_session::SaveAsIntent::Replace
+            ),
+            Err(SaveError::SimulationActive)
+        ));
+        assert!(matches!(
+            session.open_path(
+                &mut io,
+                Path::new("blocked.dig"),
+                crate::file_session::DiscardIntent::DiscardDirty
+            ),
+            Err(SessionDigError::SimulationActive)
+        ));
+        session.stop_simulation().unwrap();
+    }
+
+    #[test]
     fn codec_refusal_does_not_reach_filesystem() {
         let mut io = NoFileAccess;
         let mut session = Session::default();

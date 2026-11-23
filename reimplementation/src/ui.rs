@@ -75,6 +75,9 @@ pub struct DigitalApp {
     startup_seed_text: String,
     seed_field_focused: bool,
     seed_field_rect: Option<Rect>,
+    seed_field_id: Option<egui::Id>,
+    canvas_id: Option<egui::Id>,
+    seed_focus_requested: bool,
     /// Whether frames keep settling in bounded chunks. Step pauses it; Settle, Start and an
     /// input toggle resume it.
     settling: bool,
@@ -161,6 +164,9 @@ impl DigitalApp {
             startup_seed_text: "0".into(),
             seed_field_focused: false,
             seed_field_rect: None,
+            seed_field_id: None,
+            canvas_id: None,
+            seed_focus_requested: false,
             settling: false,
             failed_start: None,
             style: DEFAULT_STYLE,
@@ -978,12 +984,23 @@ impl DigitalApp {
             ui.horizontal(|ui| {
                 ui.label("Startup seed");
                 let response = ui.add_enabled(!active, egui::TextEdit::singleline(&mut self.startup_seed_text).id_salt("simulation_startup_seed").desired_width(140.0).hint_text("unsigned decimal u64"));
+                self.seed_field_id = Some(response.id);
+                if self.seed_focus_requested {
+                    response.request_focus();
+                    self.seed_focus_requested = false;
+                }
+                if response.has_focus()
+                    && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                    && let Some(canvas_id) = self.canvas_id
+                {
+                    ctx.memory_mut(|memory| memory.request_focus(canvas_id));
+                }
                 self.seed_field_focused = response.has_focus();
                 self.seed_field_rect = Some(response.rect);
             });
             if let Some(seed) = self.session.startup_seed() { ui.label(format!("Active startup seed: {seed}")); }
             if let Some(phase) = self.session.startup_phase() { ui.label(format!("Lifecycle: {phase:?}")); }
-            ui.label("F5 start, Shift+F5 stop, F10 step, F6 settle.");
+            ui.label("F5 start, Shift+F5 stop, F10 step, F6 settle. Canvas Ctrl+Tab → seed field; Escape → canvas.");
             if let Some(runtime) = self.session.inspect() {
                 let document = self.session.document();
                 ui.separator();
@@ -1316,6 +1333,7 @@ impl DigitalApp {
             }
             if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 { self.canvas_rect = None; return; }
             self.canvas_rect = Some(rect);
+            self.canvas_id = Some(response.id);
             // A queued navigation action may outlive the frame/UI event that created it.
             // Revalidate modality at the point of execution, just like the toolbar controls.
             if let Some(action) = self
@@ -1382,6 +1400,14 @@ impl DigitalApp {
                 }
             }
             if !modal_open && !pan_sequence && self.drag.is_none() && response.has_focus() {
+                // Ctrl+Tab is a documented route to the seed editor that does not steal
+                // plain Tab from keyboard pin navigation; Escape returns focus here.
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
+                    self.seed_focus_requested = true;
+                    if let Some(seed_id) = self.seed_field_id {
+                        ctx.memory_mut(|memory| memory.request_focus(seed_id));
+                    }
+                }
                 let nav = ctx.input_mut(|i| {
                     if i.consume_key(egui::Modifiers::NONE, egui::Key::Plus)
                         || i.consume_key(egui::Modifiers::SHIFT, egui::Key::Plus)
@@ -2158,20 +2184,31 @@ mod tests {
     }
 
     #[test]
-    fn startup_seed_text_is_keyboard_editable_and_f5_does_not_escape_focused_field() {
+    fn startup_seed_is_reachable_from_canvas_by_keyboard_without_shortcut_leakage() {
         let ctx = egui::Context::default();
         let mut app = DigitalApp::default();
         inverter_chain(&mut app, 1);
         frame(&ctx, &mut app, vec![], true);
-        let rect = app.seed_field_rect.expect("seed input was rendered");
-        let point = rect.center();
+        let canvas = Pos2::new(350., 300.);
         frame(
             &ctx,
             &mut app,
-            vec![egui::Event::PointerMoved(point), button(point, true)],
+            vec![egui::Event::PointerMoved(canvas), button(canvas, true)],
             true,
         );
-        frame(&ctx, &mut app, vec![button(point, false)], true);
+        frame(&ctx, &mut app, vec![button(canvas, false)], true);
+        assert!(!app.seed_field_focused);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Tab, egui::Modifiers::CTRL)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![], true);
+        assert!(
+            app.seed_field_focused,
+            "Tab on canvas must focus seed editor"
+        );
         frame(
             &ctx,
             &mut app,
@@ -2183,16 +2220,14 @@ mod tests {
         press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
         assert!(
             !app.session.simulation_active(),
-            "F5 text must not start simulation while seed editor owns focus"
+            "F5 must not leak from focused seed editor"
         );
-        let canvas = Pos2::new(350., 300.);
-        frame(
-            &ctx,
-            &mut app,
-            vec![egui::Event::PointerMoved(canvas), button(canvas, true)],
-            true,
+        press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        frame(&ctx, &mut app, vec![], true);
+        assert!(
+            !app.seed_field_focused,
+            "Escape returns focus from seed editor"
         );
-        frame(&ctx, &mut app, vec![button(canvas, false)], true);
         press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::NONE);
         assert_eq!(app.session.startup_seed(), Some(42));
         app.apply_simulation_action(SimAction::Stop);
