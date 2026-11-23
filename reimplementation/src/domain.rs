@@ -75,6 +75,8 @@ pub struct PinRef {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WireId(pub u64);
+/// An explicit logical pin-pair connection. Component positions and rendered route geometry do
+/// not add endpoints or join nets in the current compiler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wire {
     pub id: WireId,

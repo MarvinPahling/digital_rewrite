@@ -438,24 +438,29 @@ impl Runtime {
         )
     }
     fn trace_frontier_remaining(&self) -> usize {
-        let frontier = if self.startup_phase != StartupPhase::Running {
-            let remaining = self
-                .startup_frontier
-                .len()
-                .saturating_sub(self.startup_cursor);
-            // At a completed startup frontier, the next call may install and evaluate the
-            // queued successor before returning. Include it in the preflight reservation.
-            if remaining == 0 {
-                self.startup_next.len()
-            } else {
-                remaining
+        let frontier = match self.startup_phase {
+            StartupPhase::StartupSettling => {
+                let remaining = self
+                    .startup_frontier
+                    .len()
+                    .saturating_sub(self.startup_cursor);
+                // At a completed startup frontier, the next call may install and evaluate the
+                // queued successor before returning. Include it in the preflight reservation.
+                if remaining == 0 {
+                    self.startup_next.len()
+                } else {
+                    remaining
+                }
             }
-        } else {
-            // Normal frontiers publish every gate's value together when the last remaining
-            // gate evaluates, including values staged by prior calls.
-            self.batch
-                .as_ref()
-                .map_or_else(|| self.queue.len(), |batch| batch.gates.len())
+            StartupPhase::ResetRelease => 0,
+            StartupPhase::ResetSettling | StartupPhase::Running => {
+                // Reset propagation uses the normal read/evaluate/publish scheduler, not the
+                // randomized startup arrays. Reserve the entire active frontier, including
+                // staged gates whose outputs publish together at completion.
+                self.batch
+                    .as_ref()
+                    .map_or_else(|| self.queue.len(), |batch| batch.gates.len())
+            }
         };
         // A single operation can cross the startup barrier and release every reset. Reserve
         // both release records and worst-case net publications regardless of its entry phase.
@@ -3084,6 +3089,150 @@ mod tests {
         assert_eq!(stepped.micro_step(), StepOutcome::Stepped { evaluated: 1 });
         assert_eq!(stepped.startup_phase(), StartupPhase::Running);
         assert_eq!(stepped.pin_value(out(3)), Some(Level::Low));
+    }
+
+    #[test]
+    fn reset_settling_preflight_reserves_normal_fanout_frontier_for_every_api() {
+        for staged_publication in [false, true] {
+            for api in 0..4 {
+                let kinds = std::iter::once((1, ComponentKind::Input))
+                    .chain((2..=21).map(|id| (id, ComponentKind::Not)))
+                    .collect::<Vec<_>>();
+                let wires = (2..=21).map(|id| (out(1), inp(id, 0))).collect::<Vec<_>>();
+                let doc = document(&kinds, &wires);
+                let mut runtime = Runtime::start_with_trace(
+                    &doc,
+                    37,
+                    crate::trace::TraceLog::new(4096, 37, 0).unwrap(),
+                )
+                .unwrap();
+                runtime.register_reset_pin_for_test(out(1), ResetOutputPolarity::Inverted);
+                while runtime.startup_phase == StartupPhase::StartupSettling {
+                    let _ = runtime.advance_startup_unit();
+                }
+                assert_eq!(runtime.startup_phase, StartupPhase::ResetRelease);
+                assert!(runtime.advance_startup_unit().is_ok());
+                assert_eq!(runtime.startup_phase, StartupPhase::ResetSettling);
+                assert_eq!(runtime.queue.len(), 20);
+                assert!(runtime.batch.is_none());
+                if staged_publication {
+                    assert_eq!(
+                        runtime.micro_step_bounded(20),
+                        SettleOutcome::BudgetExhausted { work: 20 }
+                    );
+                    assert_eq!(runtime.batch.as_ref().unwrap().staged.len(), 19);
+                }
+
+                // step/microstep/bounded need at least the full 20-gate publication
+                // frontier, while settle also reserves its bounded-episode records.
+                runtime.force_trace_sequence_for_test(u64::MAX - 20);
+                let values = runtime.values.clone();
+                let queue = runtime.queue.clone();
+                let queued = runtime.queued.clone();
+                let batch = runtime
+                    .batch
+                    .as_ref()
+                    .map(|batch| (batch.gates.clone(), batch.staged.clone()));
+                let phase = runtime.startup_phase;
+                let detector = runtime.detector.clone();
+                let terminal = runtime.terminal.clone();
+                let rng = runtime.rng.0;
+                let microstep = runtime.microstep_active;
+                let startup_frontier = runtime.startup_frontier.clone();
+                let startup_next = runtime.startup_next.clone();
+                let startup_cursor = runtime.startup_cursor;
+                let startup_queued = runtime.startup_queued.clone();
+                let reset_released = runtime
+                    .reset_participants
+                    .iter()
+                    .map(|participant| participant.released)
+                    .collect::<Vec<_>>();
+                let trace = runtime.trace.as_ref().unwrap();
+                let records = trace.records().collect::<Vec<_>>();
+                let dropped = trace.dropped();
+                let first = trace.first_sequence();
+                let sequence = trace.sequence_state_for_test();
+                let capacity = trace.capacity();
+
+                let refused = match api {
+                    0 => runtime.step() == StepOutcome::TraceSequenceExhausted,
+                    1 => runtime.micro_step() == StepOutcome::TraceSequenceExhausted,
+                    2 => matches!(
+                        runtime.micro_step_bounded(2),
+                        SettleOutcome::TraceSequenceExhausted { work: 0 }
+                    ),
+                    _ => matches!(
+                        runtime.settle(1),
+                        SettleOutcome::TraceSequenceExhausted { work: 0 }
+                    ),
+                };
+                assert!(refused, "execution API {api}");
+                assert_eq!(runtime.values, values, "net values, API {api}");
+                assert_eq!(runtime.queue, queue, "queue, API {api}");
+                assert_eq!(runtime.queued, queued, "queued flags, API {api}");
+                assert_eq!(
+                    runtime
+                        .batch
+                        .as_ref()
+                        .map(|batch| (batch.gates.clone(), batch.staged.clone())),
+                    batch,
+                    "batch/staged outputs, API {api}"
+                );
+                assert_eq!(runtime.startup_phase, phase, "phase, API {api}");
+                assert_eq!(runtime.detector, detector, "detector, API {api}");
+                assert_eq!(runtime.terminal, terminal, "terminal state, API {api}");
+                assert_eq!(runtime.rng.0, rng, "RNG, API {api}");
+                assert_eq!(runtime.microstep_active, microstep, "microstep, API {api}");
+                assert_eq!(
+                    runtime.startup_frontier, startup_frontier,
+                    "frontier, API {api}"
+                );
+                assert_eq!(runtime.startup_next, startup_next, "next, API {api}");
+                assert_eq!(runtime.startup_cursor, startup_cursor, "cursor, API {api}");
+                assert_eq!(
+                    runtime.startup_queued, startup_queued,
+                    "startup flags, API {api}"
+                );
+                assert_eq!(
+                    runtime
+                        .reset_participants
+                        .iter()
+                        .map(|participant| participant.released)
+                        .collect::<Vec<_>>(),
+                    reset_released,
+                    "reset release flags, API {api}"
+                );
+                let trace = runtime.trace.as_ref().unwrap();
+                assert_eq!(
+                    trace.records().collect::<Vec<_>>(),
+                    records,
+                    "records, API {api}"
+                );
+                assert_eq!(trace.dropped(), dropped, "dropped, API {api}");
+                assert_eq!(trace.first_sequence(), first, "first sequence, API {api}");
+                assert_eq!(
+                    trace.sequence_state_for_test(),
+                    sequence,
+                    "sequence, API {api}"
+                );
+                assert_eq!(trace.capacity(), capacity, "capacity, API {api}");
+
+                runtime.force_trace_sequence_for_test(u64::MAX - 1_000);
+                let progressed = match api {
+                    0 => runtime.step() != StepOutcome::TraceSequenceExhausted,
+                    1 => runtime.micro_step() != StepOutcome::TraceSequenceExhausted,
+                    2 => !matches!(
+                        runtime.micro_step_bounded(2),
+                        SettleOutcome::TraceSequenceExhausted { .. }
+                    ),
+                    _ => !matches!(
+                        runtime.settle(1),
+                        SettleOutcome::TraceSequenceExhausted { .. }
+                    ),
+                };
+                assert!(progressed, "retry with headroom, API {api}");
+            }
+        }
     }
 
     #[test]

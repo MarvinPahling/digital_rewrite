@@ -71,9 +71,6 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
             "Several outputs drive one net: {}. A net may have only one output.",
             pin_list(document, pins)
         ),
-        CompileError::InvalidGeometry(error) => {
-            format!("Circuit geometry cannot be resolved: {error}.")
-        }
     }
 }
 
