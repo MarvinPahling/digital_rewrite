@@ -123,10 +123,15 @@ fn run_with_io(args: Vec<OsString>, io: &mut dyn FileIo) -> Result<(), (String, 
             println!("Opened supported editable .dig v2 subset; NOT simulator-validated.");
             for c in &session.document().components {
                 println!(
-                    "component id={} kind={} label=\"{}\"",
+                    "component id={} kind={} label=\"{}\"{}",
                     c.id.0,
                     kind_name(c.kind),
-                    escaped(&c.label)
+                    escaped(&c.label),
+                    if c.kind == ComponentKind::Const {
+                        format!(" configured={}", if c.constant_value { 1 } else { 0 })
+                    } else {
+                        String::new()
+                    }
                 );
             }
             println!("wires={}", session.document().wires.len());

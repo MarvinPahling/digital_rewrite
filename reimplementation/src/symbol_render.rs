@@ -278,7 +278,8 @@ mod tests {
     use eframe::egui::Pos2;
 
     const STYLES: [SymbolStyle; 2] = [SymbolStyle::Rect, SymbolStyle::Ieee];
-    const KINDS: [ComponentKind; 9] = [
+    const KINDS: [ComponentKind; 10] = [
+        ComponentKind::Const,
         ComponentKind::Input,
         ComponentKind::Output,
         ComponentKind::And,
@@ -345,6 +346,7 @@ mod tests {
                     }
                     ComponentKind::Input => vec![("pin-out-0", [o[0], o[1]])],
                     ComponentKind::Output => vec![("pin-in-0", [o[0], o[1]])],
+                    ComponentKind::Const => vec![("pin-out-0", [o[0], o[1]])],
                 };
                 let got: Vec<(&str, Point)> = l.anchors().map(|a| (a.name, a.position)).collect();
                 assert_eq!(got, expected, "{style:?} {kind:?}");

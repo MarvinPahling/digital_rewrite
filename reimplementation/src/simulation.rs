@@ -220,6 +220,7 @@ mod tests {
             kind,
             position: Position { x: 0.0, y: 0.0 },
             label: String::new(),
+            constant_value: true,
         }
     }
     fn pin(id: u64, direction: PinDirection, index: u8) -> PinRef {

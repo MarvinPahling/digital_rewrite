@@ -71,6 +71,43 @@ fn open_validate_simulate_are_headless_read_only_and_use_relative_unicode_paths(
     assert_eq!(fs::read(path).unwrap(), original);
 }
 #[test]
+fn const_cli_open_reports_both_configured_values_and_assignment_is_rejected_read_only() {
+    let dir = TempDir::new();
+    for value in ["0", "1"] {
+        let name = format!("const-{value}.dig");
+        let xml = format!(
+            "<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>Const</elementName><elementAttributes><entry><string>Value</string><long>{value}</long></entry></elementAttributes><pos x=\"-100\" y=\"-20\"/></visualElement></visualElements><wires/></circuit>"
+        );
+        fs::write(dir.0.join(&name), xml.as_bytes()).unwrap();
+        let opened = cli(&dir, &["open", &name]);
+        assert!(
+            opened.status.success(),
+            "{}",
+            String::from_utf8_lossy(&opened.stderr)
+        );
+        let text = String::from_utf8(opened.stdout).unwrap();
+        assert!(text.contains(&format!("configured={value}")));
+        assert!(text.contains("kind=Const"));
+        let validated = cli(&dir, &["validate", &name]);
+        assert!(
+            validated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&validated.stderr)
+        );
+        let simulated = cli(&dir, &["simulate", &name]);
+        assert!(
+            simulated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&simulated.stderr)
+        );
+        let rejected = cli(&dir, &["simulate", &name, "--input", "0=1"]);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("not an input"));
+        assert_eq!(fs::read(dir.0.join(name)).unwrap(), xml.as_bytes());
+    }
+}
+
+#[test]
 fn malformed_missing_unsupported_and_usage_errors_have_stable_status_and_stderr() {
     let dir = TempDir::new();
     let missing = cli(&dir, &["open", "absent.dig"]);
@@ -151,6 +188,7 @@ fn set_component_at(
             y: center[1] + (target.1 - pin_offset.1) as f32,
         },
         label: label.into(),
+        constant_value: true,
     });
 }
 fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {

@@ -29,6 +29,7 @@ pub enum EditError {
     SimulationActive,
     InvalidPosition,
     UnknownComponent,
+    WrongComponentKind,
     InvalidLabel(LabelError),
     IdExhausted,
     InvalidPin,
@@ -43,6 +44,7 @@ impl std::fmt::Display for EditError {
             Self::SimulationActive => "Stop the simulation before editing",
             Self::InvalidPosition => "Invalid position",
             Self::UnknownComponent => "Unknown component",
+            Self::WrongComponentKind => "Operation requires a Const component",
             Self::InvalidLabel(error) => return write!(f, "Invalid component label: {error}"),
             Self::IdExhausted => "No component IDs remaining",
             Self::InvalidPin => "Invalid pin",
@@ -370,9 +372,36 @@ impl Session {
             kind,
             position,
             label: kind.name().into(),
+            constant_value: true,
         });
         self.edit(next);
         Ok(id)
+    }
+    /// Set a constant's configured one-bit level; runtime values are independent.
+    pub fn set_constant_value(&mut self, id: ComponentId, value: bool) -> Result<(), EditError> {
+        self.ensure_editable()?;
+        let Some(component) = self
+            .document
+            .components
+            .iter()
+            .find(|component| component.id == id)
+        else {
+            return Err(EditError::UnknownComponent);
+        };
+        if component.kind != ComponentKind::Const {
+            return Err(EditError::WrongComponentKind);
+        }
+        if component.constant_value == value {
+            return Ok(());
+        }
+        let mut next = self.document.clone();
+        next.components
+            .iter_mut()
+            .find(|component| component.id == id)
+            .ok_or(EditError::UnknownComponent)?
+            .constant_value = value;
+        self.edit(next);
+        Ok(())
     }
     /// Change only the selected component's label. Lock and identity checks precede validation;
     /// validation completes before any document/history mutation.
@@ -1048,6 +1077,53 @@ mod tests {
         session.redo().unwrap();
         assert_eq!(*session.document(), snapshot);
     }
+    #[test]
+    fn constant_configuration_is_typed_history_and_simulation_locked() {
+        let mut session = Session::default();
+        let constant = session
+            .place(ComponentKind::Const, Position { x: -20.0, y: 0.0 })
+            .unwrap();
+        let input = session
+            .place(ComponentKind::Input, Position { x: 40.0, y: 0.0 })
+            .unwrap();
+        assert!(session.document().components[0].constant_value);
+        session.undo().unwrap();
+        let redo_len = session.redo.len();
+        assert_eq!(session.set_constant_value(constant, true), Ok(()));
+        assert_eq!(
+            session.redo.len(),
+            redo_len,
+            "same-value edit preserves redo"
+        );
+        session.redo().unwrap();
+        let saved = session.document().clone();
+        session.set_constant_value(constant, false).unwrap();
+        assert!(!session.document().components[0].constant_value);
+        assert_eq!(session.undo.len(), 3);
+        session.undo().unwrap();
+        assert_eq!(session.document(), &saved);
+        session.redo().unwrap();
+        assert!(!session.document().components[0].constant_value);
+        let before = snapshot(&session);
+        assert_eq!(
+            session.set_constant_value(ComponentId(u64::MAX), false),
+            Err(EditError::UnknownComponent)
+        );
+        assert_eq!(
+            session.set_constant_value(input, false),
+            Err(EditError::WrongComponentKind)
+        );
+        assert_unchanged(&session, &before);
+        session.start_simulation().unwrap();
+        let active = snapshot(&session);
+        assert_eq!(
+            session.set_constant_value(constant, true),
+            Err(EditError::SimulationActive)
+        );
+        assert_unchanged(&session, &active);
+        session.stop_simulation().unwrap();
+    }
+
     #[test]
     fn label_edits_validate_atomically_and_have_one_undo_snapshot() {
         let mut session = Session::default();

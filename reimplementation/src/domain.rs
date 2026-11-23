@@ -56,6 +56,7 @@ pub enum ComponentKind {
     XOr,
     XNOr,
     Not,
+    Const,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PinDirection {
@@ -82,7 +83,7 @@ pub struct Wire {
 impl ComponentKind {
     pub fn has_pin(self, pin: PinId) -> bool {
         let count = match (self, pin.direction) {
-            (Self::Input, PinDirection::Output)
+            (Self::Input | Self::Const, PinDirection::Output)
             | (Self::Output, PinDirection::Input)
             | (Self::Not, _)
             | (
@@ -114,6 +115,8 @@ pub struct Component {
     pub kind: ComponentKind,
     pub position: Position,
     pub label: String,
+    /// Configured one-bit constant output; meaningful only for `Const`, defaults HIGH.
+    pub constant_value: bool,
 }
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Document {

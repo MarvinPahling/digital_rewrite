@@ -150,6 +150,8 @@ pub fn symbol(style: SymbolStyle, kind: ComponentKind) -> Option<&'static Symbol
         return Some(def);
     }
     match (style, kind) {
+        (SymbolStyle::Rect, ComponentKind::Const) => Some(&CONST_TEXT_RECT),
+        (SymbolStyle::Ieee, ComponentKind::Const) => Some(&CONST_TEXT_IEEE),
         (SymbolStyle::Rect, ComponentKind::NAnd) => Some(&NAND_RECT),
         (SymbolStyle::Ieee, ComponentKind::NAnd) => Some(&NAND_IEEE),
         (SymbolStyle::Rect, ComponentKind::NOr) => Some(&NOR_RECT),
@@ -161,6 +163,38 @@ pub fn symbol(style: SymbolStyle, kind: ComponentKind) -> Option<&'static Symbol
         _ => None,
     }
 }
+
+const CONST_ANCHORS: [SymbolAnchor; 1] = [SymbolAnchor {
+    name: "pin-out-0",
+    position: [0.0, 0.0],
+    direction: PortDirection::Output,
+}];
+static CONST_TEXT_RECT: SymbolDef = SymbolDef {
+    id: "const-named-text-rect",
+    style: SymbolStyle::Rect,
+    kind: ComponentKind::Const,
+    master: "named-text-fallback",
+    origin: [0.0, 0.0],
+    bounds: SymbolBounds {
+        min: [-40.0, -20.0],
+        max: [0.0, 20.0],
+    },
+    paths: &[],
+    anchors: &CONST_ANCHORS,
+};
+static CONST_TEXT_IEEE: SymbolDef = SymbolDef {
+    id: "const-named-text-ieee",
+    style: SymbolStyle::Ieee,
+    kind: ComponentKind::Const,
+    master: "named-text-fallback",
+    origin: [0.0, 0.0],
+    bounds: SymbolBounds {
+        min: [-40.0, -20.0],
+        max: [0.0, 20.0],
+    },
+    paths: &[],
+    anchors: &CONST_ANCHORS,
+};
 
 const NAND_ANCHORS: [SymbolAnchor; 3] = [
     SymbolAnchor {
@@ -288,7 +322,8 @@ mod tests {
         ComponentKind::Not,
     ];
     const STYLES: [SymbolStyle; 2] = [SymbolStyle::Rect, SymbolStyle::Ieee];
-    const ALL_KINDS: [ComponentKind; 9] = [
+    const ALL_KINDS: [ComponentKind; 10] = [
+        ComponentKind::Const,
         ComponentKind::Input,
         ComponentKind::Output,
         ComponentKind::And,

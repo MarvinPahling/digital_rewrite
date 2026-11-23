@@ -28,6 +28,8 @@ pub struct DigElement {
     pub x: i32,
     pub y: i32,
     pub label: Option<String>,
+    /// Explicit Digital Const value; None distinguishes an omitted default from explicit HIGH.
+    pub value: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +83,7 @@ pub enum DigWriteErrorKind {
     InvalidXmlCharacter,
     Limit,
     OutputLimit,
+    UnsupportedValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +107,7 @@ impl std::fmt::Display for DigWriteErrorKind {
             Self::InvalidXmlCharacter => "invalid XML character",
             Self::Limit => "resource limit",
             Self::OutputLimit => "output limit",
+            Self::UnsupportedValue => "unsupported value",
         })
     }
 }
@@ -127,6 +131,13 @@ pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
     }
     for (index, element) in document.elements.iter().enumerate() {
         validate_write_string(&element.name, &format!("elements[{index}].name"))?;
+        if element.value.is_some() && element.name != "Const" {
+            return Err(write_error(
+                DigWriteErrorKind::UnsupportedValue,
+                format!("elements[{index}].Value"),
+                "Value is supported only for Const",
+            ));
+        }
         if let Some(label) = &element.label {
             if let Err(validation) = crate::domain::validate_label(label) {
                 let kind = match validation {
@@ -161,20 +172,29 @@ pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
         write_bytes(&mut output, b"<visualElement><elementName>", &context)?;
         write_text(&mut output, &element.name, &format!("{context}.name"))?;
         write_bytes(&mut output, b"</elementName><elementAttributes", &context)?;
-        if let Some(label) = &element.label {
-            write_bytes(
-                &mut output,
-                b"><entry><string>Label</string><string>",
-                &context,
-            )?;
-            write_text(&mut output, label, &format!("{context}.label"))?;
-            write_bytes(
-                &mut output,
-                b"</string></entry></elementAttributes>",
-                &context,
-            )?;
-        } else {
+        if element.label.is_none() && element.value.is_none() {
             write_bytes(&mut output, b"/>", &context)?;
+        } else {
+            write_bytes(&mut output, b">", &context)?;
+            if let Some(label) = &element.label {
+                write_bytes(
+                    &mut output,
+                    b"<entry><string>Label</string><string>",
+                    &context,
+                )?;
+                write_text(&mut output, label, &format!("{context}.label"))?;
+                write_bytes(&mut output, b"</string></entry>", &context)?;
+            }
+            if let Some(value) = element.value {
+                write_bytes(
+                    &mut output,
+                    b"<entry><string>Value</string><long>",
+                    &context,
+                )?;
+                write_bytes(&mut output, if value { b"1" } else { b"0" }, &context)?;
+                write_bytes(&mut output, b"</long></entry>", &context)?;
+            }
+            write_bytes(&mut output, b"</elementAttributes>", &context)?;
         }
         write_bytes(&mut output, b"<pos x=\"", &context)?;
         write_bytes(&mut output, element.x.to_string().as_bytes(), &context)?;
@@ -509,6 +529,7 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
     no_attributes(attr_node, "elementAttributes")?;
     whitespace_text(attr_node, "elementAttributes")?;
     let mut label = None;
+    let mut value = None;
     for entry in &attr_node.children {
         if entry.name != "entry" {
             return Err(error(
@@ -520,45 +541,108 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
         }
         no_attributes(entry, "entry")?;
         whitespace_text(entry, "entry")?;
-        if entry.children.len() != 2
-            || entry.children[0].name != "string"
-            || entry.children[1].name != "string"
-        {
+        if entry.children.len() != 2 || entry.children[0].name != "string" {
             return Err(error(
                 DigReadErrorKind::Unsupported,
                 entry.offset,
                 "elementAttributes",
-                "only a Label string entry is supported",
+                "attribute entry must have a string key and supported value",
             ));
         }
         let key = leaf(&entry.children[0], "attribute key")?;
-        if key != "Label" {
-            return Err(error(
-                DigReadErrorKind::Unsupported,
-                entry.children[0].offset,
-                "elementAttributes",
-                format!("unsupported attribute {key:?}"),
-            ));
+        let payload = &entry.children[1];
+        let raw = leaf(payload, "attribute value")?;
+        match key {
+            "Label" => {
+                if payload.name != "string" {
+                    return Err(error(
+                        DigReadErrorKind::Unsupported,
+                        payload.offset,
+                        "Label",
+                        "Label requires a string value",
+                    ));
+                }
+                if label.is_some() {
+                    return Err(error(
+                        DigReadErrorKind::DuplicateField,
+                        entry.offset,
+                        "Label",
+                        "label occurs more than once",
+                    ));
+                }
+                bounded_string(raw, payload.offset, "Label")?;
+                crate::domain::validate_label(raw).map_err(|validation| {
+                    error(
+                        DigReadErrorKind::InvalidValue,
+                        payload.offset,
+                        "Label",
+                        validation.to_string(),
+                    )
+                })?;
+                label = Some(raw.to_owned());
+            }
+            "Value" => {
+                if value.is_some() {
+                    return Err(error(
+                        DigReadErrorKind::DuplicateField,
+                        entry.offset,
+                        "Value",
+                        "Value occurs more than once",
+                    ));
+                }
+                if !matches!(payload.name.as_str(), "long" | "int") {
+                    return Err(error(
+                        DigReadErrorKind::Unsupported,
+                        payload.offset,
+                        "Value",
+                        "Value must use a long or legacy int tag",
+                    ));
+                }
+                let trimmed = trim_xml_space(raw);
+                if trimmed.is_empty()
+                    || !trimmed.bytes().enumerate().all(|(i, b)| {
+                        b.is_ascii_digit()
+                            || (i == 0 && b == b'-' && trimmed.len() > 1)
+                            || (i == 0 && b == b'+' && trimmed.len() > 1)
+                    })
+                {
+                    return Err(error(
+                        DigReadErrorKind::InvalidValue,
+                        payload.offset,
+                        "Value",
+                        "expected signed decimal 0 or 1",
+                    ));
+                }
+                let parsed: i64 = trimmed.parse().map_err(|_| {
+                    error(
+                        DigReadErrorKind::InvalidValue,
+                        payload.offset,
+                        "Value",
+                        "signed decimal value is out of range",
+                    )
+                })?;
+                value = Some(match parsed {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(error(
+                            DigReadErrorKind::InvalidValue,
+                            payload.offset,
+                            "Value",
+                            "one-bit Const accepts only 0 or 1",
+                        ));
+                    }
+                });
+            }
+            _ => {
+                return Err(error(
+                    DigReadErrorKind::Unsupported,
+                    entry.children[0].offset,
+                    "elementAttributes",
+                    format!("unsupported attribute {key:?}"),
+                ));
+            }
         }
-        if label.is_some() {
-            return Err(error(
-                DigReadErrorKind::DuplicateField,
-                entry.offset,
-                "Label",
-                "label occurs more than once",
-            ));
-        }
-        let value = leaf(&entry.children[1], "Label")?;
-        bounded_string(value, entry.children[1].offset, "Label")?;
-        crate::domain::validate_label(value).map_err(|validation| {
-            error(
-                DigReadErrorKind::InvalidValue,
-                entry.children[1].offset,
-                "Label",
-                validation.to_string(),
-            )
-        })?;
-        label = Some(value.to_owned());
     }
     let pos_node = pos.ok_or_else(|| {
         error(
@@ -574,6 +658,7 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
         x: point.x,
         y: point.y,
         label,
+        value,
     })
 }
 
@@ -1381,6 +1466,9 @@ fn name_from_kind(kind: ComponentKind) -> &'static str {
 // Domain editor positions denote the artwork bounds center. Digital stores its logical origin;
 // share the renderer's toolkit-neutral placement metrics to keep pins aligned with the artwork.
 fn center_offset(kind: ComponentKind) -> Result<(i32, i32), DomainCodecError> {
+    if kind == ComponentKind::Const {
+        return Ok((-20, 0));
+    }
     let offset = crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)
         .ok_or_else(|| invalid("component kind has no default symbol"))?;
     Ok((
@@ -1390,6 +1478,7 @@ fn center_offset(kind: ComponentKind) -> Result<(i32, i32), DomainCodecError> {
 }
 fn pin_offsets(kind: ComponentKind, pin: PinId) -> Option<Coord> {
     match (kind, pin.direction, pin.index) {
+        (ComponentKind::Const, PinDirection::Output, 0) => Some((0, 0)),
         (ComponentKind::And | ComponentKind::Or | ComponentKind::XOr, PinDirection::Input, 0) => {
             Some((0, 0))
         }
@@ -1480,11 +1569,15 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
         {
             return Err(invalid("component position loses f32 precision"));
         }
+        if kind != ComponentKind::Const && element.value.is_some() {
+            return Err(invalid("Value is supported only for Const"));
+        }
         components.push(Component {
             id: ComponentId(index as u64),
             kind,
             position,
             label: element.label.clone().unwrap_or_default(),
+            constant_value: element.value.unwrap_or(true),
         });
     }
     let mut document = Document {
@@ -1824,6 +1917,11 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
             } else {
                 Some(c.label.clone())
             },
+            value: if c.kind == ComponentKind::Const {
+                Some(c.constant_value)
+            } else {
+                None
+            },
         });
     }
     let pins = all_pins(doc)?;
@@ -1970,54 +2068,63 @@ mod tests {
                     x: -31,
                     y: -12,
                     label: Some("λ input".into()),
+                    value: None,
                 },
                 DigElement {
                     name: "Out".into(),
                     x: 18,
                     y: -2,
                     label: Some(String::new()),
+                    value: None,
                 },
                 DigElement {
                     name: "And".into(),
                     x: -100,
                     y: 40,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "Or".into(),
                     x: 3,
                     y: 7,
                     label: Some("OR".into()),
+                    value: None,
                 },
                 DigElement {
                     name: "NAnd".into(),
                     x: -220,
                     y: -40,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "NOr".into(),
                     x: -320,
                     y: -80,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "XOr".into(),
                     x: -420,
                     y: -120,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "XNOr".into(),
                     x: -520,
                     y: -160,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "Not".into(),
                     x: -20,
                     y: -4,
                     label: None,
+                    value: None,
                 },
             ],
             wires: vec![],
@@ -2077,6 +2184,7 @@ mod tests {
                     y: dy as f32,
                 },
                 label: String::new(),
+                constant_value: true,
             };
             let layout =
                 SymbolLayout::centered_on(SymbolStyle::Rect, kind, [dx as f32, dy as f32]).unwrap();
@@ -2114,12 +2222,14 @@ mod tests {
             kind: ComponentKind::Input,
             position: Position { x: 0., y: 0. },
             label: String::new(),
+            constant_value: true,
         };
         let output = Component {
             id: ComponentId(2),
             kind: ComponentKind::Output,
             position: Position { x: 100., y: 0. },
             label: String::new(),
+            constant_value: true,
         };
         let doc = Document {
             components: vec![input.clone(), output.clone()],
@@ -2198,18 +2308,21 @@ mod tests {
                     x: 0,
                     y: 0,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "Out".into(),
                     x: 50,
                     y: 0,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "Out".into(),
                     x: 100,
                     y: 0,
                     label: None,
+                    value: None,
                 },
             ],
             wires: vec![
@@ -2252,12 +2365,14 @@ mod tests {
                     x: 0,
                     y: 0,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "Out".into(),
                     x: 100,
                     y: 100,
                     label: None,
+                    value: None,
                 },
             ],
             wires: vec![
@@ -2301,6 +2416,7 @@ mod tests {
                         x,
                         y,
                         label: None,
+                        value: None,
                     })
                     .collect(),
                 wires: wires.clone(),
@@ -2445,12 +2561,14 @@ mod tests {
             kind: ComponentKind::Input,
             position: Position { x: 0., y: 0. },
             label: String::new(),
+            constant_value: true,
         };
         let b = Component {
             id: ComponentId(2),
             kind: ComponentKind::Output,
             position: Position { x: 100., y: 80. },
             label: String::new(),
+            constant_value: true,
         };
         let doc = Document {
             components: vec![a.clone(), b.clone()],
@@ -2496,6 +2614,7 @@ mod tests {
                     y: y + dy as f32,
                 },
                 label: String::new(),
+                constant_value: true,
             }
         };
         let input = |id| PinRef {
@@ -2541,6 +2660,7 @@ mod tests {
                 kind: ComponentKind::Input,
                 position: Position { x: 0.5, y: 0.0 },
                 label: String::new(),
+                constant_value: true,
             }],
             wires: vec![],
         };
@@ -2554,6 +2674,7 @@ mod tests {
                     y: 0.0,
                 },
                 label: String::new(),
+                constant_value: true,
             }],
             wires: vec![],
         };
@@ -2612,7 +2733,8 @@ mod tests {
                 name: "And".into(),
                 x: -12,
                 y: 7,
-                label: Some("R & D <λ> 💡".into())
+                label: Some("R & D <λ> 💡".into()),
+                value: None,
             }
         );
         assert_eq!(parsed.elements[1].name, "In");
@@ -3006,18 +3128,21 @@ mod tests {
                     x: i32::MIN,
                     y: i32::MAX,
                     label: None,
+                    value: None,
                 },
                 DigElement {
                     name: "second".into(),
                     x: -7,
                     y: 8,
                     label: Some(String::new()),
+                    value: None,
                 },
                 DigElement {
                     name: "third".into(),
                     x: 9,
                     y: -10,
                     label: Some("ordered".into()),
+                    value: None,
                 },
             ],
             wires: vec![
@@ -3058,6 +3183,7 @@ mod tests {
                 x: 0,
                 y: 1,
                 label: Some(value.into()),
+                value: None,
             }],
             wires: vec![],
         };
@@ -3074,6 +3200,7 @@ mod tests {
                     x: 0,
                     y: 0,
                     label: None,
+                    value: None,
                 }],
                 wires: vec![],
             };
@@ -3087,6 +3214,7 @@ mod tests {
                     x: 0,
                     y: 0,
                     label: Some(invalid.into()),
+                    value: None,
                 }],
                 wires: vec![],
             };
@@ -3104,6 +3232,7 @@ mod tests {
             x: 0,
             y: 0,
             label: None,
+            value: None,
         };
         let wire = DigWire {
             p1: DigPoint { x: 0, y: 0 },
@@ -3167,6 +3296,7 @@ mod tests {
             serialize_v2(&DigV2 {
                 elements: vec![DigElement {
                     label: Some("a".repeat(MAX_STRING_BYTES)),
+                    value: None,
                     ..element.clone()
                 }],
                 wires: vec![]
@@ -3177,6 +3307,7 @@ mod tests {
             serialize_v2(&DigV2 {
                 elements: vec![DigElement {
                     label: Some("a".repeat(MAX_STRING_BYTES + 1)),
+                    value: None,
                     ..element.clone()
                 }],
                 wires: vec![]
@@ -3188,6 +3319,7 @@ mod tests {
 
         let empty_suffix = DigElement {
             label: Some(String::new()),
+            value: None,
             ..element.clone()
         };
         let base_empty = serialize_v2(&DigV2 {
@@ -3200,6 +3332,7 @@ mod tests {
             elements: vec![
                 DigElement {
                     label: Some("x".repeat(MAX_STRING_BYTES)),
+                    value: None,
                     ..element.clone()
                 },
                 empty_suffix.clone(),
@@ -3213,6 +3346,7 @@ mod tests {
         let mut elements = vec![
             DigElement {
                 label: Some("x".repeat(MAX_STRING_BYTES)),
+                value: None,
                 ..element.clone()
             };
             full_labels
@@ -3243,7 +3377,8 @@ mod tests {
                     name: "&".repeat(MAX_STRING_BYTES),
                     x: 0,
                     y: 0,
-                    label: Some("&".repeat(MAX_STRING_BYTES))
+                    label: Some("&".repeat(MAX_STRING_BYTES)),
+                    value: None,
                 };
                 MAX_ELEMENTS
             ],
@@ -3274,6 +3409,131 @@ mod tests {
                 .label
                 .as_deref(),
             Some(" \t")
+        );
+    }
+
+    #[test]
+    fn const_values_preserve_absence_legacy_int_and_canonical_long() {
+        let element = |entries: &str| {
+            format!(
+                "<visualElement><elementName>Const</elementName><elementAttributes>{entries}</elementAttributes><pos x=\"-120\" y=\"-20\"/></visualElement>"
+            )
+        };
+        let absent = parse_v2(
+            EMPTY
+                .replace(
+                    "<visualElements/>",
+                    &format!("<visualElements>{}</visualElements>", element("")),
+                )
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(absent.elements[0].value, None);
+        assert!(to_domain(&absent).unwrap().components[0].constant_value);
+        for (tag, raw, expected) in [
+            ("long", "1", true),
+            ("int", "  -0\r\n", false),
+            ("int", "+1", true),
+        ] {
+            let entry = format!("<entry><string>Value</string><{tag}>{raw}</{tag}></entry>");
+            let xml = EMPTY.replace(
+                "<visualElements/>",
+                &format!("<visualElements>{}</visualElements>", element(&entry)),
+            );
+            let parsed = parse_v2(xml.as_bytes()).unwrap();
+            assert_eq!(parsed.elements[0].value, Some(expected));
+            let document = to_domain(&parsed).unwrap();
+            assert_eq!(document.components[0].constant_value, expected);
+            let exported = serialize_v2(&from_domain(&document).unwrap()).unwrap();
+            let reopened = to_domain(&parse_v2(&exported).unwrap()).unwrap();
+            assert_eq!(
+                reopened.components[0].position,
+                document.components[0].position
+            );
+            assert_eq!(reopened.components[0].constant_value, expected);
+            let expected_xml = if expected {
+                "<entry><string>Value</string><long>1</long></entry>"
+            } else {
+                "<entry><string>Value</string><long>0</long></entry>"
+            };
+            assert!(String::from_utf8(exported).unwrap().contains(expected_xml));
+        }
+        let label_first = "<entry><string>Label</string><string>escaped &amp; name</string></entry><entry><string>Value</string><long>0</long></entry>";
+        let label_last = "<entry><string>Value</string><long>0</long></entry><entry><string>Label</string><string>escaped &amp; name</string></entry>";
+        for entries in [label_first, label_last] {
+            let xml = EMPTY.replace(
+                "<visualElements/>",
+                &format!("<visualElements>{}</visualElements>", element(entries)),
+            );
+            assert_eq!(
+                parse_v2(xml.as_bytes()).unwrap().elements[0]
+                    .label
+                    .as_deref(),
+                Some("escaped & name")
+            );
+        }
+    }
+
+    #[test]
+    fn const_value_is_strict_and_only_const_can_be_exported_with_value() {
+        let element = |payload: &str| {
+            format!(
+                "<visualElement><elementName>Const</elementName><elementAttributes><entry><string>Value</string>{payload}</entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>"
+            )
+        };
+        for payload in [
+            "<long>-1</long>",
+            "<long>2</long>",
+            "<long>9223372036854775808</long>",
+            "<long>0x1</long>",
+            "<integer>1</integer>",
+            "<long>1 <x/></long>",
+        ] {
+            let xml = EMPTY.replace(
+                "<visualElements/>",
+                &format!("<visualElements>{}</visualElements>", element(payload)),
+            );
+            assert!(parse_v2(xml.as_bytes()).is_err(), "{payload}");
+        }
+        let duplicate = "<visualElement><elementName>Const</elementName><elementAttributes><entry><string>Value</string><long>1</long></entry><entry><string>Value</string><int>0</int></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>";
+        let xml = EMPTY.replace(
+            "<visualElements/>",
+            &format!("<visualElements>{}</visualElements>", duplicate),
+        );
+        assert_eq!(
+            parse_v2(xml.as_bytes()).unwrap_err().kind,
+            DigReadErrorKind::DuplicateField
+        );
+        let nonconst = DigV2 {
+            elements: vec![DigElement {
+                name: "In".into(),
+                x: 0,
+                y: 0,
+                label: None,
+                value: Some(true),
+            }],
+            wires: vec![],
+        };
+        assert_eq!(
+            serialize_v2(&nonconst).unwrap_err().kind,
+            DigWriteErrorKind::UnsupportedValue
+        );
+        let nonconst_with_value = "<visualElement><elementName>In</elementName><elementAttributes><entry><string>Value</string><long>0</long></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>";
+        let xml = EMPTY.replace(
+            "<visualElements/>",
+            &format!("<visualElements>{}</visualElements>", nonconst_with_value),
+        );
+        let parsed = parse_v2(xml.as_bytes()).unwrap();
+        assert!(
+            to_domain(&DigV2 {
+                elements: vec![DigElement {
+                    name: "In".into(),
+                    value: parsed.elements[0].value,
+                    ..parsed.elements[0].clone()
+                }],
+                wires: vec![]
+            })
+            .is_err()
         );
     }
 

@@ -129,6 +129,7 @@ mod tests {
             kind,
             position: Position { x: 0., y: 0. },
             label: label.into(),
+            constant_value: true,
         };
         Document {
             components: vec![

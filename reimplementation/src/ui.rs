@@ -916,6 +916,14 @@ impl DigitalApp {
                 let label = self.session.document().components.iter().find(|component| component.id == id).map(|component| component.label.clone());
                 if let Some(label) = label {
                     ui.label(format!("Selected label: {label}"));
+                    let constant_value = self.session.document().components.iter().find(|component| component.id == id && component.kind == ComponentKind::Const).map(|component| component.constant_value);
+                    if let Some(value) = constant_value {
+                        ui.label(format!("Const configured value: {}", if value { "HIGH (1)" } else { "LOW (0)" }));
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!locked && value, egui::Button::new("Set LOW (0)" )).clicked() { let _ = self.session.set_constant_value(id, false); }
+                            if ui.add_enabled(!locked && !value, egui::Button::new("Set HIGH (1)" )).clicked() { let _ = self.session.set_constant_value(id, true); }
+                        });
+                    }
                     if ui.add_enabled(!locked, egui::Button::new("Edit label… (F2)")).clicked() {
                         self.begin_label_edit();
                     }
@@ -1345,7 +1353,8 @@ impl DigitalApp {
                 };
                 if matches!(
                     c.kind,
-                    ComponentKind::NAnd
+                    ComponentKind::Const
+                        | ComponentKind::NAnd
                         | ComponentKind::NOr
                         | ComponentKind::XOr
                         | ComponentKind::XNOr
@@ -1366,7 +1375,11 @@ impl DigitalApp {
                     painter.text(
                         screen.center(),
                         egui::Align2::CENTER_CENTER,
-                        c.kind.name(),
+                        if c.kind == ComponentKind::Const {
+                            if c.constant_value { "1" } else { "0" }
+                        } else {
+                            c.kind.name()
+                        },
                         egui::FontId::proportional(13.0),
                         palette.color(state),
                     );
@@ -2365,6 +2378,45 @@ mod tests {
             .unwrap();
         app
     }
+    #[test]
+    fn const_palette_configuration_and_named_fallback_are_visible_in_both_styles() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let initial = run_frame(&ctx, &mut app);
+        assert!(has_text(&initial, "Const"));
+        click_text(&ctx, &mut app, "Const");
+        assert_eq!(app.placing, Some(ComponentKind::Const));
+        let id = app
+            .session
+            .place(ComponentKind::Const, Position { x: 100., y: 100. })
+            .unwrap();
+        app.selected = Some(id);
+        for style in [SymbolStyle::Rect, SymbolStyle::Ieee] {
+            app.style = style;
+            let shown = run_frame(&ctx, &mut app);
+            assert!(has_text(&shown, "Const configured value: HIGH (1)"));
+            assert!(has_text(&shown, "1"));
+            let bounds = SymbolLayout::centered_on(style, ComponentKind::Const, [100., 100.])
+                .unwrap()
+                .bounds();
+            assert_eq!(bounds.min, [80., 80.]);
+            assert_eq!(bounds.max, [120., 120.]);
+            app.session.start_simulation().unwrap();
+            app.session.settle_simulation(10).unwrap();
+            click_text(&ctx, &mut app, "Set LOW (0)");
+            assert!(app.session.document().components[0].constant_value);
+            app.session.stop_simulation().unwrap();
+            click_text(&ctx, &mut app, "Set LOW (0)");
+            assert!(!app.session.document().components[0].constant_value);
+            app.session.undo().unwrap();
+            assert!(app.session.document().components[0].constant_value);
+            app.session.redo().unwrap();
+            if style == SymbolStyle::Rect {
+                app.session.set_constant_value(id, true).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn shape_style_defaults_to_rectangular_and_is_offered_in_the_palette() {
         let ctx = egui::Context::default();

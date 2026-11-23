@@ -11,9 +11,10 @@ pub struct ComponentDescriptor {
     /// Digital defaults are recorded for compatibility; the strict v2 subset omits them.
     pub defaults: &'static [(&'static str, &'static str)],
 }
+const CONST_DEFAULTS: &[(&str, &str)] = &[("Bits", "1"), ("Value", "1")];
 const ONE_BIT: &[(&str, &str)] = &[("Bits", "1")];
 const TWO_INPUT_GATE: &[(&str, &str)] = &[("Bits", "1"), ("Inputs", "2"), ("wideShape", "false")];
-pub const DESCRIPTORS: [ComponentDescriptor; 9] = [
+pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
     ComponentDescriptor {
         kind: ComponentKind::Input,
         palette_name: "Input",
@@ -86,8 +87,16 @@ pub const DESCRIPTORS: [ComponentDescriptor; 9] = [
         output_pins: 1,
         defaults: ONE_BIT,
     },
+    ComponentDescriptor {
+        kind: ComponentKind::Const,
+        palette_name: "Const",
+        digital_name: "Const",
+        input_pins: 0,
+        output_pins: 1,
+        defaults: CONST_DEFAULTS,
+    },
 ];
-pub const KINDS: [ComponentKind; 9] = [
+pub const KINDS: [ComponentKind; 10] = [
     ComponentKind::Input,
     ComponentKind::Output,
     ComponentKind::And,
@@ -97,6 +106,7 @@ pub const KINDS: [ComponentKind; 9] = [
     ComponentKind::XOr,
     ComponentKind::XNOr,
     ComponentKind::Not,
+    ComponentKind::Const,
 ];
 pub fn descriptor(kind: ComponentKind) -> &'static ComponentDescriptor {
     DESCRIPTORS

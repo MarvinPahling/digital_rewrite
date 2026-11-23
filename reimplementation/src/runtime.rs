@@ -61,6 +61,7 @@ pub enum SettleOutcome {
 enum Role {
     Input { net: usize },
     Output { net: usize },
+    Const,
     Gate,
 }
 
@@ -75,7 +76,9 @@ impl Gate {
         let a = values[self.inputs[0]];
         let b = values[self.inputs[1]];
         match (self.kind, a, b) {
-            (ComponentKind::Input | ComponentKind::Output, _, _) => Level::Unavailable,
+            (ComponentKind::Input | ComponentKind::Output | ComponentKind::Const, _, _) => {
+                Level::Unavailable
+            }
             (ComponentKind::Not, Level::Unavailable, _) => Level::Unavailable,
             (ComponentKind::Not, a, _) => Level::from_bool(a == Level::Low),
             (_, Level::Unavailable, _) | (_, _, Level::Unavailable) => Level::Unavailable,
@@ -143,6 +146,11 @@ impl Runtime {
                     let net = net_of(id, PinDirection::Output, 0);
                     values[net] = Level::Low;
                     Role::Input { net }
+                }
+                ComponentKind::Const => {
+                    let net = net_of(id, PinDirection::Output, 0);
+                    values[net] = Level::from_bool(component.constant_value);
+                    Role::Const
                 }
                 ComponentKind::Output => Role::Output {
                     net: net_of(id, PinDirection::Input, 0),
@@ -338,6 +346,7 @@ mod tests {
             kind,
             position: Position { x: 0.0, y: 0.0 },
             label: String::new(),
+            constant_value: true,
         }
     }
     fn out(id: u64) -> PinRef {
@@ -435,6 +444,76 @@ mod tests {
     }
     fn level(value: bool) -> Level {
         if value { High } else { Low }
+    }
+
+    #[test]
+    fn constants_drive_before_gates_and_do_not_become_interactive_inputs() {
+        let mut high = component(9, ComponentKind::Const);
+        high.constant_value = true;
+        let mut low = component(2, ComponentKind::Const);
+        low.constant_value = false;
+        let doc = document(
+            &[
+                (9, ComponentKind::Const),
+                (2, ComponentKind::Const),
+                (3, ComponentKind::And),
+                (4, ComponentKind::Output),
+                (5, ComponentKind::Output),
+            ],
+            &[
+                (out(9), inp(3, 0)),
+                (out(2), inp(3, 1)),
+                (out(3), inp(4, 0)),
+                (out(9), inp(5, 0)),
+            ],
+        );
+        // Component data uses the configured bits even if visual order is reversed.
+        let mut doc = doc;
+        doc.components[0] = high;
+        doc.components[1] = low;
+        let mut runtime = Runtime::start(&doc).unwrap();
+        assert_eq!(runtime.pin_value(out(9)), Some(High));
+        assert_eq!(runtime.pin_value(out(2)), Some(Low));
+        assert_eq!(runtime.output_value(ComponentId(5)), Some(High));
+        assert_eq!(runtime.output_value(ComponentId(4)), Some(Unavailable));
+        settled(&mut runtime);
+        assert_eq!(runtime.output_value(ComponentId(4)), Some(Low));
+        let mut reversed = doc.clone();
+        reversed.components.reverse();
+        reversed.wires.reverse();
+        let mut reordered = Runtime::start(&reversed).unwrap();
+        settled(&mut reordered);
+        assert_eq!(reordered.output_value(ComponentId(4)), Some(Low));
+        assert_eq!(
+            runtime.set_input(ComponentId(9), false),
+            Err(RuntimeError::NotAnInput(ComponentId(9)))
+        );
+        assert_eq!(
+            runtime.toggle_input(ComponentId(2)),
+            Err(RuntimeError::NotAnInput(ComponentId(2)))
+        );
+        let isolated = document(&[(7, ComponentKind::Const)], &[]);
+        let mut standalone = Runtime::start(&isolated).unwrap();
+        assert_eq!(standalone.settle(0), SettleOutcome::Settled { work: 0 });
+        assert_eq!(standalone.pin_value(out(7)), Some(High));
+    }
+
+    #[test]
+    fn equal_constant_drivers_are_still_a_compile_error() {
+        let mut a = component(1, ComponentKind::Const);
+        let b = component(2, ComponentKind::Const);
+        a.constant_value = b.constant_value;
+        let doc = Document {
+            components: vec![a, b],
+            wires: vec![Wire {
+                id: WireId(1),
+                endpoints: [out(1), out(2)],
+            }],
+        };
+        assert!(matches!(
+            Runtime::start(&doc),
+            Err(CompileError::MultipleDrivers { .. })
+        ));
     }
 
     #[test]
