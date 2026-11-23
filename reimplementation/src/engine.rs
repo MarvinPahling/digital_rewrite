@@ -3,9 +3,13 @@
 use crate::domain::{
     Component, ComponentId, ComponentKind, Document, PinRef, Position, Wire, WireId,
 };
+use crate::file_session::{
+    self, DiscardIntent, FileIo, PublishFailure, PublishOutcome, SaveAsIntent,
+};
 use crate::formats::{self, DigReadError, DigWriteError};
 use crate::runtime::{InputChange, Runtime, RuntimeError, SettleOutcome, StepOutcome};
 use crate::simulation::CompileError;
+use std::path::{Path, PathBuf};
 #[derive(Default)]
 pub struct Session {
     document: Document,
@@ -16,6 +20,7 @@ pub struct Session {
     next_wire_id: u64,
     /// Transient simulation state. Never part of the document or its history.
     runtime: Option<Runtime>,
+    path: Option<PathBuf>,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditError {
@@ -46,12 +51,15 @@ impl std::fmt::Display for EditError {
     }
 }
 impl std::error::Error for EditError {}
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum SessionDigError {
     SimulationActive,
     Read(DigReadError),
     Domain(formats::DomainCodecError),
     Write(DigWriteError),
+    DirtyDiscardRequired,
+    Path(std::io::Error),
+    File(std::io::Error),
 }
 impl std::fmt::Display for SessionDigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,10 +68,38 @@ impl std::fmt::Display for SessionDigError {
             Self::Read(e) => e.fmt(f),
             Self::Domain(e) => e.fmt(f),
             Self::Write(e) => e.fmt(f),
+            Self::DirtyDiscardRequired => {
+                f.write_str("Document has unsaved changes; explicit discard intent is required")
+            }
+            Self::Path(e) => e.fmt(f),
+            Self::File(e) => e.fmt(f),
         }
     }
 }
 impl std::error::Error for SessionDigError {}
+#[derive(Debug)]
+pub enum SaveError {
+    SimulationActive,
+    PathRequired,
+    Path(std::io::Error),
+    Codec(SessionDigError),
+    NotPublished(PublishFailure),
+}
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SimulationActive => f.write_str("Stop the simulation before saving"),
+            Self::PathRequired => {
+                f.write_str("Save As is required because this session has no file path")
+            }
+            Self::Path(e) => e.fmt(f),
+            Self::Codec(e) => e.fmt(f),
+            Self::NotPublished(e) => e.fmt(f),
+        }
+    }
+}
+impl std::error::Error for SaveError {}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SimulationError {
     AlreadyActive,
@@ -103,6 +139,7 @@ impl Session {
         })?;
         self.document = document.clone();
         self.saved = document;
+        self.path = None;
         self.undo.clear();
         self.redo.clear();
         self.next_id = next_id;
@@ -113,6 +150,108 @@ impl Session {
     pub fn export_dig_bytes(&self) -> Result<Vec<u8>, SessionDigError> {
         let dig = formats::from_domain(&self.document).map_err(SessionDigError::Domain)?;
         formats::serialize_v2(&dig).map_err(SessionDigError::Write)
+    }
+
+    /// The associated absolute path, if this session has been opened/saved from disk.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Bounded open through an explicitly based, injectable filesystem adapter. Symlinks,
+    /// directories and other non-regular files are refused by the local adapter.
+    pub fn open_path(
+        &mut self,
+        io: &mut dyn FileIo,
+        path: &Path,
+        discard: DiscardIntent,
+    ) -> Result<(), SessionDigError> {
+        if self.runtime.is_some() {
+            return Err(SessionDigError::SimulationActive);
+        }
+        if self.dirty() && matches!(discard, DiscardIntent::RefuseDirty) {
+            return Err(SessionDigError::DirtyDiscardRequired);
+        }
+        let path =
+            file_session::resolve_path(io.base_dir(), path).map_err(SessionDigError::Path)?;
+        let bytes = io
+            .read_bounded_regular(&path, file_session::MAX_OPEN_BYTES)
+            .map_err(SessionDigError::File)?;
+        if bytes.len() > file_session::MAX_OPEN_BYTES {
+            return Err(SessionDigError::Read(DigReadError {
+                kind: formats::DigReadErrorKind::InputLimit,
+                offset: file_session::MAX_OPEN_BYTES,
+                context: "document".into(),
+                message: "input exceeds 4 MiB".into(),
+            }));
+        }
+        self.open_bytes_at(&bytes, Some(path))
+    }
+
+    fn open_bytes_at(
+        &mut self,
+        bytes: &[u8],
+        path: Option<PathBuf>,
+    ) -> Result<(), SessionDigError> {
+        let parsed = formats::parse_v2(bytes).map_err(SessionDigError::Read)?;
+        let document = formats::to_domain(&parsed).map_err(SessionDigError::Domain)?;
+        let next_id = u64::try_from(document.components.len()).map_err(|_| {
+            SessionDigError::Domain(formats::DomainCodecError(
+                "component ID counter overflow".into(),
+            ))
+        })?;
+        let next_wire_id = u64::try_from(document.wires.len()).map_err(|_| {
+            SessionDigError::Domain(formats::DomainCodecError("wire ID counter overflow".into()))
+        })?;
+        self.document = document.clone();
+        self.saved = document;
+        self.undo.clear();
+        self.redo.clear();
+        self.next_id = next_id;
+        self.next_wire_id = next_wire_id;
+        self.path = path;
+        Ok(())
+    }
+
+    /// Save to the current association. All encoding finishes before the filesystem is touched.
+    pub fn save(&mut self, io: &mut dyn FileIo) -> Result<PublishOutcome, SaveError> {
+        self.ensure_file_editable()?;
+        let target = self.path.clone().ok_or(SaveError::PathRequired)?;
+        self.save_encoded(io, target, SaveAsIntent::Replace)
+    }
+
+    /// Save As requires explicit intent: create-only is atomically no-clobber; replacement uses
+    /// same-directory atomic replacement. Association and saved baseline change only after publish.
+    pub fn save_as(
+        &mut self,
+        io: &mut dyn FileIo,
+        path: &Path,
+        intent: SaveAsIntent,
+    ) -> Result<PublishOutcome, SaveError> {
+        self.ensure_file_editable()?;
+        let target = file_session::resolve_path(io.base_dir(), path).map_err(SaveError::Path)?;
+        self.save_encoded(io, target, intent)
+    }
+
+    fn ensure_file_editable(&self) -> Result<(), SaveError> {
+        if self.runtime.is_some() {
+            Err(SaveError::SimulationActive)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn save_encoded(
+        &mut self,
+        io: &mut dyn FileIo,
+        target: PathBuf,
+        intent: SaveAsIntent,
+    ) -> Result<PublishOutcome, SaveError> {
+        let bytes = self.export_dig_bytes().map_err(SaveError::Codec)?;
+        let outcome = file_session::publish_bytes(io, &target, &bytes, intent)
+            .map_err(SaveError::NotPublished)?;
+        self.saved = self.document.clone();
+        self.path = Some(target);
+        Ok(outcome)
     }
 
     pub fn dirty(&self) -> bool {
@@ -323,13 +462,299 @@ mod tests {
         assert_unchanged(&session, &before);
         session.start_simulation().unwrap();
         let active = snapshot(&session);
-        assert_eq!(
+        assert!(matches!(
             session.open_dig_bytes(b"bad"),
             Err(SessionDigError::SimulationActive)
-        );
+        ));
         assert_unchanged(&session, &active);
         session.stop_simulation().unwrap();
     }
+    struct OversizedIo;
+    impl crate::file_session::FileIo for OversizedIo {
+        fn base_dir(&self) -> &Path {
+            Path::new("/")
+        }
+        fn read_bounded_regular(&mut self, _: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+            Ok(vec![b'x'; limit + 1])
+        }
+        fn validate_target(
+            &mut self,
+            _: &Path,
+            _: crate::file_session::SaveAsIntent,
+        ) -> std::io::Result<()> {
+            panic!("unexpected target inspection")
+        }
+        fn create_temp(
+            &mut self,
+            _: &Path,
+        ) -> std::io::Result<Box<dyn crate::file_session::StagedFile>> {
+            panic!("unexpected temp create")
+        }
+        fn publish(
+            &mut self,
+            _: &Path,
+            _: &Path,
+            _: crate::file_session::SaveAsIntent,
+        ) -> std::io::Result<()> {
+            panic!("unexpected publish")
+        }
+        fn sync_parent(&mut self, _: &Path) -> std::io::Result<()> {
+            panic!("unexpected directory sync")
+        }
+        fn remove_temp(&mut self, _: &Path) -> std::io::Result<()> {
+            panic!("unexpected temp cleanup")
+        }
+    }
+
+    #[test]
+    fn adapter_cannot_return_more_than_the_session_open_bound() {
+        let mut session = Session::default();
+        session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let before = snapshot(&session);
+        assert!(matches!(
+            session.open_path(
+                &mut OversizedIo,
+                Path::new("unchecked.dig"),
+                crate::file_session::DiscardIntent::DiscardDirty
+            ),
+            Err(SessionDigError::Read(_))
+        ));
+        assert_unchanged(&session, &before);
+    }
+
+    #[test]
+    fn file_open_failures_and_dirty_or_locked_rejections_are_transactional() {
+        use crate::file_session::{DiscardIntent, LocalFileIo};
+        let dir = std::env::temp_dir().join(format!("digital-rust-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>";
+        let path = dir.join("valid.dig");
+        std::fs::write(&path, good).unwrap();
+        let mut io = LocalFileIo::new(&dir);
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::Not, Position { x: 1., y: 2. })
+            .unwrap();
+        let before = snapshot(&session);
+        assert!(matches!(
+            session.open_path(
+                &mut io,
+                Path::new("missing.dig"),
+                DiscardIntent::DiscardDirty
+            ),
+            Err(SessionDigError::File(_))
+        ));
+        assert_unchanged(&session, &before);
+        assert!(matches!(
+            session.open_path(&mut io, Path::new("valid.dig"), DiscardIntent::RefuseDirty),
+            Err(SessionDigError::DirtyDiscardRequired)
+        ));
+        assert_unchanged(&session, &before);
+        session
+            .open_path(&mut io, Path::new("valid.dig"), DiscardIntent::DiscardDirty)
+            .unwrap();
+        assert_eq!(session.path(), Some(path.as_path()));
+        assert!(!session.dirty());
+        assert!(session.undo.is_empty());
+        assert!(session.redo.is_empty());
+        let next = session
+            .place(ComponentKind::Output, Position { x: 4., y: 5. })
+            .unwrap();
+        assert!(next.0 > id.0);
+        for (name, bytes) in [
+            ("malformed.dig", b"bad".as_slice()),
+            (
+                "unsupported.dig",
+                b"<circuit><version>1</version></circuit>".as_slice(),
+            ),
+            (
+                "oversized.dig",
+                vec![b' '; crate::file_session::MAX_OPEN_BYTES + 1].as_slice(),
+            ),
+        ] {
+            let bad = dir.join(name);
+            std::fs::write(&bad, bytes).unwrap();
+            let before = snapshot(&session);
+            assert!(
+                session
+                    .open_path(&mut io, &bad, DiscardIntent::DiscardDirty)
+                    .is_err()
+            );
+            assert_unchanged(&session, &before);
+        }
+        session.delete(next).unwrap();
+        session.start_simulation().unwrap();
+        let before = snapshot(&session);
+        assert!(matches!(
+            session.open_path(
+                &mut io,
+                Path::new("missing.dig"),
+                DiscardIntent::DiscardDirty
+            ),
+            Err(SessionDigError::SimulationActive)
+        ));
+        assert_unchanged(&session, &before);
+        session.stop_simulation().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct NoFileAccess;
+    impl crate::file_session::FileIo for NoFileAccess {
+        fn base_dir(&self) -> &Path {
+            Path::new("/")
+        }
+        fn read_bounded_regular(&mut self, _: &Path, _: usize) -> std::io::Result<Vec<u8>> {
+            panic!("unexpected file read")
+        }
+        fn validate_target(
+            &mut self,
+            _: &Path,
+            _: crate::file_session::SaveAsIntent,
+        ) -> std::io::Result<()> {
+            panic!("unexpected target inspection")
+        }
+        fn create_temp(
+            &mut self,
+            _: &Path,
+        ) -> std::io::Result<Box<dyn crate::file_session::StagedFile>> {
+            panic!("unexpected temp create")
+        }
+        fn publish(
+            &mut self,
+            _: &Path,
+            _: &Path,
+            _: crate::file_session::SaveAsIntent,
+        ) -> std::io::Result<()> {
+            panic!("unexpected publish")
+        }
+        fn sync_parent(&mut self, _: &Path) -> std::io::Result<()> {
+            panic!("unexpected directory sync")
+        }
+        fn remove_temp(&mut self, _: &Path) -> std::io::Result<()> {
+            panic!("unexpected temp cleanup")
+        }
+    }
+
+    #[test]
+    fn save_path_required_and_simulation_locks_precede_any_file_operation() {
+        let mut io = NoFileAccess;
+        let mut session = Session::default();
+        assert!(matches!(
+            session.save(&mut io),
+            Err(SaveError::PathRequired)
+        ));
+        session.start_simulation().unwrap();
+        assert!(matches!(
+            session.save(&mut io),
+            Err(SaveError::SimulationActive)
+        ));
+        assert!(matches!(
+            session.save_as(
+                &mut io,
+                Path::new("x.dig"),
+                crate::file_session::SaveAsIntent::Replace
+            ),
+            Err(SaveError::SimulationActive)
+        ));
+        assert!(matches!(
+            session.open_path(
+                &mut io,
+                Path::new("x.dig"),
+                crate::file_session::DiscardIntent::DiscardDirty
+            ),
+            Err(SessionDigError::SimulationActive)
+        ));
+        session.stop_simulation().unwrap();
+    }
+
+    #[test]
+    fn codec_refusal_does_not_reach_filesystem() {
+        let mut io = NoFileAccess;
+        let mut session = Session::default();
+        session
+            .place(
+                ComponentKind::Input,
+                Position {
+                    x: f32::MAX,
+                    y: 0.0,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            session.save_as(
+                &mut io,
+                Path::new("unsupported.dig"),
+                crate::file_session::SaveAsIntent::Replace
+            ),
+            Err(SaveError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn save_and_save_as_update_association_only_after_publish_and_keep_history() {
+        use crate::file_session::{LocalFileIo, PublishOutcome, SaveAsIntent};
+        let dir =
+            std::env::temp_dir().join(format!("digital-rust-save-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut io = LocalFileIo::new(&dir);
+        let mut session = Session::default();
+        assert!(matches!(
+            session.save(&mut io),
+            Err(SaveError::PathRequired)
+        ));
+        let id = session
+            .place(ComponentKind::Input, Position { x: 2., y: 3. })
+            .unwrap();
+        assert_eq!(
+            session
+                .save_as(&mut io, Path::new("first.dig"), SaveAsIntent::CreateOnly)
+                .unwrap(),
+            PublishOutcome::Published
+        );
+        let first_path = dir.join("first.dig");
+        assert_eq!(session.path(), Some(first_path.as_path()));
+        assert!(!session.dirty());
+        let next = session
+            .place(ComponentKind::Not, Position { x: 40., y: 0. })
+            .unwrap();
+        let undo_len = session.undo.len();
+        let before_path = session.path().unwrap().to_path_buf();
+        assert!(
+            session
+                .save_as(&mut io, Path::new("first.dig"), SaveAsIntent::CreateOnly)
+                .is_err()
+        );
+        assert_eq!(session.path(), Some(before_path.as_path()));
+        assert!(session.dirty());
+        assert_eq!(session.undo.len(), undo_len);
+        let second_path = dir.join("second.dig");
+        session
+            .save_as(&mut io, Path::new("second.dig"), SaveAsIntent::CreateOnly)
+            .unwrap();
+        assert_eq!(session.path(), Some(second_path.as_path()));
+        assert!(!session.dirty());
+        assert_eq!(session.undo.len(), undo_len);
+        session.undo().unwrap();
+        assert!(session.dirty());
+        session.redo().unwrap();
+        assert!(!session.dirty());
+        assert_eq!(session.document.components.last().unwrap().id, next);
+        let mut reopened = Session::default();
+        reopened
+            .open_path(
+                &mut io,
+                Path::new("second.dig"),
+                crate::file_session::DiscardIntent::RefuseDirty,
+            )
+            .unwrap();
+        assert_eq!(reopened.document(), session.document());
+        assert!(reopened.path().is_some());
+        assert_eq!(id, crate::domain::ComponentId(0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn imported_geometric_netlist_roundtrips_and_simulates_truth_table() {
         let xml=b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement><visualElement><elementName>Not</elementName><elementAttributes/><pos x=\"100\" y=\"0\"/></visualElement><visualElement><elementName>Out</elementName><elementAttributes/><pos x=\"200\" y=\"0\"/></visualElement></visualElements><wires><wire><p1 x=\"0\" y=\"0\"/><p2 x=\"100\" y=\"0\"/></wire><wire><p1 x=\"140\" y=\"0\"/><p2 x=\"200\" y=\"0\"/></wire></wires></circuit>";
@@ -547,6 +972,7 @@ mod tests {
         next_id: u64,
         next_wire_id: u64,
         dirty: bool,
+        path: Option<PathBuf>,
     }
     fn snapshot(s: &Session) -> Snapshot {
         Snapshot {
@@ -557,6 +983,7 @@ mod tests {
             next_id: s.next_id,
             next_wire_id: s.next_wire_id,
             dirty: s.dirty(),
+            path: s.path.clone(),
         }
     }
     fn assert_unchanged(s: &Session, before: &Snapshot) {
@@ -567,6 +994,7 @@ mod tests {
         assert_eq!(s.next_id, before.next_id);
         assert_eq!(s.next_wire_id, before.next_wire_id);
         assert_eq!(s.dirty(), before.dirty);
+        assert_eq!(s.path, before.path);
     }
     #[test]
     fn failed_start_preserves_everything_and_does_not_activate() {
