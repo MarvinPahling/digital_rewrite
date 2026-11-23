@@ -1,5 +1,6 @@
 [package]
 name = "digital-rust"
+default-run = "digital-rust"
 version = "0.1.0"
 edition = "2024"
 

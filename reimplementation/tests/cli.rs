@@ -102,9 +102,20 @@ fn malformed_missing_unsupported_and_usage_errors_have_stable_status_and_stderr(
 #[test]
 fn assignments_are_validated_before_start_and_overflow_is_usage_error() {
     let dir = TempDir::new();
-    fs::write(dir.0.join("input.dig"), fixture("in")).unwrap();
+    fs::write(
+        dir.0.join("input.dig"),
+        gate_document(digital_rust::domain::ComponentKind::Not),
+    )
+    .unwrap();
+    let invalid = cli(
+        &dir,
+        &["simulate", "input.dig", "--budget", "1", "--input", "99=1"],
+    );
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("unknown input component ID 99"));
+    assert!(!String::from_utf8_lossy(&invalid.stderr).contains("budget exhausted"));
     for args in [
-        vec!["simulate", "input.dig", "--input", "99=1"],
         vec!["simulate", "input.dig", "--input", "0=2"],
         vec!["simulate", "input.dig", "--input", "0=1", "--input", "0=0"],
         vec![
@@ -247,6 +258,38 @@ fn inverter_and_two_input_gates_run_exhaustive_truth_tables() {
         }
     }
 }
+#[test]
+fn startup_and_input_assignment_share_one_budget_at_exact_boundary() {
+    let dir = TempDir::new();
+    fs::write(
+        dir.0.join("not.dig"),
+        gate_document(digital_rust::domain::ComponentKind::Not),
+    )
+    .unwrap();
+
+    // One gate takes two settle work units (begin batch, evaluate); setting the input queues
+    // that gate again, taking two more. This exact cumulative total must be accepted.
+    let exact = cli(
+        &dir,
+        &["simulate", "not.dig", "--input", "0=1", "--budget", "4"],
+    );
+    assert!(
+        exact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exact.stderr)
+    );
+    assert!(String::from_utf8_lossy(&exact.stdout).contains("value=0"));
+
+    // One less than the cumulative startup-plus-assignment cost must fail without output.
+    let short = cli(
+        &dir,
+        &["simulate", "not.dig", "--input", "0=1", "--budget", "3"],
+    );
+    assert_eq!(short.status.code(), Some(1));
+    assert!(short.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&short.stderr).contains("budget exhausted"));
+}
+
 #[test]
 fn settle_exhaustion_has_no_settled_output() {
     let dir = TempDir::new();
