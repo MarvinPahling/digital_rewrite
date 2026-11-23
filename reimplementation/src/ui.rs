@@ -4,7 +4,7 @@
 //! screen through [`CanvasTransform`]. The shape style is transient UI state and never reaches
 //! the engine or the document.
 use crate::{
-    canvas::CanvasTransform,
+    canvas::{CanvasTransform, CanvasViewState, grid_lines},
     components::KINDS,
     domain::{ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position, WireId},
     engine::{EditError, SaveError, Session, SimulationError},
@@ -16,9 +16,6 @@ use crate::{
 };
 use eframe::egui::{self, Pos2, Rect, Sense, Stroke, Vec2};
 
-/// Screen points per world unit. Pan and zoom will vary this; everything already goes through
-/// the [`CanvasTransform`].
-const CANVAS_ZOOM: f32 = 1.0;
 /// Extra reach of a click around a symbol's bounds, in screen points.
 const PICK_TOLERANCE: f32 = 2.0;
 /// Gap between a symbol's bounds and its selection frame, in world units.
@@ -40,6 +37,14 @@ enum SimAction {
     Step,
     Settle,
     Toggle(ComponentId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewAction {
+    ZoomIn,
+    ZoomOut,
+    Fit,
+    Reset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +85,11 @@ pub struct DigitalApp {
     approved_close: bool,
     label_modal: Option<LabelDraft>,
     restore_canvas_focus: bool,
+    view: CanvasViewState,
+    pan_owner: Option<egui::PointerButton>,
+    fit_view_pending: bool,
+    view_action: Option<ViewAction>,
+    canvas_rect: Option<Rect>,
 }
 #[derive(Clone, Debug)]
 struct LabelDraft {
@@ -155,6 +165,11 @@ impl DigitalApp {
             approved_close: false,
             label_modal: None,
             restore_canvas_focus: false,
+            view: CanvasViewState::default(),
+            pan_owner: None,
+            fit_view_pending: false,
+            view_action: None,
+            canvas_rect: None,
         }
     }
 }
@@ -164,6 +179,111 @@ pub fn native_options() -> eframe::NativeOptions {
         ..Default::default()
     }
 }
+/// Conservative content extent for fit: symbol strokes/bounds, canonical routed wire paths and
+/// measured multiline labels. Text and runtime badges are screen-sized, so reserve their measured
+/// galley width/height as screen margins rather than scaling the fonts with the camera.
+type ViewBounds = ([f32; 2], [f32; 2], f32);
+fn document_view_bounds(
+    doc: &Document,
+    style: SymbolStyle,
+    painter: &egui::Painter,
+) -> Result<Option<ViewBounds>, String> {
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    let mut have_geometry = false;
+    let mut label_width = 0.0_f32;
+    let mut label_height = 0.0_f32;
+    let mut anchors = std::collections::HashMap::new();
+    let include = |p: [f32; 2], min: &mut [f32; 2], max: &mut [f32; 2]| -> bool {
+        if !p.into_iter().all(f32::is_finite) {
+            return false;
+        }
+        min[0] = min[0].min(p[0]);
+        min[1] = min[1].min(p[1]);
+        max[0] = max[0].max(p[0]);
+        max[1] = max[1].max(p[1]);
+        true
+    };
+    for c in &doc.components {
+        let Some(layout) = SymbolLayout::centered_on(style, c.kind, [c.position.x, c.position.y])
+        else {
+            return Err(format!(
+                "Cannot fit: missing symbol geometry for {}",
+                c.kind.name()
+            ));
+        };
+        let bounds = layout.bounds();
+        if !include(bounds.min, &mut min, &mut max) || !include(bounds.max, &mut min, &mut max) {
+            return Err(format!(
+                "Cannot fit: invalid geometry for component #{}",
+                c.id.0
+            ));
+        }
+        have_geometry = true;
+        for anchor in layout.anchors() {
+            anchors.insert(
+                PinRef {
+                    component: c.id,
+                    pin: match anchor.name {
+                        "pin-in-0" => PinId {
+                            direction: PinDirection::Input,
+                            index: 0,
+                        },
+                        "pin-in-1" => PinId {
+                            direction: PinDirection::Input,
+                            index: 1,
+                        },
+                        "pin-out-0" => PinId {
+                            direction: PinDirection::Output,
+                            index: 0,
+                        },
+                        _ => continue,
+                    },
+                },
+                anchor.position,
+            );
+        }
+        let galley = painter.layout_no_wrap(
+            c.label.clone(),
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        );
+        label_width = label_width.max(galley.size().x);
+        label_height = label_height.max(galley.size().y);
+    }
+    for wire in &doc.wires {
+        let (Some(a), Some(b)) = (
+            anchors.get(&wire.endpoints[0]),
+            anchors.get(&wire.endpoints[1]),
+        ) else {
+            return Err(format!(
+                "Cannot fit: wire #{} has a missing endpoint",
+                wire.id.0
+            ));
+        };
+        let path = crate::wire_geometry::path((wire.endpoints[0], *a), (wire.endpoints[1], *b));
+        for point in path {
+            if !include(point, &mut min, &mut max) {
+                return Err(format!("Cannot fit: invalid wire geometry #{}", wire.id.0));
+            }
+        }
+        have_geometry = true;
+    }
+    if !have_geometry {
+        return Ok(None);
+    }
+    let badge_height = if doc.components.is_empty() { 0.0 } else { 18.0 };
+    let margin = (label_width * 0.5).max(36.0) + 12.0;
+    // Labels and badges sit below each component (not centred on it), with selection-frame
+    // padding growing with zoom; reserve for the maximum supported camera scale conservatively.
+    let vertical = 42.0 + label_height + badge_height;
+    let margin = margin.max(vertical);
+    if !margin.is_finite() {
+        return Err("Cannot fit: measured labels exceed finite canvas dimensions".into());
+    }
+    Ok(Some((min, max, margin)))
+}
+
 fn draw_grid(
     painter: &egui::Painter,
     rect: Rect,
@@ -171,25 +291,19 @@ fn draw_grid(
     color: egui::Color32,
 ) {
     let stroke = Stroke::new(0.5_f32, color);
-    let [left, top] = transform.to_world(rect.min);
-    let [right, bottom] = transform.to_world(rect.max);
-    let mut column = (left / GRID_UNIT).floor();
-    while column * GRID_UNIT < right {
-        let x = transform.to_screen([column * GRID_UNIT, 0.]).x;
-        painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            stroke,
-        );
-        column += 1.;
-    }
-    let mut row = (top / GRID_UNIT).floor();
-    while row * GRID_UNIT < bottom {
-        let y = transform.to_screen([0., row * GRID_UNIT]).y;
-        painter.line_segment(
-            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-            stroke,
-        );
-        row += 1.;
+    for (vertical, coordinate) in grid_lines(rect, transform, GRID_UNIT) {
+        let (from, to) = if vertical {
+            (
+                Pos2::new(coordinate, rect.top()),
+                Pos2::new(coordinate, rect.bottom()),
+            )
+        } else {
+            (
+                Pos2::new(rect.left(), coordinate),
+                Pos2::new(rect.right(), coordinate),
+            )
+        };
+        painter.line_segment([from, to], stroke);
     }
 }
 impl DigitalApp {
@@ -247,6 +361,7 @@ impl DigitalApp {
         }
     }
     fn cancel_gestures(&mut self) {
+        self.pan_owner = None;
         self.placing = None;
         self.wiring = false;
         self.wire_start = None;
@@ -283,7 +398,11 @@ impl DigitalApp {
         };
         match action {
             PendingAction::New => match self.session.new_document(DiscardIntent::DiscardDirty) {
-                Ok(()) => self.reset_document_ui(),
+                Ok(()) => {
+                    self.reset_document_ui();
+                    self.view.reset();
+                    self.fit_view_pending = false;
+                }
                 Err(error) => {
                     self.error = Some(error.to_string());
                     self.pending_action = Some(PendingAction::New);
@@ -304,7 +423,10 @@ impl DigitalApp {
                             .map_err(|e| e.to_string())
                     });
                 match result {
-                    Ok(()) => self.reset_document_ui(),
+                    Ok(()) => {
+                        self.reset_document_ui();
+                        self.fit_view_pending = true;
+                    }
                     Err(error) => {
                         self.error = Some(error);
                         self.pending_action = Some(PendingAction::Open(path));
@@ -320,8 +442,21 @@ impl DigitalApp {
             }
         }
     }
+    fn fit_extent(&mut self, rect: Rect, min: [f32; 2], max: [f32; 2], margin: f32) {
+        let limited = CanvasViewState::fit_limited(rect, min, max, margin);
+        if !self.view.fit(rect, min, max, margin) {
+            self.error = Some("Cannot fit circuit: invalid canvas or geometry extent".into());
+        } else if limited {
+            self.error = Some(
+                "Fit limited by minimum zoom; content may extend beyond the visible canvas".into(),
+            );
+        } else {
+            self.error = None;
+        }
+    }
     fn reset_document_ui(&mut self) {
         self.cancel_label_edit();
+        self.pan_owner = None;
         self.selected = None;
         self.selected_wire = None;
         self.cancel_gestures();
@@ -658,6 +793,7 @@ impl DigitalApp {
         match action {
             SimAction::Start => match self.session.start_simulation() {
                 Ok(()) => {
+                    self.pan_owner = None;
                     self.placing = None;
                     self.wiring = false;
                     self.wire_start = None;
@@ -676,6 +812,7 @@ impl DigitalApp {
             },
             SimAction::Stop => match self.session.stop_simulation() {
                 Ok(()) => {
+                    self.pan_owner = None;
                     self.settling = false;
                     self.error = None;
                 }
@@ -900,6 +1037,14 @@ impl DigitalApp {
                     }
                 });
             });
+            ui.horizontal_wrapped(|ui| {
+                let nav_enabled = self.drag.is_none();
+                if ui.add_enabled(nav_enabled, egui::Button::new("− Zoom out")).on_hover_text("Zoom out (−)").clicked() { self.view_action = Some(ViewAction::ZoomOut); }
+                if ui.add_enabled(nav_enabled, egui::Button::new("+ Zoom in")).on_hover_text("Zoom in (+)").clicked() { self.view_action = Some(ViewAction::ZoomIn); }
+                if ui.add_enabled(nav_enabled, egui::Button::new("Fit")).on_hover_text("Fit circuit (F)").clicked() { self.view_action = Some(ViewAction::Fit); }
+                if ui.add_enabled(nav_enabled, egui::Button::new("Reset")).on_hover_text("Reset view (0)").clicked() { self.view_action = Some(ViewAction::Reset); }
+            });
+            ui.label(format!("{:.0}% · Middle/Alt-drag pan · wheel zoom · +/- zoom · F fit · 0 reset · arrows pan", self.view.zoom() * 100.));
             if locked {
                 ui.label(if self.session.simulation_active() { EDIT_LOCK_NOTE } else { "Finish or cancel the file action to resume editing." });
             }
@@ -1094,27 +1239,99 @@ impl DigitalApp {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
             let painter = ui.painter_at(rect);
-            // The world origin sits at the canvas corner until panning exists.
-            let Some(transform) = CanvasTransform::new(rect.min, CANVAS_ZOOM) else {
-                return;
-            };
+            if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 { self.canvas_rect = None; return; }
+            self.canvas_rect = Some(rect);
+            if let Some(action) = self.view_action.take().filter(|_| self.drag.is_none()) {
+                match action {
+                    ViewAction::Reset => self.view.reset(),
+                    ViewAction::ZoomIn | ViewAction::ZoomOut => {
+                        let pointer = ctx.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p)).unwrap_or(rect.center());
+                        let factor = if action == ViewAction::ZoomIn { 1.2 } else { 1.0 / 1.2 };
+                        let _ = self.view.zoom_at(rect, pointer, factor);
+                    }
+                    ViewAction::Fit => {
+                        match document_view_bounds(self.session.document(), self.style, &ui.painter_at(rect)) {
+                            Ok(Some((min, max, margin))) => self.fit_extent(rect, min, max, margin),
+                            Ok(None) => self.view.reset(),
+                            Err(error) => self.error = Some(error),
+                        }
+                    }
+                }
+            }
+            if self.fit_view_pending {
+                match document_view_bounds(self.session.document(), self.style, &ui.painter_at(rect)) {
+                    Ok(Some((min, max, margin))) => { self.fit_extent(rect, min, max, margin); self.fit_view_pending = false; }
+                    Ok(None) => { self.view.reset(); self.fit_view_pending = false; }
+                    Err(error) => { self.error = Some(error); self.fit_view_pending = false; }
+                }
+            }
             let style = self.style;
-            draw_grid(
-                &painter,
-                rect,
-                transform,
-                ui.visuals().widgets.noninteractive.bg_stroke.color,
-            );
-            let cancelled =
-                modal_open || ctx.input(|i| !i.focused || i.key_pressed(egui::Key::Escape));
-            let pointer = (!cancelled)
-                .then(|| response.interact_pointer_pos())
-                .flatten();
+            let lost_pointer = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerGone)));
+            let cancelled = modal_open || ctx.input(|i| !i.focused || i.key_pressed(egui::Key::Escape)) || lost_pointer;
             if cancelled {
+                self.pan_owner = None;
                 self.drag = None;
                 self.placing = None;
                 self.wire_start = None;
             }
+            let pan_start = (!cancelled && self.drag.is_none()).then(|| ctx.input(|i| i.events.iter().find_map(|event| match event {
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Middle, pressed: true, .. } if rect.contains(*pos) => Some((egui::PointerButton::Middle, *pos)),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers, .. } if modifiers.alt && rect.contains(*pos) => Some((egui::PointerButton::Primary, *pos)),
+                _ => None,
+            }))).flatten();
+            let starting_pan = pan_start.is_some();
+            if let Some((owner, _)) = pan_start { self.pan_owner = Some(owner); }
+            let pan_sequence = starting_pan || self.pan_owner.is_some();
+            if pan_sequence && !starting_pan && !cancelled {
+                let delta = ctx.input(|i| i.pointer.delta());
+                let _ = self.view.pan(delta);
+            }
+            let owner_released = ctx.input(|i| i.events.iter().any(|event| matches!(event,
+                egui::Event::PointerButton { button, pressed: false, .. } if Some(*button) == self.pan_owner)));
+            if owner_released { self.pan_owner = None; }
+            if !modal_open && !pan_sequence && self.drag.is_none()
+                && let Some(pointer) = ctx.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p))
+            {
+                let (scroll, pinch) = ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+                let factor = ((scroll as f64 * 0.002).exp() * pinch as f64) as f32;
+                if factor.is_finite() && factor > 0.0 && (scroll != 0.0 || pinch != 1.0) {
+                    let _ = self.view.zoom_at(rect, pointer, factor);
+                }
+            }
+            if !modal_open && !pan_sequence && self.drag.is_none() && response.has_focus() {
+                let nav = ctx.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::Plus)
+                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::Plus)
+                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::Equals) { Some(ViewAction::ZoomIn) }
+                    else if i.consume_key(egui::Modifiers::NONE, egui::Key::Minus) { Some(ViewAction::ZoomOut) }
+                    else if i.consume_key(egui::Modifiers::NONE, egui::Key::F) { Some(ViewAction::Fit) }
+                    else if i.consume_key(egui::Modifiers::NONE, egui::Key::Num0) { Some(ViewAction::Reset) }
+                    else { None }
+                });
+                if let Some(action) = nav {
+                    match action {
+                        ViewAction::ZoomIn | ViewAction::ZoomOut => { let _ = self.view.zoom_at(rect, rect.center(), if action == ViewAction::ZoomIn { 1.2 } else { 1.0 / 1.2 }); }
+                        ViewAction::Reset => self.view.reset(),
+                        ViewAction::Fit => match document_view_bounds(self.session.document(), self.style, &painter) {
+                            Ok(Some((min,max,margin))) => self.fit_extent(rect,min,max,margin),
+                            Ok(None) => self.view.reset(),
+                            Err(error) => self.error = Some(error),
+                        }
+                    }
+                }
+                let pan_keys = ctx.input_mut(|i| {
+                    [egui::Key::ArrowLeft, egui::Key::ArrowRight, egui::Key::ArrowUp, egui::Key::ArrowDown]
+                        .into_iter()
+                        .find(|key| i.consume_key(egui::Modifiers::NONE, *key))
+                });
+                if let Some(key) = pan_keys {
+                    let delta = match key { egui::Key::ArrowLeft => Vec2::new(40.,0.), egui::Key::ArrowRight => Vec2::new(-40.,0.), egui::Key::ArrowUp => Vec2::new(0.,40.), _ => Vec2::new(0.,-40.) };
+                    let _ = self.view.pan(delta);
+                }
+            }
+            let Some(transform) = self.view.transform(rect) else { return; };
+            draw_grid(&painter, rect, transform, ui.visuals().widgets.noninteractive.bg_stroke.color);
+            let pointer = (!cancelled && !pan_sequence).then(|| response.interact_pointer_pos()).flatten();
             let mut pins: Vec<_> = self
                 .session
                 .document()
@@ -1152,7 +1369,7 @@ impl DigitalApp {
                     _ => None,
                 })
             });
-            if !cancelled
+            if !cancelled && !pan_sequence
                 && let Some(p) = press
                 && rect.contains(p)
             {
@@ -1219,7 +1436,7 @@ impl DigitalApp {
                     }
                 }
             }
-            if !cancelled
+            if !cancelled && !pan_sequence
                 && !locked
                 && response.clicked()
                 && let Some(kind) = self.placing.take()
@@ -1234,10 +1451,10 @@ impl DigitalApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            if !cancelled && response.clicked() {
+            if !cancelled && !pan_sequence && response.clicked() {
                 self.drag = None;
             }
-            if !cancelled
+            if !cancelled && !pan_sequence
                 && !locked
                 && response.drag_stopped()
                 && let (Some((id, start, origin)), Some(p)) = (self.drag.take(), pointer)
@@ -1314,7 +1531,7 @@ impl DigitalApp {
                         Stroke::new(2_f32, palette.selection),
                     );
                 }
-                if !cancelled
+                if !cancelled && !pan_sequence
                     && let Some(start) = self.wire_start
                     && let Some(a) = wire_pins.iter().find(|v| v.0 == start)
                     && let Some(p) = response.hover_pos()
@@ -1447,7 +1664,7 @@ impl DigitalApp {
                 response.request_focus();
                 self.restore_canvas_focus = false;
             }
-            let owns_keyboard = response.has_focus() && !self.modality_active();
+            let owns_keyboard = response.has_focus() && !self.modality_active() && !pan_sequence;
             if owns_keyboard {
                 ui.memory_mut(|m| {
                     m.set_focus_lock_filter(
@@ -1954,12 +2171,389 @@ mod tests {
         assert!(!has_line(&output, old, target, 2.));
     }
     fn button(pos: Pos2, pressed: bool) -> egui::Event {
+        pointer_button(
+            pos,
+            egui::PointerButton::Primary,
+            pressed,
+            egui::Modifiers::NONE,
+        )
+    }
+    fn pointer_button(
+        pos: Pos2,
+        button: egui::PointerButton,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+    ) -> egui::Event {
         egui::Event::PointerButton {
             pos,
-            button: egui::PointerButton::Primary,
+            button,
             pressed,
-            modifiers: egui::Modifiers::NONE,
+            modifiers,
         }
+    }
+    fn camera_rect(ctx: &egui::Context, app: &mut DigitalApp) -> Rect {
+        frame(ctx, app, vec![], true);
+        app.canvas_rect.expect("canvas has a usable viewport")
+    }
+    fn component_screen(app: &DigitalApp, id: ComponentId) -> Pos2 {
+        let c = app
+            .session
+            .document()
+            .components
+            .iter()
+            .find(|c| c.id == id)
+            .expect("component exists");
+        app.view
+            .transform(
+                app.canvas_rect
+                    .expect("canvas rect measured from egui frame"),
+            )
+            .expect("valid camera")
+            .to_screen([c.position.x, c.position.y])
+    }
+    #[test]
+    fn production_canvas_wheel_zoom_preserves_pointer_and_fit_uses_document_extent() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let a = app
+            .session
+            .place(ComponentKind::Input, Position { x: -400., y: -200. })
+            .unwrap();
+        let b = app
+            .session
+            .place(ComponentKind::Output, Position { x: 500., y: 300. })
+            .unwrap();
+        let rect = camera_rect(&ctx, &mut app);
+        let pointer = rect.center() + Vec2::new(36., 20.);
+        let before = app.view.transform(rect).unwrap().to_world(pointer);
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0., 80.),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            true,
+        );
+        assert!(app.view.zoom() > 1.0);
+        let after = app.view.transform(rect).unwrap().to_world(pointer);
+        assert!((before[0] - after[0]).abs() < 0.01 && (before[1] - after[1]).abs() < 0.01);
+        app.view_action = Some(ViewAction::Fit);
+        let rect = camera_rect(&ctx, &mut app);
+        let t = app.view.transform(rect).unwrap();
+        for id in [a, b] {
+            let c = app
+                .session
+                .document()
+                .components
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap();
+            let layout =
+                SymbolLayout::centered_on(app.style, c.kind, [c.position.x, c.position.y]).unwrap();
+            let bounds = layout.bounds();
+            let pmin = t.to_screen(bounds.min);
+            let pmax = t.to_screen(bounds.max);
+            assert!(rect.expand(1.).contains(pmin) && rect.expand(1.).contains(pmax));
+        }
+        assert!(t.zoom() >= crate::canvas::MIN_ZOOM);
+    }
+    #[test]
+    fn fit_keeps_symbols_wires_and_measured_multiline_unicode_labels_visible() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let input = app
+            .session
+            .place(ComponentKind::Input, Position { x: -420., y: -180. })
+            .unwrap();
+        let output = app
+            .session
+            .place(ComponentKind::Output, Position { x: 520., y: 260. })
+            .unwrap();
+        app.session.set_label(input, "Source\nΔ温度 🧭").unwrap();
+        app.session.set_label(output, "Output & result").unwrap();
+        let pins = |component, direction| PinRef {
+            component,
+            pin: PinId {
+                direction,
+                index: 0,
+            },
+        };
+        app.session
+            .connect([
+                pins(input, PinDirection::Output),
+                pins(output, PinDirection::Input),
+            ])
+            .unwrap();
+        let _ = camera_rect(&ctx, &mut app);
+        app.view_action = Some(ViewAction::Fit);
+        let output_frame = frame(&ctx, &mut app, vec![], true);
+        let rect = app.canvas_rect.unwrap();
+        let transform = app.view.transform(rect).unwrap();
+        for component in &app.session.document().components {
+            let layout = SymbolLayout::centered_on(
+                app.style,
+                component.kind,
+                [component.position.x, component.position.y],
+            )
+            .unwrap();
+            let bounds = layout.bounds();
+            assert!(
+                rect.contains(transform.to_screen(bounds.min))
+                    && rect.contains(transform.to_screen(bounds.max))
+            );
+            let position = transform
+                .to_screen([(bounds.min[0] + bounds.max[0]) * 0.5, bounds.max[1]])
+                + Vec2::new(0., SELECTION_MARGIN * transform.zoom() + LABEL_GAP);
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let galley = painter.layout_no_wrap(
+                component.label.clone(),
+                egui::FontId::proportional(14.),
+                egui::Color32::WHITE,
+            );
+            let label = Rect::from_center_size(
+                position + Vec2::new(0., galley.size().y * 0.5),
+                galley.size(),
+            );
+            assert!(
+                rect.contains_rect(label),
+                "measured label should fit: {:?}",
+                component.label
+            );
+        }
+        let wire = &app.session.document().wires[0];
+        let a = SymbolLayout::centered_on(app.style, ComponentKind::Input, [-420., -180.])
+            .unwrap()
+            .pin_position(wire.endpoints[0].pin)
+            .unwrap();
+        let b = SymbolLayout::centered_on(app.style, ComponentKind::Output, [520., 260.])
+            .unwrap()
+            .pin_position(wire.endpoints[1].pin)
+            .unwrap();
+        for point in crate::wire_geometry::path((wire.endpoints[0], a), (wire.endpoints[1], b)) {
+            assert!(
+                rect.contains(transform.to_screen(point)),
+                "fitted wire path remains visible"
+            );
+        }
+        assert!(output_frame.shapes.iter().all(|shape| match &shape.shape {
+            egui::Shape::LineSegment { points, .. } => points.iter().all(|p| p.is_finite()),
+            _ => true,
+        }));
+        app.apply_simulation_action(SimAction::Start);
+        app.view_action = Some(ViewAction::Fit);
+        let _ = frame(&ctx, &mut app, vec![], true);
+        let rect = app.canvas_rect.unwrap();
+        let transform = app.view.transform(rect).unwrap();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        for component in &app.session.document().components {
+            let layout = SymbolLayout::centered_on(
+                app.style,
+                component.kind,
+                [component.position.x, component.position.y],
+            )
+            .unwrap();
+            let bounds = layout.bounds();
+            let value_pin = if component.kind == ComponentKind::Output {
+                PinRef {
+                    component: component.id,
+                    pin: PinId {
+                        direction: PinDirection::Input,
+                        index: 0,
+                    },
+                }
+            } else {
+                PinRef {
+                    component: component.id,
+                    pin: PinId {
+                        direction: PinDirection::Output,
+                        index: 0,
+                    },
+                }
+            };
+            let value = app
+                .session
+                .inspect()
+                .unwrap()
+                .pin_value(value_pin)
+                .unwrap_or(Level::Unavailable);
+            let galley = painter.layout_no_wrap(
+                level_badge(value).into(),
+                egui::FontId::monospace(14.),
+                egui::Color32::WHITE,
+            );
+            let position = transform
+                .to_screen([(bounds.min[0] + bounds.max[0]) * 0.5, bounds.max[1]])
+                + Vec2::new(0., SELECTION_MARGIN * transform.zoom() + LABEL_GAP + 16.);
+            assert!(
+                rect.contains_rect(Rect::from_center_size(
+                    position + Vec2::new(0., galley.size().y * 0.5),
+                    galley.size()
+                )),
+                "runtime badge remains in fitted canvas"
+            );
+        }
+    }
+    #[test]
+    fn camera_shortcuts_are_canvas_focused_and_modal_safe_without_document_edits() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let rect = camera_rect(&ctx, &mut app);
+        click_at(&ctx, &mut app, rect.center());
+        let before = app.session.document().clone();
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Plus, egui::Modifiers::SHIFT)],
+            true,
+        );
+        assert!(app.view.zoom() > 1.0);
+        assert_eq!(*app.session.document(), before);
+        assert!(!app.session.dirty());
+        let zoom = app.view.zoom();
+        app.file_modal = Some(FileModal::OpenPath);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::F, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(
+            app.view.zoom(),
+            zoom,
+            "file modality blocks camera shortcuts"
+        );
+        assert_eq!(*app.session.document(), before);
+    }
+    #[test]
+    fn pan_owns_its_button_and_suppresses_canvas_edits_until_release() {
+        for owner in [egui::PointerButton::Middle, egui::PointerButton::Primary] {
+            let ctx = egui::Context::default();
+            let mut app = DigitalApp::default();
+            let id = app
+                .session
+                .place(ComponentKind::Input, Position { x: 100., y: 100. })
+                .unwrap();
+            app.placing = Some(ComponentKind::And);
+            app.wiring = true;
+            app.wire_start = Some(PinRef {
+                component: id,
+                pin: PinId {
+                    direction: PinDirection::Output,
+                    index: 0,
+                },
+            });
+            let rect = camera_rect(&ctx, &mut app);
+            let start = app.view.transform(rect).unwrap().to_screen([100., 100.]);
+            let mods = if owner == egui::PointerButton::Primary {
+                egui::Modifiers::ALT
+            } else {
+                egui::Modifiers::NONE
+            };
+            frame(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    pointer_button(start, owner, true, mods),
+                ],
+                true,
+            );
+            assert_eq!(app.pan_owner, Some(owner));
+            assert_eq!(app.session.document().components.len(), 1);
+            let before = app.view;
+            let outside = Pos2::new(rect.left() - 40., rect.top() - 30.);
+            frame(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(outside),
+                    pointer_button(
+                        outside,
+                        egui::PointerButton::Secondary,
+                        false,
+                        egui::Modifiers::NONE,
+                    ),
+                ],
+                true,
+            );
+            assert_eq!(
+                app.pan_owner,
+                Some(owner),
+                "a non-owner release cannot finish navigation"
+            );
+            assert_ne!(app.view, before, "drag remains live outside the viewport");
+            frame(
+                &ctx,
+                &mut app,
+                vec![pointer_button(outside, owner, false, egui::Modifiers::NONE)],
+                true,
+            );
+            assert_eq!(app.pan_owner, None);
+            assert_eq!(
+                app.session.document().components.len(),
+                1,
+                "pan must not place or move components"
+            );
+            assert_eq!(
+                app.selected, None,
+                "pan must not select the component underneath"
+            );
+            assert_eq!(
+                app.placing,
+                Some(ComponentKind::And),
+                "armed placement intent survives navigation"
+            );
+            assert!(
+                app.wiring && app.wire_start.is_some(),
+                "pending wire intent survives navigation"
+            );
+        }
+    }
+    #[test]
+    fn escape_and_focus_loss_cancel_pan_without_committing_edits() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        app.session
+            .place(ComponentKind::And, Position { x: 80., y: 80. })
+            .unwrap();
+        let rect = camera_rect(&ctx, &mut app);
+        let p = rect.center();
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(p),
+                pointer_button(p, egui::PointerButton::Middle, true, egui::Modifiers::NONE),
+            ],
+            true,
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(app.pan_owner, None);
+        assert_eq!(app.session.document().components[0].position.x, 80.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![pointer_button(
+                p,
+                egui::PointerButton::Middle,
+                true,
+                egui::Modifiers::NONE,
+            )],
+            true,
+        );
+        frame(&ctx, &mut app, vec![], false);
+        assert_eq!(app.pan_owner, None);
+        assert_eq!(app.session.document().components[0].position.x, 80.);
     }
     fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
@@ -2535,7 +3129,8 @@ mod tests {
         assert_eq!(app.session.document().components.len(), 2);
         assert!(app.session.document().components[0].constant_value);
         assert_eq!(app.session.document().wires.len(), 1);
-        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        let component_pos = component_screen(&app, const_id);
+        click_at(&ctx, &mut app, component_pos);
         assert_eq!(app.selected, Some(const_id));
         click_text(&ctx, &mut app, "Start");
         for _ in 0..10 {
@@ -2545,7 +3140,8 @@ mod tests {
             }
         }
         assert_eq!(output_level(&app, output_id), Some(Level::High));
-        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        let component_pos = component_screen(&app, const_id);
+        click_at(&ctx, &mut app, component_pos);
         press(&ctx, &mut app, egui::Key::L, egui::Modifiers::NONE);
         assert!(
             app.session.document().components[0].constant_value,
@@ -2553,11 +3149,13 @@ mod tests {
         );
         click_text(&ctx, &mut app, "Stop");
         assert!(!app.session.simulation_active());
-        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        let component_pos = component_screen(&app, const_id);
+        click_at(&ctx, &mut app, component_pos);
         press(&ctx, &mut app, egui::Key::L, egui::Modifiers::NONE);
         assert!(!app.session.document().components[0].constant_value);
         assert!(app.session.dirty());
-        click_at(&ctx, &mut app, Pos2::new(408., 158.));
+        let component_pos = component_screen(&app, const_id);
+        click_at(&ctx, &mut app, component_pos);
         press(&ctx, &mut app, egui::Key::O, egui::Modifiers::COMMAND);
         assert!(matches!(app.file_modal, Some(FileModal::OpenPath)));
         let before_modal = app.session.document().clone();
@@ -4048,7 +4646,8 @@ mod tests {
         );
         assert!(has_text(&settled, "Résultat & <Q>"));
         let document = app.session.document().clone();
-        click_at(&ctx, &mut app, Pos2::new(508., 108.));
+        let output_pos = component_screen(&app, output);
+        click_at(&ctx, &mut app, output_pos);
         assert_eq!(app.selected, Some(output));
         click_text(&ctx, &mut app, "Edit label… (F2)");
         assert!(
