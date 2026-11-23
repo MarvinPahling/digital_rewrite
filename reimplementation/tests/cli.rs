@@ -219,20 +219,23 @@ fn inverter_and_two_input_gates_run_exhaustive_truth_tables() {
                 .contains(&format!("output id=2 label=\"result\" value={}", 1 - input))
         );
     }
-    for kind in [ComponentKind::And, ComponentKind::Or] {
-        let file = if kind == ComponentKind::And {
-            "and.dig"
-        } else {
-            "or.dig"
-        };
-        fs::write(dir.0.join(file), gate_document(kind)).unwrap();
+    for kind in [
+        ComponentKind::And,
+        ComponentKind::NAnd,
+        ComponentKind::Or,
+        ComponentKind::NOr,
+        ComponentKind::XOr,
+        ComponentKind::XNOr,
+    ] {
+        let file = format!("{}.dig", kind.name().to_ascii_lowercase());
+        fs::write(dir.0.join(&file), gate_document(kind)).unwrap();
         for a in [0, 1] {
             for b in [0, 1] {
                 let out = cli(
                     &dir,
                     &[
                         "simulate",
-                        file,
+                        &file,
                         "--input",
                         &format!("0={a}"),
                         "--input",
@@ -244,10 +247,14 @@ fn inverter_and_two_input_gates_run_exhaustive_truth_tables() {
                     "{}",
                     String::from_utf8_lossy(&out.stderr)
                 );
-                let expected = if kind == ComponentKind::And {
-                    a & b
-                } else {
-                    a | b
+                let expected = match kind {
+                    ComponentKind::And => a & b,
+                    ComponentKind::NAnd => 1 - (a & b),
+                    ComponentKind::Or => a | b,
+                    ComponentKind::NOr => 1 - (a | b),
+                    ComponentKind::XOr => a ^ b,
+                    ComponentKind::XNOr => 1 - (a ^ b),
+                    _ => unreachable!(),
                 };
                 assert!(
                     String::from_utf8_lossy(&out.stdout).contains(&format!("value={expected}")),

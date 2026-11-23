@@ -50,7 +50,11 @@ pub enum ComponentKind {
     Input,
     Output,
     And,
+    NAnd,
     Or,
+    NOr,
+    XOr,
+    XNOr,
     Not,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,8 +85,14 @@ impl ComponentKind {
             (Self::Input, PinDirection::Output)
             | (Self::Output, PinDirection::Input)
             | (Self::Not, _)
-            | (Self::And | Self::Or, PinDirection::Output) => 1,
-            (Self::And | Self::Or, PinDirection::Input) => 2,
+            | (
+                Self::And | Self::NAnd | Self::Or | Self::NOr | Self::XOr | Self::XNOr,
+                PinDirection::Output,
+            ) => 1,
+            (
+                Self::And | Self::NAnd | Self::Or | Self::NOr | Self::XOr | Self::XNOr,
+                PinDirection::Input,
+            ) => 2,
             _ => 0,
         };
         pin.index < count

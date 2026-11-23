@@ -1373,23 +1373,10 @@ fn invalid(message: impl Into<String>) -> DomainCodecError {
 type Coord = (i32, i32);
 
 fn kind_from_name(name: &str) -> Option<ComponentKind> {
-    match name {
-        "In" => Some(ComponentKind::Input),
-        "Out" => Some(ComponentKind::Output),
-        "And" => Some(ComponentKind::And),
-        "Or" => Some(ComponentKind::Or),
-        "Not" => Some(ComponentKind::Not),
-        _ => None,
-    }
+    crate::components::from_digital_name(name)
 }
 fn name_from_kind(kind: ComponentKind) -> &'static str {
-    match kind {
-        ComponentKind::Input => "In",
-        ComponentKind::Output => "Out",
-        ComponentKind::And => "And",
-        ComponentKind::Or => "Or",
-        ComponentKind::Not => "Not",
-    }
+    kind.digital_name()
 }
 // Domain editor positions denote the artwork bounds center. Digital stores its logical origin;
 // share the renderer's toolkit-neutral placement metrics to keep pins aligned with the artwork.
@@ -1403,9 +1390,30 @@ fn center_offset(kind: ComponentKind) -> Result<(i32, i32), DomainCodecError> {
 }
 fn pin_offsets(kind: ComponentKind, pin: PinId) -> Option<Coord> {
     match (kind, pin.direction, pin.index) {
-        (ComponentKind::And | ComponentKind::Or, PinDirection::Input, 0) => Some((0, 0)),
-        (ComponentKind::And | ComponentKind::Or, PinDirection::Input, 1) => Some((0, 40)),
-        (ComponentKind::And | ComponentKind::Or, PinDirection::Output, 0) => Some((60, 20)),
+        (ComponentKind::And | ComponentKind::Or | ComponentKind::XOr, PinDirection::Input, 0) => {
+            Some((0, 0))
+        }
+        (ComponentKind::And | ComponentKind::Or | ComponentKind::XOr, PinDirection::Input, 1) => {
+            Some((0, 40))
+        }
+        (ComponentKind::And | ComponentKind::Or | ComponentKind::XOr, PinDirection::Output, 0) => {
+            Some((60, 20))
+        }
+        (
+            ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr,
+            PinDirection::Input,
+            0,
+        ) => Some((0, 0)),
+        (
+            ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr,
+            PinDirection::Input,
+            1,
+        ) => Some((0, 40)),
+        (
+            ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr,
+            PinDirection::Output,
+            0,
+        ) => Some((80, 20)),
         (ComponentKind::Not, PinDirection::Input, 0) => Some((0, 0)),
         (ComponentKind::Not, PinDirection::Output, 0) => Some((40, 0)),
         (ComponentKind::Input, PinDirection::Output, 0)
@@ -1982,6 +1990,30 @@ mod tests {
                     label: Some("OR".into()),
                 },
                 DigElement {
+                    name: "NAnd".into(),
+                    x: -220,
+                    y: -40,
+                    label: None,
+                },
+                DigElement {
+                    name: "NOr".into(),
+                    x: -320,
+                    y: -80,
+                    label: None,
+                },
+                DigElement {
+                    name: "XOr".into(),
+                    x: -420,
+                    y: -120,
+                    label: None,
+                },
+                DigElement {
+                    name: "XNOr".into(),
+                    x: -520,
+                    y: -160,
+                    label: None,
+                },
+                DigElement {
                     name: "Not".into(),
                     x: -20,
                     y: -4,
@@ -1993,7 +2025,7 @@ mod tests {
         let domain = to_domain(&source).unwrap();
         assert_eq!(
             domain.components.iter().map(|c| c.id.0).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
         );
         assert_eq!(
             domain
@@ -2001,7 +2033,7 @@ mod tests {
                 .iter()
                 .map(|c| c.label.as_str())
                 .collect::<Vec<_>>(),
-            vec!["λ input", "", "", "OR", ""]
+            vec!["λ input", "", "", "OR", "", "", "", "", ""]
         );
         assert_eq!(
             from_domain(&domain).unwrap(),
@@ -2029,7 +2061,11 @@ mod tests {
             ComponentKind::Input,
             ComponentKind::Output,
             ComponentKind::And,
+            ComponentKind::NAnd,
             ComponentKind::Or,
+            ComponentKind::NOr,
+            ComponentKind::XOr,
+            ComponentKind::XNOr,
             ComponentKind::Not,
         ] {
             let (dx, dy) = center_offset(kind).unwrap();
@@ -2640,6 +2676,18 @@ mod tests {
             DigReadErrorKind::Unsupported,
             "elementAttributes",
         );
+        for (key, value) in [("Bits", "1"), ("Inputs", "2"), ("Wide", "false")] {
+            let explicit_default = format!(
+                "<visualElement><elementName>NAnd</elementName><elementAttributes><entry><string>{key}</string><string>{value}</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>"
+            );
+            expect_error(
+                &doc(&explicit_default, ""),
+                DigReadErrorKind::Unsupported,
+                "elementAttributes",
+            );
+        }
+        let wrong_case = "<visualElement><elementName>nand</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement>";
+        assert!(to_domain(&parse_v2(doc(wrong_case, "").as_bytes()).unwrap()).is_err());
         let resource = "<visualElement><elementName>ROM</elementName><elementAttributes><entry><string>Data</string><string>memory.hex</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>";
         expect_error(
             &doc(resource, ""),

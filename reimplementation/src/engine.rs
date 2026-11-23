@@ -1003,7 +1003,11 @@ mod tests {
             (ComponentKind::Input, 0, 1),
             (ComponentKind::Output, 1, 0),
             (ComponentKind::And, 2, 1),
+            (ComponentKind::NAnd, 2, 1),
             (ComponentKind::Or, 2, 1),
+            (ComponentKind::NOr, 2, 1),
+            (ComponentKind::XOr, 2, 1),
+            (ComponentKind::XNOr, 2, 1),
             (ComponentKind::Not, 1, 1),
         ] {
             for (direction, count) in [(Input, inputs), (Output, outputs)] {

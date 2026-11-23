@@ -75,11 +75,22 @@ impl Gate {
         let a = values[self.inputs[0]];
         let b = values[self.inputs[1]];
         match (self.kind, a, b) {
+            (ComponentKind::Input | ComponentKind::Output, _, _) => Level::Unavailable,
             (ComponentKind::Not, Level::Unavailable, _) => Level::Unavailable,
             (ComponentKind::Not, a, _) => Level::from_bool(a == Level::Low),
             (_, Level::Unavailable, _) | (_, _, Level::Unavailable) => Level::Unavailable,
             (ComponentKind::And, a, b) => Level::from_bool(a == Level::High && b == Level::High),
-            (_, a, b) => Level::from_bool(a == Level::High || b == Level::High),
+            (ComponentKind::NAnd, a, b) => {
+                Level::from_bool(!(a == Level::High && b == Level::High))
+            }
+            (ComponentKind::Or, a, b) => Level::from_bool(a == Level::High || b == Level::High),
+            (ComponentKind::NOr, a, b) => Level::from_bool(!(a == Level::High || b == Level::High)),
+            (ComponentKind::XOr, a, b) => {
+                Level::from_bool((a == Level::High) != (b == Level::High))
+            }
+            (ComponentKind::XNOr, a, b) => {
+                Level::from_bool((a == Level::High) == (b == Level::High))
+            }
         }
     }
 }
@@ -468,6 +479,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn nand_nor_xor_xnor_truth_tables_are_exhaustive() {
+        for (kind, expected) in [
+            (ComponentKind::NAnd, [true, true, true, false]),
+            (ComponentKind::NOr, [true, false, false, false]),
+            (ComponentKind::XOr, [false, true, true, false]),
+            (ComponentKind::XNOr, [true, false, false, true]),
+        ] {
+            let document = binary(kind);
+            let mut runtime = Runtime::start(&document).unwrap();
+            settled(&mut runtime);
+            for (index, (a, b)) in [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+            {
+                runtime.set_input(ComponentId(1), a).unwrap();
+                settled(&mut runtime);
+                runtime.set_input(ComponentId(2), b).unwrap();
+                settled(&mut runtime);
+                assert_eq!(
+                    runtime.output_value(ComponentId(4)),
+                    Some(level(expected[index])),
+                    "{kind:?} {a}{b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_new_gate_cascade_has_order_independent_microsteps() {
+        let kinds = [
+            (1, ComponentKind::Input),
+            (2, ComponentKind::Input),
+            (3, ComponentKind::NAnd),
+            (4, ComponentKind::XOr),
+            (5, ComponentKind::NOr),
+            (6, ComponentKind::Output),
+        ];
+        let wires = [
+            (out(1), inp(3, 0)),
+            (out(2), inp(3, 1)),
+            (out(3), inp(4, 0)),
+            (out(2), inp(4, 1)),
+            (out(4), inp(5, 0)),
+            (out(1), inp(5, 1)),
+            (out(5), inp(6, 0)),
+        ];
+        let mut reversed_kinds = kinds;
+        reversed_kinds.reverse();
+        let mut reversed_wires = wires;
+        reversed_wires.reverse();
+        let docs = [
+            document(&kinds, &wires),
+            document(&reversed_kinds, &reversed_wires),
+        ];
+        let mut traces = Vec::new();
+        for doc in &docs {
+            let mut runtime = Runtime::start(doc).unwrap();
+            let mut trace = Vec::new();
+            while runtime.step() != StepOutcome::Idle {
+                trace.push(snapshot(&runtime, doc));
+            }
+            runtime.set_input(ComponentId(1), true).unwrap();
+            while runtime.step() != StepOutcome::Idle {
+                trace.push(snapshot(&runtime, doc));
+            }
+            assert_eq!(runtime.output_value(ComponentId(6)), Some(Low));
+            traces.push(trace);
+        }
+        assert_eq!(traces[0], traces[1]);
+    }
+
+    #[test]
+    fn new_gate_frontier_budget_keeps_every_output_unpublished_until_resume() {
+        let kinds = [
+            (1, ComponentKind::Input),
+            (2, ComponentKind::Input),
+            (3, ComponentKind::Input),
+            (4, ComponentKind::Input),
+            (5, ComponentKind::NAnd),
+            (6, ComponentKind::XNOr),
+            (7, ComponentKind::Output),
+            (8, ComponentKind::Output),
+        ];
+        let wires = [
+            (out(1), inp(5, 0)),
+            (out(2), inp(5, 1)),
+            (out(3), inp(6, 0)),
+            (out(4), inp(6, 1)),
+            (out(5), inp(7, 0)),
+            (out(6), inp(8, 0)),
+        ];
+        let document = document(&kinds, &wires);
+        let mut whole = Runtime::start(&document).unwrap();
+        settled(&mut whole);
+        let mut resumed = Runtime::start(&document).unwrap();
+        assert_eq!(
+            resumed.settle(2),
+            SettleOutcome::BudgetExhausted { work: 2 }
+        );
+        for pin in [out(5), out(6), inp(7, 0), inp(8, 0)] {
+            assert_eq!(resumed.pin_value(pin), Some(Unavailable));
+        }
+        assert_eq!(resumed.settle(1), SettleOutcome::Settled { work: 1 });
+        assert_eq!(snapshot(&resumed, &document), snapshot(&whole, &document));
+        assert_eq!(resumed.output_value(ComponentId(7)), Some(High));
+        assert_eq!(resumed.output_value(ComponentId(8)), Some(High));
     }
 
     #[test]

@@ -278,11 +278,15 @@ mod tests {
     use eframe::egui::Pos2;
 
     const STYLES: [SymbolStyle; 2] = [SymbolStyle::Rect, SymbolStyle::Ieee];
-    const KINDS: [ComponentKind; 5] = [
+    const KINDS: [ComponentKind; 9] = [
         ComponentKind::Input,
         ComponentKind::Output,
         ComponentKind::And,
+        ComponentKind::NAnd,
         ComponentKind::Or,
+        ComponentKind::NOr,
+        ComponentKind::XOr,
+        ComponentKind::XNOr,
         ComponentKind::Not,
     ];
 
@@ -319,6 +323,16 @@ mod tests {
                 let o = l.origin();
                 let expected: Vec<(&str, Point)> = match kind {
                     ComponentKind::And | ComponentKind::Or => vec![
+                        ("pin-in-0", [o[0], o[1]]),
+                        ("pin-in-1", [o[0], o[1] + 40.]),
+                        ("pin-out-0", [o[0] + 60., o[1] + 20.]),
+                    ],
+                    ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr => vec![
+                        ("pin-in-0", [o[0], o[1]]),
+                        ("pin-in-1", [o[0], o[1] + 40.]),
+                        ("pin-out-0", [o[0] + 80., o[1] + 20.]),
+                    ],
+                    ComponentKind::XOr => vec![
                         ("pin-in-0", [o[0], o[1]]),
                         ("pin-in-1", [o[0], o[1] + 40.]),
                         ("pin-out-0", [o[0] + 60., o[1] + 20.]),

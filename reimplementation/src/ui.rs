@@ -839,7 +839,13 @@ impl DigitalApp {
                         for component in &document.components {
                             if matches!(
                                 component.kind,
-                                ComponentKind::And | ComponentKind::Or | ComponentKind::Not
+                                ComponentKind::And
+                                    | ComponentKind::NAnd
+                                    | ComponentKind::Or
+                                    | ComponentKind::NOr
+                                    | ComponentKind::XOr
+                                    | ComponentKind::XNOr
+                                    | ComponentKind::Not
                             ) {
                                 let level = runtime
                                     .pin_value(PinRef {
@@ -875,22 +881,24 @@ impl DigitalApp {
             ui.heading("Components");
             let locked = self.session.simulation_active() || self.modality_active();
             ui.add_enabled_ui(!locked, |ui| {
-                for kind in KINDS {
-                    if ui
-                        .selectable_label(self.placing == Some(kind), kind.name())
-                        .clicked()
-                    {
-                        self.placing = Some(kind);
-                        self.wiring = false;
-                        self.wire_start = None;
+                ui.horizontal_wrapped(|ui| {
+                    for kind in KINDS {
+                        if ui
+                            .selectable_label(self.placing == Some(kind), kind.name())
+                            .clicked()
+                        {
+                            self.placing = Some(kind);
+                            self.wiring = false;
+                            self.wire_start = None;
+                        }
                     }
-                }
-                if ui.selectable_label(self.wiring, "Wire (W)").clicked() {
-                    self.wiring = !self.wiring;
-                    self.wire_start = None;
-                    self.placing = None;
-                    self.drag = None;
-                }
+                    if ui.selectable_label(self.wiring, "Wire (W)").clicked() {
+                        self.wiring = !self.wiring;
+                        self.wire_start = None;
+                        self.placing = None;
+                        self.drag = None;
+                    }
+                });
             });
             if locked {
                 ui.label(if self.session.simulation_active() { EDIT_LOCK_NOTE } else { "Finish or cancel the file action to resume editing." });
@@ -1335,7 +1343,34 @@ impl DigitalApp {
                     self.error = Some(format!("No symbol is drawn for {}", c.kind.name()));
                     continue;
                 };
-                if let Err(e) = self
+                if matches!(
+                    c.kind,
+                    ComponentKind::NAnd
+                        | ComponentKind::NOr
+                        | ComponentKind::XOr
+                        | ComponentKind::XNOr
+                ) {
+                    // No cleared IEEE artwork is available for these gates. Keep one shared
+                    // bounds/anchor/picking layout and render an explicit named text box instead
+                    // of misleadingly reusing a plain AND/OR symbol.
+                    let screen = Rect::from_min_max(
+                        transform.to_screen(layout.bounds().min),
+                        transform.to_screen(layout.bounds().max),
+                    );
+                    painter.rect_stroke(
+                        screen,
+                        3.0,
+                        Stroke::new(STROKE_WIDTH, palette.color(state)),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.text(
+                        screen.center(),
+                        egui::Align2::CENTER_CENTER,
+                        c.kind.name(),
+                        egui::FontId::proportional(13.0),
+                        palette.color(state),
+                    );
+                } else if let Err(e) = self
                     .renderer
                     .draw(&painter, &layout, &transform, &palette, state)
                 {
@@ -2101,6 +2136,99 @@ mod tests {
         );
         assert_eq!(app.session.document().components.len(), 1);
     }
+    #[test]
+    fn new_logic_gate_palette_placement_anchors_and_styles_are_shared() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        for (index, (name, kind)) in [
+            ("NAND", ComponentKind::NAnd),
+            ("NOR", ComponentKind::NOr),
+            ("XOR", ComponentKind::XOr),
+            ("XNOR", ComponentKind::XNOr),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            click_text(&ctx, &mut app, name);
+            let center = Pos2::new(
+                350. + (index % 2) as f32 * 120.,
+                180. + (index / 2) as f32 * 100.,
+            );
+            click_at(&ctx, &mut app, center);
+            assert_eq!(app.session.document().components.last().unwrap().kind, kind);
+        }
+        for style in [SymbolStyle::Rect, SymbolStyle::Ieee] {
+            app.style = style;
+            for component in app.session.document().components.iter().filter(|c| {
+                matches!(
+                    c.kind,
+                    ComponentKind::NAnd
+                        | ComponentKind::NOr
+                        | ComponentKind::XOr
+                        | ComponentKind::XNOr
+                )
+            }) {
+                let layout = SymbolLayout::centered_on(
+                    style,
+                    component.kind,
+                    [component.position.x, component.position.y],
+                )
+                .unwrap();
+                assert_eq!(layout.anchors().count(), 3);
+                assert_eq!(
+                    layout
+                        .pin_position(PinId {
+                            direction: PinDirection::Input,
+                            index: 0
+                        })
+                        .unwrap()[0],
+                    layout
+                        .pin_position(PinId {
+                            direction: PinDirection::Input,
+                            index: 1
+                        })
+                        .unwrap()[0]
+                );
+                let expected = if component.kind == ComponentKind::XOr {
+                    60.
+                } else {
+                    80.
+                };
+                assert_eq!(
+                    layout
+                        .pin_position(PinId {
+                            direction: PinDirection::Output,
+                            index: 0
+                        })
+                        .unwrap()[0]
+                        - layout
+                            .pin_position(PinId {
+                                direction: PinDirection::Input,
+                                index: 0
+                            })
+                            .unwrap()[0],
+                    expected
+                );
+            }
+            let painted = frame(&ctx, &mut app, vec![], true);
+            for name in ["NAND", "NOR", "XOR", "XNOR"] {
+                assert!(has_text(&painted, name));
+            }
+        }
+        press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(app.session.document().components.len(), 3);
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::Z,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        );
+        assert_eq!(app.session.document().components.len(), 4);
+    }
+
     #[test]
     fn redo_y_and_error_display() {
         let ctx = egui::Context::default();

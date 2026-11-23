@@ -83,7 +83,11 @@ mod anchor_tests {
                 ComponentKind::Input,
                 ComponentKind::Output,
                 ComponentKind::And,
+                ComponentKind::NAnd,
                 ComponentKind::Or,
+                ComponentKind::NOr,
+                ComponentKind::XOr,
+                ComponentKind::XNOr,
                 ComponentKind::Not,
             ] {
                 for center in [[0., 0.], [13.5, -27.25]] {

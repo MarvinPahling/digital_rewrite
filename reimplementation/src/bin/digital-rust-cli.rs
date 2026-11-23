@@ -25,13 +25,7 @@ fn escaped(text: &str) -> String {
     text.chars().flat_map(char::escape_default).collect()
 }
 fn kind_name(kind: ComponentKind) -> &'static str {
-    match kind {
-        ComponentKind::Input => "Input",
-        ComponentKind::Output => "Output",
-        ComponentKind::And => "And",
-        ComponentKind::Or => "Or",
-        ComponentKind::Not => "Not",
-    }
+    kind.name()
 }
 fn parse_number(text: &str, what: &str) -> Result<usize, String> {
     text.parse::<usize>()

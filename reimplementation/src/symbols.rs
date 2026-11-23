@@ -143,10 +143,107 @@ include!(concat!(env!("OUT_DIR"), "/component_symbols.rs"));
 
 /// Returns the symbol drawn for `kind` in `style`, if one has been drawn.
 pub fn symbol(style: SymbolStyle, kind: ComponentKind) -> Option<&'static SymbolDef> {
-    SYMBOLS
+    if let Some(def) = SYMBOLS
         .iter()
         .find(|def| def.style == style && def.kind == kind)
+    {
+        return Some(def);
+    }
+    match (style, kind) {
+        (SymbolStyle::Rect, ComponentKind::NAnd) => Some(&NAND_RECT),
+        (SymbolStyle::Ieee, ComponentKind::NAnd) => Some(&NAND_IEEE),
+        (SymbolStyle::Rect, ComponentKind::NOr) => Some(&NOR_RECT),
+        (SymbolStyle::Ieee, ComponentKind::NOr) => Some(&NOR_IEEE),
+        (SymbolStyle::Rect, ComponentKind::XOr) => Some(&XOR_RECT),
+        (SymbolStyle::Ieee, ComponentKind::XOr) => Some(&XOR_IEEE),
+        (SymbolStyle::Rect, ComponentKind::XNOr) => Some(&XNOR_RECT),
+        (SymbolStyle::Ieee, ComponentKind::XNOr) => Some(&XNOR_IEEE),
+        _ => None,
+    }
 }
+
+const NAND_ANCHORS: [SymbolAnchor; 3] = [
+    SymbolAnchor {
+        name: "pin-in-0",
+        position: [0.0, 0.0],
+        direction: PortDirection::Input,
+    },
+    SymbolAnchor {
+        name: "pin-in-1",
+        position: [0.0, 40.0],
+        direction: PortDirection::Input,
+    },
+    SymbolAnchor {
+        name: "pin-out-0",
+        position: [80.0, 20.0],
+        direction: PortDirection::Output,
+    },
+];
+const XOR_ANCHORS: [SymbolAnchor; 3] = [
+    NAND_ANCHORS[0],
+    NAND_ANCHORS[1],
+    SymbolAnchor {
+        name: "pin-out-0",
+        position: [60.0, 20.0],
+        direction: PortDirection::Output,
+    },
+];
+const fn text_gate(
+    id: &'static str,
+    style: SymbolStyle,
+    kind: ComponentKind,
+    width: f32,
+) -> SymbolDef {
+    SymbolDef {
+        id,
+        style,
+        kind,
+        master: "named-text-fallback",
+        origin: [0.0, 0.0],
+        bounds: SymbolBounds {
+            min: [0.0, 0.0],
+            max: [width, 40.0],
+        },
+        paths: &[],
+        anchors: if matches!(kind, ComponentKind::XOr) {
+            &XOR_ANCHORS
+        } else {
+            &NAND_ANCHORS
+        },
+    }
+}
+static NAND_RECT: SymbolDef = text_gate(
+    "rect-nand-text",
+    SymbolStyle::Rect,
+    ComponentKind::NAnd,
+    80.0,
+);
+static NAND_IEEE: SymbolDef = text_gate(
+    "ieee-nand-text",
+    SymbolStyle::Ieee,
+    ComponentKind::NAnd,
+    80.0,
+);
+static NOR_RECT: SymbolDef =
+    text_gate("rect-nor-text", SymbolStyle::Rect, ComponentKind::NOr, 80.0);
+static NOR_IEEE: SymbolDef =
+    text_gate("ieee-nor-text", SymbolStyle::Ieee, ComponentKind::NOr, 80.0);
+static XOR_RECT: SymbolDef =
+    text_gate("rect-xor-text", SymbolStyle::Rect, ComponentKind::XOr, 60.0);
+static XOR_IEEE: SymbolDef =
+    text_gate("ieee-xor-text", SymbolStyle::Ieee, ComponentKind::XOr, 60.0);
+static XNOR_RECT: SymbolDef = text_gate(
+    "rect-xnor-text",
+    SymbolStyle::Rect,
+    ComponentKind::XNOr,
+    80.0,
+);
+static XNOR_IEEE: SymbolDef = text_gate(
+    "ieee-xnor-text",
+    SymbolStyle::Ieee,
+    ComponentKind::XNOr,
+    80.0,
+);
 
 /// Origin offset from the editor's component position, which denotes the artwork-bounds center.
 /// Kept toolkit-neutral so drawing and document-format adapters place pins identically.
@@ -181,13 +278,25 @@ pub fn symbols() -> impl Iterator<Item = &'static SymbolDef> {
 mod tests {
     use super::*;
 
-    const GATES: [ComponentKind; 3] = [ComponentKind::And, ComponentKind::Or, ComponentKind::Not];
+    const GATES: [ComponentKind; 7] = [
+        ComponentKind::And,
+        ComponentKind::NAnd,
+        ComponentKind::Or,
+        ComponentKind::NOr,
+        ComponentKind::XOr,
+        ComponentKind::XNOr,
+        ComponentKind::Not,
+    ];
     const STYLES: [SymbolStyle; 2] = [SymbolStyle::Rect, SymbolStyle::Ieee];
-    const ALL_KINDS: [ComponentKind; 5] = [
+    const ALL_KINDS: [ComponentKind; 9] = [
         ComponentKind::Input,
         ComponentKind::Output,
         ComponentKind::And,
+        ComponentKind::NAnd,
         ComponentKind::Or,
+        ComponentKind::NOr,
+        ComponentKind::XOr,
+        ComponentKind::XNOr,
         ComponentKind::Not,
     ];
 
@@ -260,6 +369,31 @@ mod tests {
                 .unwrap()
                 .master
         );
+    }
+
+    #[test]
+    fn named_logic_gate_anchors_match_codec_contract_in_both_styles() {
+        use PortDirection::{Input, Output};
+        for style in STYLES {
+            for kind in [ComponentKind::NAnd, ComponentKind::NOr, ComponentKind::XNOr] {
+                assert_eq!(
+                    anchors_of(symbol(style, kind).unwrap()),
+                    [
+                        ("pin-in-0", [0.0, 0.0], Input),
+                        ("pin-in-1", [0.0, 40.0], Input),
+                        ("pin-out-0", [80.0, 20.0], Output),
+                    ]
+                );
+            }
+            assert_eq!(
+                anchors_of(symbol(style, ComponentKind::XOr).unwrap()),
+                [
+                    ("pin-in-0", [0.0, 0.0], Input),
+                    ("pin-in-1", [0.0, 40.0], Input),
+                    ("pin-out-0", [60.0, 20.0], Output),
+                ]
+            );
+        }
     }
 
     #[test]
