@@ -12,6 +12,7 @@ pub struct SignalWidthError(pub u8);
 impl SignalWidth {
     pub const MIN: u8 = 1;
     pub const MAX: u8 = 64;
+    pub const ONE: Self = Self(1);
 
     pub fn new(width: u8) -> Result<Self, SignalWidthError> {
         (Self::MIN..=Self::MAX)
@@ -51,6 +52,7 @@ pub struct SignalValue {
 pub enum SignalValueError {
     NotOneBit,
     HighImpedance,
+    WidthMismatch,
 }
 
 impl SignalValue {
@@ -115,6 +117,41 @@ impl SignalValue {
             return Err(SignalValueError::HighImpedance);
         }
         Ok(self.bits != 0)
+    }
+
+    /// Bitwise AND for equal-width, fully-known operands. High-Z sampling is deliberately a
+    /// separate operation and is never hidden inside gate evaluation.
+    pub fn bitwise_and(self, rhs: Self) -> Result<Self, SignalValueError> {
+        self.binary_known(rhs, |a, b| a & b)
+    }
+
+    pub fn bitwise_or(self, rhs: Self) -> Result<Self, SignalValueError> {
+        self.binary_known(rhs, |a, b| a | b)
+    }
+
+    pub fn bitwise_xor(self, rhs: Self) -> Result<Self, SignalValueError> {
+        self.binary_known(rhs, |a, b| a ^ b)
+    }
+
+    pub fn bitwise_not(self) -> Result<Self, SignalValueError> {
+        if self.high_z != 0 {
+            return Err(SignalValueError::HighImpedance);
+        }
+        Ok(Self::known(self.width, !self.bits))
+    }
+
+    fn binary_known(
+        self,
+        rhs: Self,
+        operation: impl FnOnce(u64, u64) -> u64,
+    ) -> Result<Self, SignalValueError> {
+        if self.width != rhs.width {
+            return Err(SignalValueError::WidthMismatch);
+        }
+        if self.high_z != 0 || rhs.high_z != 0 {
+            return Err(SignalValueError::HighImpedance);
+        }
+        Ok(Self::known(self.width, operation(self.bits, rhs.bits)))
     }
 
     pub fn format_hex(self) -> String {

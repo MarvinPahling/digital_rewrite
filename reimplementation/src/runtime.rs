@@ -144,27 +144,42 @@ impl Gate {
     fn evaluate(&self, values: &[Level]) -> Level {
         let a = values[self.inputs[0]];
         let b = values[self.inputs[1]];
-        match (self.kind, a, b) {
-            (ComponentKind::Input | ComponentKind::Output | ComponentKind::Const, _, _) => {
-                Level::Unavailable
-            }
-            (ComponentKind::Not, Level::Unavailable, _) => Level::Unavailable,
-            (ComponentKind::Not, a, _) => Level::from_bool(a == Level::Low),
-            (_, Level::Unavailable, _) | (_, _, Level::Unavailable) => Level::Unavailable,
-            (ComponentKind::And, a, b) => Level::from_bool(a == Level::High && b == Level::High),
-            (ComponentKind::NAnd, a, b) => {
-                Level::from_bool(!(a == Level::High && b == Level::High))
-            }
-            (ComponentKind::Or, a, b) => Level::from_bool(a == Level::High || b == Level::High),
-            (ComponentKind::NOr, a, b) => Level::from_bool(!(a == Level::High || b == Level::High)),
-            (ComponentKind::XOr, a, b) => {
-                Level::from_bool((a == Level::High) != (b == Level::High))
-            }
-            (ComponentKind::XNOr, a, b) => {
-                Level::from_bool((a == Level::High) == (b == Level::High))
-            }
+        if a == Level::Unavailable || (self.kind != ComponentKind::Not && b == Level::Unavailable) {
+            return Level::Unavailable;
         }
+        let value = |level| {
+            crate::signal::SignalValue::known(
+                crate::signal::SignalWidth::ONE,
+                u64::from(level == Level::High),
+            )
+        };
+        evaluate_signal_gate(self.kind, value(a), value(b))
+            .and_then(|value| value.as_bool().ok())
+            .map_or(Level::Unavailable, Level::from_bool)
     }
+}
+
+/// Shared width-aware implementation used by the current one-bit runtime adapter and future
+/// width-bearing components. Unavailable scheduling state remains outside `SignalValue`.
+fn evaluate_signal_gate(
+    kind: ComponentKind,
+    a: crate::signal::SignalValue,
+    b: crate::signal::SignalValue,
+) -> Option<crate::signal::SignalValue> {
+    use crate::signal::{SignalValue, SignalValueError};
+    let result = match kind {
+        ComponentKind::Not => a.bitwise_not(),
+        ComponentKind::And => a.bitwise_and(b),
+        ComponentKind::NAnd => a.bitwise_and(b).and_then(SignalValue::bitwise_not),
+        ComponentKind::Or => a.bitwise_or(b),
+        ComponentKind::NOr => a.bitwise_or(b).and_then(SignalValue::bitwise_not),
+        ComponentKind::XOr => a.bitwise_xor(b),
+        ComponentKind::XNOr => a.bitwise_xor(b).and_then(SignalValue::bitwise_not),
+        ComponentKind::Input | ComponentKind::Output | ComponentKind::Const => {
+            Err(SignalValueError::NotOneBit)
+        }
+    };
+    result.ok()
 }
 
 /// A microstep whose gates are being evaluated; nothing is published until all are done.
@@ -2182,6 +2197,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn production_bitwise_gate_evaluator_masks_complements_at_bus_width() {
+        use crate::signal::{SignalValue, SignalWidth};
+        let width = SignalWidth::new(4).unwrap();
+        let a = SignalValue::known(width, 0b1010);
+        let b = SignalValue::known(width, 0b1100);
+        for (kind, expected) in [
+            (ComponentKind::And, 0b1000),
+            (ComponentKind::NAnd, 0b0111),
+            (ComponentKind::Or, 0b1110),
+            (ComponentKind::NOr, 0b0001),
+            (ComponentKind::XOr, 0b0110),
+            (ComponentKind::XNOr, 0b1001),
+            (ComponentKind::Not, 0b0101),
+        ] {
+            let result = evaluate_signal_gate(kind, a, b).unwrap();
+            assert_eq!(result.width(), width);
+            assert_eq!(result.bits(), expected, "{kind:?}");
+            assert_eq!(result.high_z(), 0);
+        }
+        let three = SignalWidth::new(3).unwrap();
+        assert!(
+            evaluate_signal_gate(ComponentKind::And, a, SignalValue::known(three, 1)).is_none()
+        );
+        assert!(
+            evaluate_signal_gate(ComponentKind::Not, SignalValue::new(width, 0, 1), b,).is_none()
+        );
     }
 
     #[test]
