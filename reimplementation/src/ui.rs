@@ -9078,6 +9078,575 @@ mod tests {
     }
 
     #[test]
+    fn m4_integrated_edit_clipboard_persist_reopen_simulate_workflow() {
+        let ctx = egui::Context::default();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "digital-m4-integrated-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clipboard = Rc::new(RefCell::new(FakeClipboardState::default()));
+        let mut app = ui_file_app(&dir).with_clipboard(Box::new(FakeClipboard(clipboard.clone())));
+
+        // Build a fresh circuit only through the visible palette, canvas and attribute editor.
+        let world_point = |app: &mut DigitalApp, world: [f32; 2]| {
+            let rect = camera_rect(&ctx, app);
+            app.view.transform(rect).unwrap().to_screen(world)
+        };
+        for (kind_label, world) in [
+            ("Input", [60., 180.]),
+            ("NOT", [180., 180.]),
+            ("Output", [300., 180.]),
+        ] {
+            click_text(&ctx, &mut app, kind_label);
+            let target = world_point(&mut app, world);
+            assert!(
+                app.canvas_rect.unwrap().contains(target),
+                "{kind_label}: rect={:?}, target={target:?}",
+                app.canvas_rect.unwrap()
+            );
+            click_at(&ctx, &mut app, target);
+        }
+        let component = |app: &DigitalApp, kind| {
+            app.session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.kind == kind)
+                .unwrap()
+                .clone()
+        };
+        let input = component(&app, ComponentKind::Input).id;
+        let inverter = component(&app, ComponentKind::Not).id;
+        let output = component(&app, ComponentKind::Output).id;
+
+        // Set the non-default orientation before routing; the configured attributes determine
+        // the actual hit-tested pins used by the wire gesture below.
+        camera_rect(&ctx, &mut app);
+        let inverter_screen = component_screen(&app, inverter);
+        click_at(&ctx, &mut app, inverter_screen);
+        press(&ctx, &mut app, egui::Key::R, egui::Modifiers::NONE);
+        assert_eq!(component(&app, ComponentKind::Not).rotation, 1);
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
+        let modal = frame(&ctx, &mut app, vec![], true);
+        let mirror_pos = modal
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "mirror" => Some(text.pos),
+                _ => None,
+            })
+            .expect("the NOT mirror attribute is visible");
+        click_at(&ctx, &mut app, mirror_pos + Vec2::new(4., 4.));
+        press(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert!(component(&app, ComponentKind::Not).mirror);
+
+        // Exercise a Unicode/XML-sensitive descriptor value using the production text widget.
+        camera_rect(&ctx, &mut app);
+        let initial_output_screen = component_screen(&app, output);
+        click_at(&ctx, &mut app, initial_output_screen);
+        assert_eq!(app.selected, Some(output));
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
+        let modal = frame(&ctx, &mut app, vec![], true);
+        let label_pos = modal
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Output" => Some(text.pos),
+                _ => None,
+            })
+            .unwrap();
+        click_at(&ctx, &mut app, label_pos + Vec2::new(8., 8.));
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                key(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("Résultat & <Q>".into()),
+            ],
+            true,
+        );
+        assert_eq!(app.label_modal.as_ref().unwrap().text, "Résultat & <Q>");
+        press(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert_eq!(
+            component(&app, ComponentKind::Output).label,
+            "Résultat & <Q>"
+        );
+
+        let pin_screen = |app: &DigitalApp, id, direction| {
+            let component = app
+                .session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == id)
+                .unwrap();
+            let layout = SymbolLayout::oriented_config_on(
+                app.style,
+                component.kind,
+                [component.position.x, component.position.y],
+                crate::domain::Orientation {
+                    rotation: component.rotation,
+                    mirror: component.mirror,
+                },
+                component.wide_shape,
+            )
+            .unwrap();
+            let pin = layout
+                .pin_position(PinId {
+                    direction,
+                    index: 0,
+                })
+                .unwrap();
+            app.view
+                .transform(app.canvas_rect.unwrap())
+                .unwrap()
+                .to_screen([pin[0], pin[1]])
+        };
+        click_text(&ctx, &mut app, "Wire (W)");
+        camera_rect(&ctx, &mut app);
+        let routes = [
+            (
+                pin_screen(&app, input, PinDirection::Output),
+                pin_screen(&app, inverter, PinDirection::Input),
+            ),
+            (
+                pin_screen(&app, inverter, PinDirection::Output),
+                pin_screen(&app, output, PinDirection::Input),
+            ),
+        ];
+        for (start, end) in routes {
+            click_at(&ctx, &mut app, start);
+            click_at(&ctx, &mut app, end);
+        }
+        click_text(&ctx, &mut app, "Wire (W)");
+        let authored = app.session.document().clone();
+        assert!(authored.wires.len() >= 2);
+        assert!(digital_rust::simulation::compile(&authored).is_ok());
+
+        // Select the actual mixed document, move it as one history transaction, and exercise
+        // both branches of that transaction without bypassing the production keyboard handler.
+        let ctrl_a = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        camera_rect(&ctx, &mut app);
+        let canvas_focus = app.canvas_rect.unwrap().left_bottom() + Vec2::new(18., -18.);
+        click_at(&ctx, &mut app, canvas_focus);
+        frame(&ctx, &mut app, vec![key(egui::Key::A, ctrl_a)], true);
+        assert_eq!(app.selection.components.len(), 3);
+        assert_eq!(app.selection.wires.len(), authored.wires.len());
+        assert!(app.selection.wires.values().all(|mask| mask.is_both()));
+        let before_move = app.session.document().clone();
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::ArrowRight,
+            egui::Modifiers::SHIFT,
+        );
+        let moved = app.session.document().clone();
+        assert_ne!(moved, before_move);
+        click_text(&ctx, &mut app, "Undo");
+        assert_eq!(*app.session.document(), before_move);
+        click_text(&ctx, &mut app, "Redo");
+        assert_eq!(*app.session.document(), moved);
+        click_text(&ctx, &mut app, "Undo");
+        assert_eq!(*app.session.document(), before_move);
+
+        // Copy goes through the injected clipboard; paste goes through its read action and the
+        // real placement preview. Rotation changes that preview before Enter commits it.
+        camera_rect(&ctx, &mut app);
+        let canvas_focus = app.canvas_rect.unwrap().left_bottom() + Vec2::new(18., -18.);
+        click_at(&ctx, &mut app, canvas_focus);
+        frame(&ctx, &mut app, vec![key(egui::Key::A, ctrl_a)], true);
+        assert_eq!(app.selection.components.len(), 3);
+        assert_eq!(app.selection.wires.len(), authored.wires.len());
+        click_text(&ctx, &mut app, "Copy");
+        let list_xml = clipboard.borrow().text.clone();
+        assert!(list_xml.starts_with("<?xml"));
+        assert!(list_xml.contains("<list>"));
+        assert_eq!(clipboard.borrow().writes, 1);
+        camera_rect(&ctx, &mut app);
+        let paste_pos = app.canvas_rect.unwrap().center();
+        click_text(&ctx, &mut app, "Paste");
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(paste_pos)],
+            true,
+        );
+        assert_eq!(clipboard.borrow().reads, 1);
+        let before_paste = app.session.document().clone();
+        let before_history = app.session.can_undo();
+        assert!(app.fragment_draft.is_some());
+        let draft_before_rotation =
+            fragment_preview_document(app.fragment_draft.as_ref().unwrap()).unwrap();
+        press(&ctx, &mut app, egui::Key::R, egui::Modifiers::NONE);
+        let expected_preview =
+            fragment_preview_document(app.fragment_draft.as_ref().unwrap()).unwrap();
+        assert_ne!(draft_before_rotation, expected_preview);
+        assert_eq!(
+            *app.session.document(),
+            before_paste,
+            "preview is transient"
+        );
+        press(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(app.fragment_draft.is_none());
+        assert_eq!(app.session.document().components.len(), 6);
+        assert_eq!(app.session.document().wires.len(), authored.wires.len() * 2);
+        for expected in &expected_preview.components {
+            let actual = app
+                .session
+                .document()
+                .components
+                .iter()
+                .find(|actual| {
+                    actual.kind == expected.kind
+                        && actual.position == expected.position
+                        && actual.label == expected.label
+                        && actual.constant_value == expected.constant_value
+                        && actual.wide_shape == expected.wide_shape
+                        && actual.rotation == expected.rotation
+                        && actual.mirror == expected.mirror
+                })
+                .expect("committed component matches preview");
+            assert!(
+                !before_paste
+                    .components
+                    .iter()
+                    .any(|original| original.id == actual.id),
+                "pasted identity is remapped rather than reused"
+            );
+        }
+        for expected in expected_preview.wires.geometric().unwrap() {
+            let actual = app
+                .session
+                .document()
+                .wires
+                .geometric()
+                .unwrap()
+                .iter()
+                .find(|actual| {
+                    (actual.a == expected.a && actual.b == expected.b)
+                        || (actual.a == expected.b && actual.b == expected.a)
+                })
+                .expect("committed wire matches preview");
+            assert!(
+                !before_paste
+                    .wires
+                    .geometric()
+                    .unwrap()
+                    .iter()
+                    .any(|original| original.id == actual.id),
+                "pasted segment identity is remapped rather than reused"
+            );
+        }
+        assert!(app.session.can_undo());
+        press(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
+        assert_eq!(app.session.document(), &before_paste);
+        click_text(&ctx, &mut app, "Undo");
+        assert_eq!(app.session.document().components.len(), 6);
+        click_text(&ctx, &mut app, "Redo");
+        assert_eq!(app.session.document(), &before_paste);
+        click_text(&ctx, &mut app, "Undo");
+        assert_eq!(app.session.document().components.len(), 6);
+
+        // A second paste is cancelled without consuming history or mutating the document.
+        let before_cancel = app.session.document().clone();
+        let undo_before_cancel = app.session.can_undo();
+        let redo_before_cancel = app.session.can_redo();
+        click_text(&ctx, &mut app, "Paste");
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(paste_pos)],
+            true,
+        );
+        assert!(app.fragment_draft.is_some());
+        press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(app.fragment_draft.is_none());
+        assert_eq!(*app.session.document(), before_cancel);
+        assert_eq!(app.session.can_undo(), undo_before_cancel);
+        assert_eq!(app.session.can_redo(), redo_before_cancel);
+        assert!(before_history);
+
+        // Save As and subsequent associated Save are driven through the visible file workflow.
+        click_text(&ctx, &mut app, "Save As");
+        app.file_path_entry = "integrated.dig".into(); // sole direct file-path-entry setup
+        click_text(&ctx, &mut app, "Save path");
+        let path = dir.join("integrated.dig");
+        assert_eq!(app.session.path(), Some(path.as_path()));
+        assert!(!app.session.dirty());
+        let saved_label = "Persisted & <Q>";
+        camera_rect(&ctx, &mut app);
+        let save_edit_screen = component_screen(&app, output);
+        click_at(&ctx, &mut app, save_edit_screen);
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
+        let modal = frame(&ctx, &mut app, vec![], true);
+        let old_label = modal
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Résultat & <Q>" => {
+                    Some(text.pos)
+                }
+                _ => None,
+            })
+            .unwrap();
+        click_at(&ctx, &mut app, old_label + Vec2::new(8., 8.));
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                key(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text(saved_label.into()),
+            ],
+            true,
+        );
+        press(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert!(app.session.dirty());
+        click_text(&ctx, &mut app, "Save");
+        assert!(!app.session.dirty());
+        let xml = std::fs::read_to_string(&path).unwrap();
+        assert!(xml.contains("Persisted &amp; &lt;Q&gt;"));
+        assert!(xml.contains("rotation=\"1\""));
+        assert!(xml.contains("<boolean>true</boolean>"));
+
+        let semantic_document = |document: &Document| {
+            let mut components: Vec<_> = document
+                .components
+                .iter()
+                .map(|component| {
+                    (
+                        component.kind,
+                        component.position.x,
+                        component.position.y,
+                        component.label.clone(),
+                        component.constant_value,
+                        component.wide_shape,
+                        component.rotation,
+                        component.mirror,
+                    )
+                })
+                .collect();
+            components.sort_by(|a, b| {
+                (a.1, a.2, a.0 as u8)
+                    .partial_cmp(&(b.1, b.2, b.0 as u8))
+                    .unwrap()
+            });
+            let mut wires: Vec<_> = document
+                .wires
+                .geometric()
+                .unwrap()
+                .iter()
+                .map(|wire| (wire.a, wire.b))
+                .collect();
+            wires.sort();
+            (components, wires)
+        };
+        let expected_semantics = semantic_document(app.session.document());
+        click_text(&ctx, &mut app, "New");
+        assert!(app.session.document().components.is_empty());
+        click_text(&ctx, &mut app, "Open");
+        type_file_path(&ctx, &mut app, "integrated.dig");
+        click_text(&ctx, &mut app, "Open path");
+        assert_eq!(
+            semantic_document(app.session.document()),
+            expected_semantics
+        );
+        assert!(!app.session.dirty());
+        assert!(app.selection.is_empty());
+        assert!(app.fragment_draft.is_none());
+        assert!(!app.session.can_undo() && !app.session.can_redo());
+
+        // The actual bounded UI runner drives the shared compiler/runtime. The duplicate remains
+        // an independent second inverter; every output starts HIGH for LOW input.
+        let outputs: Vec<_> = app
+            .session
+            .document()
+            .components
+            .iter()
+            .filter(|c| c.kind == ComponentKind::Output)
+            .map(|c| c.id)
+            .collect();
+        click_text(&ctx, &mut app, "Start");
+        let mut frames = 0;
+        while app
+            .session
+            .inspect()
+            .is_some_and(|runtime| runtime.is_pending())
+        {
+            let painted = frame(&ctx, &mut app, vec![], true);
+            frames += 1;
+            assert!(
+                frames < 100,
+                "bounded simulator did not settle: {:?}",
+                app.error
+            );
+            if app.session.inspect().unwrap().is_pending() {
+                assert!(wants_immediate_repaint(&painted));
+            }
+        }
+        for id in &outputs {
+            assert_eq!(
+                app.session.inspect().unwrap().output_value(*id),
+                Some(Level::High)
+            );
+        }
+        let input_id = app
+            .session
+            .document()
+            .components
+            .iter()
+            .find(|c| c.kind == ComponentKind::Input)
+            .unwrap()
+            .id;
+        click_text(&ctx, &mut app, &format!("Input #{}: 0 (low)", input_id.0));
+        assert_eq!(
+            app.session
+                .inspect()
+                .unwrap()
+                .pin_value(pin_ref(input_id, PinDirection::Output, 0)),
+            Some(Level::High)
+        );
+        click_text(&ctx, &mut app, "Microstep");
+        click_text(&ctx, &mut app, "Full step");
+        while app
+            .session
+            .inspect()
+            .is_some_and(|runtime| runtime.is_pending())
+        {
+            let painted = frame(&ctx, &mut app, vec![], true);
+            frames += 1;
+            assert!(frames < 200, "input propagation did not settle");
+            if app.session.inspect().unwrap().is_pending() {
+                assert!(wants_immediate_repaint(&painted));
+            }
+        }
+        assert_eq!(
+            app.session.inspect().unwrap().output_value(outputs[0]),
+            Some(Level::Low)
+        );
+        assert_eq!(
+            app.session.inspect().unwrap().output_value(outputs[1]),
+            Some(Level::High),
+            "the unmodified duplicate keeps its independent LOW input"
+        );
+        let second_input = app
+            .session
+            .document()
+            .components
+            .iter()
+            .filter(|c| c.kind == ComponentKind::Input)
+            .nth(1)
+            .unwrap()
+            .id;
+        click_text(
+            &ctx,
+            &mut app,
+            &format!("Input #{}: 0 (low)", second_input.0),
+        );
+        click_text(&ctx, &mut app, "Microstep");
+        click_text(&ctx, &mut app, "Full step");
+        while app
+            .session
+            .inspect()
+            .is_some_and(|runtime| runtime.is_pending())
+        {
+            let painted = frame(&ctx, &mut app, vec![], true);
+            frames += 1;
+            assert!(frames < 300, "duplicate propagation did not settle");
+            if app.session.inspect().unwrap().is_pending() {
+                assert!(wants_immediate_repaint(&painted));
+            }
+        }
+        assert_eq!(
+            app.session.inspect().unwrap().output_value(outputs[1]),
+            Some(Level::Low)
+        );
+        let document_before_locked_edit = app.session.document().clone();
+        camera_rect(&ctx, &mut app);
+        let output_position = component_screen(&app, outputs[0]);
+        click_at(&ctx, &mut app, output_position);
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
+        assert!(app.label_modal.is_none());
+        assert_eq!(*app.session.document(), document_before_locked_edit);
+        assert!(!app.session.dirty());
+        assert!(has_text(
+            &frame(&ctx, &mut app, vec![], true),
+            "Editing is locked"
+        ));
+        click_text(&ctx, &mut app, "Stop");
+        assert!(!app.session.simulation_active());
+
+        // Restart creates fresh runtime input state, then Stop returns to normal editable state.
+        click_text(&ctx, &mut app, "Start");
+        while app
+            .session
+            .inspect()
+            .is_some_and(|runtime| runtime.is_pending())
+        {
+            frame(&ctx, &mut app, vec![], true);
+            frames += 1;
+            assert!(frames < 300);
+        }
+        for id in &outputs {
+            assert_eq!(
+                app.session.inspect().unwrap().output_value(*id),
+                Some(Level::High)
+            );
+        }
+        click_text(&ctx, &mut app, "Stop");
+        assert!(!app.session.simulation_active());
+        camera_rect(&ctx, &mut app);
+        let output_screen = component_screen(&app, outputs[0]);
+        click_at(&ctx, &mut app, output_screen);
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
+        let modal = frame(&ctx, &mut app, vec![], true);
+        let label_pos = modal
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == saved_label => Some(text.pos),
+                _ => None,
+            })
+            .unwrap();
+        click_at(&ctx, &mut app, label_pos + Vec2::new(8., 8.));
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                key(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("After stop".into()),
+            ],
+            true,
+        );
+        press(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert!(app.session.dirty());
+        press(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert!(!app.session.dirty());
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::Z,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        );
+        assert!(app.session.dirty());
+        assert_eq!(clipboard.borrow().reads, 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn supported_document_file_lifecycle_save_new_reopen_run_toggle_inspect_stop() {
         let dir = test_dir("m4-lifecycle");
         let mut app = ui_file_app(&dir);
