@@ -100,8 +100,86 @@ enum SimState {
     Settled,
 }
 
+pub trait TextClipboard {
+    fn read_text(&mut self) -> Result<String, String>;
+    fn write_text(&mut self, text: &str) -> Result<(), String>;
+}
+
+struct UnavailableClipboard;
+impl TextClipboard for UnavailableClipboard {
+    fn read_text(&mut self) -> Result<String, String> {
+        Err("System clipboard is unavailable".into())
+    }
+    fn write_text(&mut self, _text: &str) -> Result<(), String> {
+        Err("System clipboard is unavailable".into())
+    }
+}
+
+struct NativeClipboard {
+    inner: Option<arboard::Clipboard>,
+    init_error: Option<String>,
+}
+impl NativeClipboard {
+    fn new() -> Self {
+        match arboard::Clipboard::new() {
+            Ok(inner) => Self {
+                inner: Some(inner),
+                init_error: None,
+            },
+            Err(error) => Self {
+                inner: None,
+                init_error: Some(format!("Cannot initialize system clipboard: {error}")),
+            },
+        }
+    }
+}
+impl TextClipboard for NativeClipboard {
+    fn read_text(&mut self) -> Result<String, String> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| {
+                self.init_error
+                    .clone()
+                    .unwrap_or_else(|| "System clipboard is unavailable".into())
+            })?
+            .get_text()
+            .map_err(|error| format!("Cannot read system clipboard: {error}"))
+    }
+    fn write_text(&mut self, text: &str) -> Result<(), String> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| {
+                self.init_error
+                    .clone()
+                    .unwrap_or_else(|| "System clipboard is unavailable".into())
+            })?
+            .set_text(text.to_owned())
+            .map_err(|error| format!("Cannot write system clipboard: {error}"))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FragmentDraft {
+    fragment: digital_rust::formats::DigV2,
+    anchor: [f64; 2],
+    delta: [i32; 2],
+    center_fallback: bool,
+    keyboard_adjusted: bool,
+}
+
+#[derive(Clone, Debug)]
+enum ClipboardAction {
+    Copy,
+    Cut,
+    Paste(Option<String>),
+    Duplicate,
+}
+
 pub struct DigitalApp {
     session: Session,
+    clipboard: Box<dyn TextClipboard>,
+    fragment_draft: Option<FragmentDraft>,
+    clipboard_error: Option<String>,
     selected: Option<ComponentId>,
     selected_segment: Option<u64>,
     selection: crate::selection::Selection,
@@ -199,6 +277,9 @@ impl DigitalApp {
     pub fn with_file_io(file_io: Option<Box<dyn FileIo>>, file_io_error: Option<String>) -> Self {
         Self {
             session: Session::default(),
+            clipboard: Box::new(UnavailableClipboard),
+            fragment_draft: None,
+            clipboard_error: None,
             selected: None,
             selected_segment: None,
             selection: crate::selection::Selection::default(),
@@ -238,6 +319,209 @@ impl DigitalApp {
             view_action: None,
             canvas_rect: None,
         }
+    }
+    pub fn with_clipboard(mut self, clipboard: Box<dyn TextClipboard>) -> Self {
+        self.clipboard = clipboard;
+        self
+    }
+    pub fn native() -> Self {
+        let mut app = Self::default();
+        let clipboard = NativeClipboard::new();
+        app.clipboard_error = clipboard.init_error.clone();
+        app.with_clipboard(Box::new(clipboard))
+    }
+
+    fn begin_fragment_draft(
+        &mut self,
+        fragment: digital_rust::formats::DigV2,
+        initial_delta: [i32; 2],
+        center_fallback: bool,
+    ) -> Result<(), String> {
+        let document =
+            digital_rust::formats::to_domain(&fragment).map_err(|error| error.to_string())?;
+        let mut max = [f64::NEG_INFINITY; 2];
+        for component in &document.components {
+            let layout = SymbolLayout::centered_on(
+                self.style,
+                component.kind,
+                [component.position.x, component.position.y],
+            )
+            .ok_or_else(|| format!("No geometry for {}", component.kind.name()))?;
+            let bounds = layout.bounds();
+            max[0] = max[0].max(f64::from(bounds.max[0]));
+            max[1] = max[1].max(f64::from(bounds.max[1]));
+        }
+        for wire in &fragment.wires {
+            max[0] = max[0].max(f64::from(wire.p1.x.max(wire.p2.x)));
+            max[1] = max[1].max(f64::from(wire.p1.y.max(wire.p2.y)));
+        }
+        if !max[0].is_finite()
+            || !max[1].is_finite()
+            || max
+                .iter()
+                .any(|value| value.abs() > (i32::MAX as f64 * 2.0))
+        {
+            return Err("Clipboard fragment has an unrepresentable placement anchor".into());
+        }
+        self.placing = None;
+        self.wiring = false;
+        self.drag = None;
+        self.marquee = None;
+        self.geometric_route_start = None;
+        self.pan_owner = None;
+        self.fragment_draft = Some(FragmentDraft {
+            fragment,
+            anchor: max,
+            delta: initial_delta,
+            center_fallback,
+            keyboard_adjusted: false,
+        });
+        self.restore_canvas_focus = true;
+        Ok(())
+    }
+
+    fn run_clipboard_action(&mut self, action: ClipboardAction) {
+        if self.modality_active() || self.fragment_draft.is_some() {
+            return;
+        }
+        if self.session.simulation_active() {
+            self.error = Some(EditError::SimulationActive.to_string());
+            return;
+        }
+        match action {
+            ClipboardAction::Copy => match self.session.copy_selection_text(&self.selection) {
+                Ok(Some(text)) => match self.clipboard.write_text(&text) {
+                    Ok(()) => {
+                        self.cancel_edit_gestures();
+                        self.error = None;
+                        self.clipboard_error = None;
+                    }
+                    Err(error) => self.clipboard_error = Some(error),
+                },
+                Ok(None) => {}
+                Err(error) => self.clipboard_error = Some(error.to_string()),
+            },
+            ClipboardAction::Cut => match self.session.prepare_cut(&self.selection) {
+                Ok(Some(plan)) => match self.clipboard.write_text(&plan.text) {
+                    Err(error) => self.clipboard_error = Some(error),
+                    Ok(()) => {
+                        let omitted = plan.omitted_boundary_wires;
+                        match self.session.commit_cut(plan) {
+                            Ok(_) => {
+                                self.cancel_edit_gestures();
+                                self.selection.clear();
+                                self.selected = None;
+                                self.selected_segment = None;
+                                self.clipboard_error = None;
+                                self.error = (omitted > 0).then(|| format!("Cut copied components and complete wires; left {omitted} partial boundary wire(s) in the document (safe-cut deviation from Digital)."));
+                            }
+                            Err(error) => self.clipboard_error = Some(error.to_string()),
+                        }
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => self.clipboard_error = Some(error.to_string()),
+            },
+            ClipboardAction::Paste(text) => {
+                let text = match text {
+                    Some(text) => Ok(text),
+                    None => self.clipboard.read_text(),
+                };
+                match text.and_then(|text| {
+                    digital_rust::formats::parse_clipboard_list(text.as_bytes())
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(fragment) if fragment.elements.is_empty() && fragment.wires.is_empty() => {}
+                    Ok(fragment) => {
+                        self.cancel_edit_gestures();
+                        let result = self.begin_fragment_draft(fragment, [0, 0], true);
+                        match result {
+                            Ok(()) => self.clipboard_error = None,
+                            Err(error) => self.clipboard_error = Some(error),
+                        }
+                    }
+                    Err(error) => self.clipboard_error = Some(error),
+                }
+            }
+            ClipboardAction::Duplicate => match self.session.selected_fragment(&self.selection) {
+                Ok(Some(fragment)) => {
+                    self.cancel_edit_gestures();
+                    match self.begin_fragment_draft(fragment, [20, 20], false) {
+                        Ok(()) => self.clipboard_error = None,
+                        Err(error) => self.clipboard_error = Some(error),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.clipboard_error = Some(error.to_string()),
+            },
+        }
+    }
+
+    fn commit_fragment_draft(&mut self) {
+        let Some(draft) = self.fragment_draft.clone() else {
+            return;
+        };
+        let previous_segments: std::collections::BTreeSet<_> = self
+            .session
+            .document()
+            .wires
+            .geometric()
+            .map(|segments| segments.iter().map(|segment| segment.id).collect())
+            .unwrap_or_default();
+        match self.session.insert_clipboard_fragment(
+            &draft.fragment,
+            draft.delta[0],
+            draft.delta[1],
+        ) {
+            Ok(ids) => {
+                self.selection.clear();
+                self.selection.components.extend(ids.iter().copied());
+                if let Ok(segments) = self.session.document().wires.geometric() {
+                    self.selection.wires.extend(
+                        segments
+                            .iter()
+                            .filter(|segment| !previous_segments.contains(&segment.id))
+                            .map(|segment| (segment.id, crate::selection::EndpointMask::BOTH)),
+                    );
+                }
+                self.selected = (self.selection.components.len() == 1
+                    && self.selection.wires.is_empty())
+                .then(|| self.selection.components.iter().next().copied())
+                .flatten();
+                self.selected_segment = None;
+                self.fragment_draft = None;
+                self.clipboard_error = None;
+                self.error = None;
+            }
+            Err(error) => self.clipboard_error = Some(error.to_string()),
+        }
+    }
+
+    fn adjust_fragment_draft(&mut self, dx: i32, dy: i32) {
+        let Some(draft) = &mut self.fragment_draft else {
+            return;
+        };
+        if let (Some(x), Some(y)) = (
+            draft.delta[0].checked_add(dx),
+            draft.delta[1].checked_add(dy),
+        ) {
+            draft.delta = [x, y];
+            draft.keyboard_adjusted = true;
+        } else {
+            self.clipboard_error =
+                Some("Placement offset exceeds supported integer geometry".into());
+        }
+    }
+
+    fn cancel_edit_gestures(&mut self) {
+        self.placing = None;
+        self.wiring = false;
+        self.drag = None;
+        self.marquee = None;
+        self.pan_owner = None;
+        self.geometric_route_start = None;
+        self.focused_route_target = None;
+        self.focused_pin = None;
     }
 }
 pub fn native_options() -> eframe::NativeOptions {
@@ -452,6 +736,7 @@ impl DigitalApp {
     }
 
     fn cancel_gestures(&mut self) {
+        self.fragment_draft = None;
         self.pan_owner = None;
         self.placing = None;
         self.wiring = false;
@@ -1144,6 +1429,7 @@ impl DigitalApp {
                         oscillation_limit: crate::runtime::DEFAULT_OSCILLATION_LIMIT,
                     }) {
                     Ok(()) => {
+                        self.fragment_draft = None;
                         self.pan_owner = None;
                         self.placing = None;
                         self.wiring = false;
@@ -1447,7 +1733,7 @@ impl DigitalApp {
         let mut running_close_choice = None;
         egui::SidePanel::left("palette").show(ctx, |ui| {
             ui.heading("Components");
-            let locked = self.session.simulation_active() || self.modality_active();
+            let locked = self.session.simulation_active() || self.modality_active() || self.fragment_draft.is_some();
             ui.add_enabled_ui(!locked, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for kind in KINDS {
@@ -1498,7 +1784,13 @@ impl DigitalApp {
             });
             ui.label(format!("{:.0}% · Middle/Alt-drag pan · wheel zoom · +/- zoom · F fit · 0 reset · arrows pan", self.view.zoom() * 100.));
             if locked {
-                ui.label(if self.session.simulation_active() { EDIT_LOCK_NOTE } else { "Finish or cancel the file action to resume editing." });
+                if self.session.simulation_active() {
+                    ui.label(EDIT_LOCK_NOTE);
+                } else if self.fragment_draft.is_some() {
+                    ui.label("Place clipboard fragment: move pointer, arrows nudge 20, click/Enter commits, Escape cancels.");
+                } else {
+                    ui.label("Finish or cancel the file action to resume editing.");
+                }
             }
             ui.separator();
             ui.add_enabled_ui(!locked, |ui| {
@@ -1530,6 +1822,9 @@ impl DigitalApp {
                 }
             }
             if let Some(error) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            if let Some(error) = &self.clipboard_error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
             if let Some(error) = &self.file_io_error {
@@ -1595,10 +1890,18 @@ impl DigitalApp {
                 document_name
             ));
             let mut file_action = None;
+            let mut edit_action = None;
             if !self.modality_active() {
             ui.menu_button("File", |ui| {
                 for (label, enabled, action) in [("New  Ctrl/Cmd+N", !locked, 0), ("Open…  Ctrl/Cmd+O", !locked, 1), ("Save  Ctrl/Cmd+S", !locked, 2), ("Save As…  Shift+Ctrl/Cmd+S", !locked, 3)] {
                     if ui.add_enabled(enabled, egui::Button::new(label)).clicked() { file_action = Some(action); ui.close_menu(); }
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                for (label, action) in [("Copy  Ctrl/Cmd+C", 0), ("Cut  Ctrl/Cmd+X", 1), ("Paste  Ctrl/Cmd+V", 2), ("Duplicate  Ctrl/Cmd+D", 3)] {
+                    if ui.add_enabled(!locked && self.fragment_draft.is_none(), egui::Button::new(label)).clicked() {
+                        edit_action = Some(action); ui.close_menu();
+                    }
                 }
             });
             ui.horizontal_wrapped(|ui| {
@@ -1606,6 +1909,12 @@ impl DigitalApp {
                     if ui.add_enabled(!locked, egui::Button::new(label)).clicked() { file_action = Some(action); }
                 }
             });
+            if let Some(action) = edit_action {
+                self.run_clipboard_action(match action {
+                    0 => ClipboardAction::Copy, 1 => ClipboardAction::Cut,
+                    2 => ClipboardAction::Paste(None), _ => ClipboardAction::Duplicate,
+                });
+            }
             if let Some(action) = file_action {
                 match action {
                     0 => self.begin_pending(PendingAction::New),
@@ -1745,11 +2054,12 @@ impl DigitalApp {
                 self.drag = None;
                 self.marquee = None;
                 self.placing = None;
-                        self.geometric_route_start = None;
+                self.fragment_draft = None;
+                self.geometric_route_start = None;
             }
             // Gesture ownership is acquired only when unowned. A chorded/extra press must
             // never replace the button whose release terminates the current pan.
-            let pan_start = (self.pan_owner.is_none() && !cancelled && self.drag.is_none()).then(|| ctx.input(|i| i.events.iter().find_map(|event| match event {
+            let pan_start = (self.pan_owner.is_none() && !cancelled && self.drag.is_none() && self.fragment_draft.is_none()).then(|| ctx.input(|i| i.events.iter().find_map(|event| match event {
                 egui::Event::PointerButton { pos, button: egui::PointerButton::Middle, pressed: true, .. } if rect.contains(*pos) => Some((egui::PointerButton::Middle, *pos)),
                 egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers, .. } if modifiers.alt && rect.contains(*pos) => Some((egui::PointerButton::Primary, *pos)),
                 _ => None,
@@ -1773,7 +2083,7 @@ impl DigitalApp {
                     let _ = self.view.zoom_at(rect, pointer, factor);
                 }
             }
-            if !modal_open && !pan_sequence && self.drag.is_none() && response.has_focus() {
+            if !modal_open && !pan_sequence && self.drag.is_none() && self.fragment_draft.is_none() && response.has_focus() {
                 // Ctrl+Tab is a documented route to the seed editor that does not steal
                 // plain Tab from keyboard pin navigation; Escape returns focus here.
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
@@ -1816,6 +2126,18 @@ impl DigitalApp {
             let Some(transform) = self.view.transform(rect) else { return; };
             draw_grid(&painter, rect, transform, ui.visuals().widgets.noninteractive.bg_stroke.color);
             let pointer = (!cancelled && !pan_sequence).then(|| response.interact_pointer_pos()).flatten();
+            let pointer_moved = ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::PointerMoved(_))));
+            if let Some(draft) = &mut self.fragment_draft {
+                if pointer_moved { draft.keyboard_adjusted = false; }
+                if !draft.keyboard_adjusted && let Some(target) = pointer.or_else(|| draft.center_fallback.then_some(rect.center())) {
+                    let world = transform.to_world(target);
+                    let dx = ((f64::from(world[0]) - draft.anchor[0]) / 20.0).round() * 20.0;
+                    let dy = ((f64::from(world[1]) - draft.anchor[1]) / 20.0).round() * 20.0;
+                    if dx.is_finite() && dy.is_finite() && dx >= i32::MIN as f64 && dx <= i32::MAX as f64 && dy >= i32::MIN as f64 && dy <= i32::MAX as f64 {
+                        draft.delta = [dx as i32, dy as i32];
+                    }
+                }
+            }
             let mut pins: Vec<_> = self
                 .session
                 .document()
@@ -1858,7 +2180,9 @@ impl DigitalApp {
                 && rect.contains(p)
             {
                 response.request_focus();
-                if self.wiring && !locked {
+                if self.fragment_draft.is_some() {
+                    // Fragment placement owns the pointer; editing hit targets are suppressed.
+                } else if self.wiring && !locked {
                     let hit = self.route_target_at(p, transform, &pins);
                     if let Some(target) = hit {
                         self.choose_route_target(target);
@@ -1925,9 +2249,13 @@ impl DigitalApp {
                     }
                 }
             }
+            if !cancelled && !pan_sequence && !locked && response.clicked() && self.fragment_draft.is_some() {
+                self.commit_fragment_draft();
+            }
             if !cancelled && !pan_sequence
                 && !locked
                 && response.clicked()
+                && self.fragment_draft.is_none()
                 && let Some(kind) = self.placing.take()
                 && let Some(p) = pointer
             {
@@ -2225,6 +2553,36 @@ impl DigitalApp {
                     );
                 }
             }
+            if let Some(draft) = &self.fragment_draft
+                && let Ok(document) = digital_rust::formats::to_domain(&draft.fragment)
+            {
+                    for segment in document.wires.geometric().unwrap_or(&[]) {
+                        let add = |point: digital_rust::geometric_wiring::Point| -> Option<Pos2> {
+                            Some(transform.to_screen([point.x.checked_add(draft.delta[0])? as f32, point.y.checked_add(draft.delta[1])? as f32]))
+                        };
+                        if let (Some(a), Some(b)) = (add(segment.a), add(segment.b)) {
+                            painter.line_segment([a, b], Stroke::new(2.0_f32, palette.selection));
+                        }
+                    }
+                    for component in &document.components {
+                        let x = f64::from(component.position.x) + f64::from(draft.delta[0]);
+                        let y = f64::from(component.position.y) + f64::from(draft.delta[1]);
+                        if !x.is_finite() || !y.is_finite() || x.abs() > f32::MAX as f64 || y.abs() > f32::MAX as f64 { continue; }
+                        if let Some(layout) = SymbolLayout::centered_on(style, component.kind, [x as f32, y as f32]) {
+                            if matches!(component.kind, ComponentKind::Const | ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XOr | ComponentKind::XNOr) {
+                                let bounds = layout.bounds();
+                                let screen = Rect::from_min_max(transform.to_screen(bounds.min), transform.to_screen(bounds.max));
+                                painter.rect_stroke(screen, 3.0, Stroke::new(STROKE_WIDTH, palette.selection), egui::StrokeKind::Inside);
+                                let text = if component.kind == ComponentKind::Const { if component.constant_value { "1" } else { "0" } } else { component.kind.name() };
+                                painter.text(screen.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), palette.selection);
+                            } else if let Err(error) = self.renderer.draw(&painter, &layout, &transform, &palette, PaintState::Selection) {
+                                self.clipboard_error = Some(error.to_string());
+                            }
+                            let bounds = layout.bounds();
+                            painter.text(transform.to_screen([(bounds.min[0] + bounds.max[0]) / 2.0, bounds.max[1]]) + Vec2::new(0.0, SELECTION_MARGIN * transform.zoom() + LABEL_GAP), egui::Align2::CENTER_TOP, &component.label, egui::FontId::proportional(14.0), palette.selection);
+                        }
+                    }
+            }
             if self.restore_canvas_focus
                 && !self.modality_active()
                 && ctx.input(|input| input.focused)
@@ -2232,8 +2590,50 @@ impl DigitalApp {
                 response.request_focus();
                 self.restore_canvas_focus = false;
             }
-            let owns_keyboard = response.has_focus() && !self.modality_active() && !pan_sequence;
-            if owns_keyboard {
+            if self.fragment_draft.is_some() && !self.modality_active() && !pan_sequence {
+                response.request_focus();
+            }
+            let placement_keyboard = response.has_focus() && !self.modality_active() && !pan_sequence && self.fragment_draft.is_some();
+            if placement_keyboard && !locked {
+                let key = ctx.input(|input| input.events.iter().find_map(|event| match event {
+                    egui::Event::Key { key, pressed: true, modifiers, .. }
+                        if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
+                            && matches!(key, egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Enter) => Some(*key),
+                    _ => None,
+                }));
+                match key {
+                    Some(egui::Key::ArrowLeft) => self.adjust_fragment_draft(-20, 0),
+                    Some(egui::Key::ArrowRight) => self.adjust_fragment_draft(20, 0),
+                    Some(egui::Key::ArrowUp) => self.adjust_fragment_draft(0, -20),
+                    Some(egui::Key::ArrowDown) => self.adjust_fragment_draft(0, 20),
+                    Some(egui::Key::Enter) => self.commit_fragment_draft(),
+                    _ => {}
+                }
+            }
+            let owns_keyboard = response.has_focus() && !self.modality_active() && !pan_sequence && self.fragment_draft.is_none();
+            if owns_keyboard && !locked && self.fragment_draft.is_none() {
+                let platform_action = ctx.input(|input| input.events.iter().find_map(|event| match event {
+                    egui::Event::Copy => Some(ClipboardAction::Copy),
+                    egui::Event::Cut => Some(ClipboardAction::Cut),
+                    egui::Event::Paste(text) => Some(ClipboardAction::Paste(Some(text.clone()))),
+                    _ => None,
+                }));
+                let shortcut_action = ctx.input(|input| input.events.iter().find_map(|event| match event {
+                    egui::Event::Key { key, pressed: true, modifiers, .. }
+                        if (modifiers.ctrl || modifiers.command) && !modifiers.alt && !modifiers.shift => match key {
+                            egui::Key::C => Some(ClipboardAction::Copy),
+                            egui::Key::X => Some(ClipboardAction::Cut),
+                            egui::Key::V => Some(ClipboardAction::Paste(None)),
+                            egui::Key::D => Some(ClipboardAction::Duplicate),
+                            _ => None,
+                        },
+                    _ => None,
+                }));
+                if let Some(action) = platform_action.or(shortcut_action) {
+                    self.run_clipboard_action(action);
+                }
+            }
+            if owns_keyboard && self.fragment_draft.is_none() {
                 ui.memory_mut(|m| {
                     m.set_focus_lock_filter(
                         response.id,
@@ -2244,7 +2644,7 @@ impl DigitalApp {
                     )
                 });
             }
-            if owns_keyboard && !locked {
+            if owns_keyboard && !locked && self.fragment_draft.is_none() {
                 let select_all = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A) || i.consume_key(egui::Modifiers::CTRL, egui::Key::A));
                 if select_all {
                     self.selection.components = self.session.document().components.iter().map(|c| c.id).collect();
@@ -2458,7 +2858,7 @@ impl DigitalApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            let (undo, redo) = if owns_keyboard && !locked {
+            let (undo, redo) = if owns_keyboard && !locked && self.fragment_draft.is_none() {
                 ctx.input_mut(|i| {
                     let command = egui::Modifiers::COMMAND;
                     let shifted = egui::Modifiers {
@@ -2513,6 +2913,284 @@ impl eframe::App for DigitalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct FakeClipboardState {
+        text: String,
+        reads: usize,
+        writes: usize,
+        fail_read: bool,
+        fail_write: bool,
+    }
+    struct FakeClipboard(Rc<RefCell<FakeClipboardState>>);
+    impl TextClipboard for FakeClipboard {
+        fn read_text(&mut self) -> Result<String, String> {
+            let mut state = self.0.borrow_mut();
+            state.reads += 1;
+            if state.fail_read {
+                Err("injected read failure".into())
+            } else {
+                Ok(state.text.clone())
+            }
+        }
+        fn write_text(&mut self, text: &str) -> Result<(), String> {
+            let mut state = self.0.borrow_mut();
+            state.writes += 1;
+            if state.fail_write {
+                Err("injected write failure".into())
+            } else {
+                state.text = text.to_owned();
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cut_write_failure_preserves_document_history_selection_and_clipboard() {
+        let state = Rc::new(RefCell::new(FakeClipboardState {
+            text: "old clipboard".into(),
+            fail_write: true,
+            ..Default::default()
+        }));
+        let mut app = DigitalApp::with_file_io(None, None)
+            .with_clipboard(Box::new(FakeClipboard(state.clone())));
+        let id = app
+            .session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        app.selection.components.insert(id);
+        app.selected = Some(id);
+        let document = app.session.document().clone();
+        app.run_clipboard_action(ClipboardAction::Cut);
+        assert_eq!(app.session.document(), &document);
+        assert_eq!(app.selection.components, [id].into_iter().collect());
+        assert_eq!(state.borrow().text, "old clipboard");
+        assert!(
+            app.clipboard_error
+                .as_deref()
+                .is_some_and(|message| message.contains("injected"))
+        );
+        app.session.undo().unwrap();
+        let next = app
+            .session
+            .place(ComponentKind::Output, Position { x: 40.0, y: 0.0 })
+            .unwrap();
+        assert_eq!(next.0, id.0 + 1);
+    }
+
+    #[test]
+    fn egui_copy_and_synthetic_shortcut_dispatch_once_and_text_modal_keeps_clipboard_ownership() {
+        let state = Rc::new(RefCell::new(FakeClipboardState::default()));
+        let mut app = DigitalApp::with_file_io(None, None)
+            .with_clipboard(Box::new(FakeClipboard(state.clone())));
+        let id = app
+            .session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], true);
+        let rect = app.canvas_rect.unwrap();
+        let transform = app.view.transform(rect).unwrap();
+        let position = app.session.document().components[0].position;
+        let screen = transform.to_screen([position.x, position.y]);
+        click_at(&ctx, &mut app, screen);
+        assert!(app.selection.components.contains(&id));
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::C, ctrl), egui::Event::Copy],
+            true,
+        );
+        assert_eq!(
+            state.borrow().writes,
+            1,
+            "key and egui clipboard events must not dispatch twice"
+        );
+        assert!(state.borrow().text.contains("<list>"));
+        app.begin_label_edit();
+        let writes_before = state.borrow().writes;
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::C, ctrl), egui::Event::Copy],
+            true,
+        );
+        assert_eq!(
+            state.borrow().writes,
+            writes_before,
+            "text editor owns its normal clipboard shortcuts"
+        );
+    }
+
+    #[test]
+    fn clipboard_read_failure_and_empty_copy_are_visible_noops() {
+        let state = Rc::new(RefCell::new(FakeClipboardState {
+            text: "keep".into(),
+            fail_read: true,
+            ..Default::default()
+        }));
+        let mut app = DigitalApp::with_file_io(None, None)
+            .with_clipboard(Box::new(FakeClipboard(state.clone())));
+        app.run_clipboard_action(ClipboardAction::Copy);
+        assert_eq!(state.borrow().text, "keep");
+        assert_eq!(state.borrow().writes, 0);
+        app.run_clipboard_action(ClipboardAction::Paste(None));
+        assert!(app.fragment_draft.is_none());
+        assert!(app.session.document().components.is_empty());
+        assert!(
+            app.clipboard_error
+                .as_deref()
+                .is_some_and(|message| message.contains("injected read failure"))
+        );
+        assert_eq!(state.borrow().reads, 1);
+    }
+
+    #[test]
+    fn fragment_placement_click_commits_and_escape_or_focus_loss_cancels_without_edits() {
+        let fragment = digital_rust::formats::DigV2 {
+            elements: vec![digital_rust::formats::DigElement {
+                name: "In".into(),
+                x: 0,
+                y: 0,
+                label: None,
+                value: None,
+            }],
+            wires: vec![],
+        };
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::with_file_io(None, None);
+        app.begin_fragment_draft(fragment.clone(), [0, 0], true)
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let document = app.session.document().clone();
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(app.session.document(), &document);
+        assert!(app.fragment_draft.is_none());
+
+        app.begin_fragment_draft(fragment.clone(), [0, 0], true)
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        frame(&ctx, &mut app, vec![], false);
+        assert_eq!(app.session.document(), &document);
+        assert!(app.fragment_draft.is_none());
+
+        app.begin_fragment_draft(fragment, [0, 0], true).unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let center = app.canvas_rect.unwrap().center();
+        click_at(&ctx, &mut app, center);
+        assert_eq!(app.session.document().components.len(), 1);
+        assert_eq!(app.selection.components.len(), 1);
+        assert!(app.fragment_draft.is_none());
+    }
+
+    #[test]
+    fn edit_menu_copy_uses_same_injected_clipboard_action() {
+        let state = Rc::new(RefCell::new(FakeClipboardState {
+            text: "preserve".into(),
+            ..Default::default()
+        }));
+        let mut app = DigitalApp::with_file_io(None, None)
+            .with_clipboard(Box::new(FakeClipboard(state.clone())));
+        let id = app
+            .session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        app.selection.components.insert(id);
+        let ctx = egui::Context::default();
+        click_text(&ctx, &mut app, "Edit");
+        click_text(&ctx, &mut app, "Copy  Ctrl/Cmd+C");
+        assert_eq!(state.borrow().writes, 1);
+        assert!(state.borrow().text.starts_with("<?xml"));
+    }
+
+    #[test]
+    fn duplicate_uses_fragment_preview_without_reading_or_writing_clipboard() {
+        let state = Rc::new(RefCell::new(FakeClipboardState::default()));
+        let mut app = DigitalApp::with_file_io(None, None)
+            .with_clipboard(Box::new(FakeClipboard(state.clone())));
+        let id = app
+            .session
+            .place(ComponentKind::Not, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        app.selection.components.insert(id);
+        app.selected = Some(id);
+        let document = app.session.document().clone();
+        app.run_clipboard_action(ClipboardAction::Duplicate);
+        assert_eq!(app.session.document(), &document);
+        assert!(app.fragment_draft.is_some(), "{:?}", app.clipboard_error);
+        assert_eq!((state.borrow().reads, state.borrow().writes), (0, 0));
+    }
+    #[test]
+    fn paste_preview_is_transient_and_keyboard_offset_commits_once_with_fresh_selection() {
+        let fragment = digital_rust::formats::DigV2 {
+            elements: vec![digital_rust::formats::DigElement {
+                name: "In".into(),
+                x: 0,
+                y: 0,
+                label: Some("Paste λ".into()),
+                value: None,
+            }],
+            wires: vec![],
+        };
+        let xml =
+            String::from_utf8(digital_rust::formats::serialize_clipboard_list(&fragment).unwrap())
+                .unwrap();
+        let state = Rc::new(RefCell::new(FakeClipboardState {
+            text: xml,
+            ..Default::default()
+        }));
+        let mut app = DigitalApp::with_file_io(None, None)
+            .with_clipboard(Box::new(FakeClipboard(state.clone())));
+        let original = app.session.document().clone();
+        app.run_clipboard_action(ClipboardAction::Paste(None));
+        assert_eq!(app.session.document(), &original);
+        assert_eq!(state.borrow().reads, 1);
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], true);
+        ctx.memory_mut(|memory| memory.request_focus(app.canvas_id.unwrap()));
+        let before_arrow = app.fragment_draft.as_ref().unwrap().delta;
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::ArrowRight, egui::Modifiers::NONE)],
+            true,
+        );
+        let offset = app.fragment_draft.as_ref().unwrap().delta;
+        assert_eq!(offset[0], before_arrow[0] + 20);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(
+            app.session.document().components.len(),
+            1,
+            "draft={:?} clipboard_error={:?}",
+            app.fragment_draft.as_ref().map(|draft| draft.delta),
+            app.clipboard_error
+        );
+        assert_eq!(app.session.document().components[0].label, "Paste λ");
+        assert_eq!(
+            app.selection.components,
+            [ComponentId(0)].into_iter().collect()
+        );
+        assert!(app.fragment_draft.is_none());
+        app.session.undo().unwrap();
+        assert!(app.session.document().components.is_empty());
+    }
+
     #[test]
     fn keyboard_target_dedup_scales_to_maximum_wire_candidate_count_and_keeps_order() {
         use crate::engine::RouteTarget;

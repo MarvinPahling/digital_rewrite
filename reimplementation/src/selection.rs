@@ -18,6 +18,9 @@ impl EndpointMask {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
+    pub const fn is_both(self) -> bool {
+        self.0 == Self::BOTH.0
+    }
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }

@@ -22,6 +22,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Digital Rust",
         ui::native_options(),
-        Box::new(|_| Ok(Box::new(ui::DigitalApp::default()))),
+        Box::new(|_| Ok(Box::new(ui::DigitalApp::native()))),
     )
 }

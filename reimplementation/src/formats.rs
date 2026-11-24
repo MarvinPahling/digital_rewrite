@@ -39,7 +39,7 @@ pub struct DigWire {
     pub p2: DigPoint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DigPoint {
     pub x: i32,
     pub y: i32,
@@ -315,8 +315,150 @@ impl std::fmt::Display for DigReadErrorKind {
     }
 }
 
-/// Parse strict `.dig` XML version 2, rejecting every field not represented here.
-pub fn parse_v2(bytes: &[u8]) -> Result<DigV2, DigReadError> {
+/// Parse the original Digital clipboard payload: an XStream `ArrayList<Movable>` rooted at
+/// `<list>`, containing only supported visual elements and wires. This is intentionally not a
+/// circuit-v2 wrapper; unknown classes, rotations, resources and attributes are rejected.
+pub fn parse_clipboard_list(bytes: &[u8]) -> Result<DigV2, DigReadError> {
+    let root = parse_bounded_xml(bytes)?;
+    if root.name != "list" {
+        return Err(error(
+            DigReadErrorKind::Unsupported,
+            root.offset,
+            "root",
+            "expected XStream <list>",
+        ));
+    }
+    no_attributes(&root, "list")?;
+    whitespace_text(&root, "list")?;
+    let mut result = DigV2 {
+        elements: Vec::new(),
+        wires: Vec::new(),
+    };
+    for child in &root.children {
+        match child.name.as_str() {
+            "visualElement" => {
+                if result.elements.len() >= MAX_ELEMENTS {
+                    return Err(error(
+                        DigReadErrorKind::Limit,
+                        child.offset,
+                        "list",
+                        "component count exceeds 10,000",
+                    ));
+                }
+                result.elements.push(parse_element(child)?);
+            }
+            "wire" => {
+                if result.wires.len() >= MAX_WIRES {
+                    return Err(error(
+                        DigReadErrorKind::Limit,
+                        child.offset,
+                        "list",
+                        "wire count exceeds 30,000",
+                    ));
+                }
+                result.wires.push(parse_wire(child)?);
+            }
+            other => {
+                return Err(error(
+                    DigReadErrorKind::Unsupported,
+                    child.offset,
+                    other,
+                    "unsupported clipboard class",
+                ));
+            }
+        }
+    }
+    // Domain conversion checks kind names, exact integer precision, attribute semantics and pins.
+    to_domain(&result).map_err(|e| {
+        error(
+            DigReadErrorKind::Unsupported,
+            root.offset,
+            "list",
+            e.to_string(),
+        )
+    })?;
+    Ok(result)
+}
+
+/// Serialize the supported subset using Digital's list-root clipboard interchange shape.
+pub fn serialize_clipboard_list(list: &DigV2) -> Result<Vec<u8>, DigWriteError> {
+    if list.elements.len() > MAX_ELEMENTS || list.wires.len() > MAX_WIRES {
+        return Err(write_error(
+            DigWriteErrorKind::Limit,
+            "list",
+            "clipboard element/wire limit exceeded",
+        ));
+    }
+    // Refuse unsupported kinds, attrs, labels and precision loss before emitting any bytes.
+    to_domain(list)
+        .map_err(|e| write_error(DigWriteErrorKind::UnsupportedValue, "list", e.to_string()))?;
+    let mut output = Vec::new();
+    write_bytes(
+        &mut output,
+        b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<list>",
+        "list",
+    )?;
+    for element in &list.elements {
+        write_clipboard_element(&mut output, element)?;
+    }
+    for wire in &list.wires {
+        write_clipboard_wire(&mut output, wire)?;
+    }
+    write_bytes(&mut output, b"</list>", "list")?;
+    Ok(output)
+}
+
+fn write_clipboard_element(
+    output: &mut Vec<u8>,
+    element: &DigElement,
+) -> Result<(), DigWriteError> {
+    validate_write_string(&element.name, "elementName")?;
+    if let Some(label) = &element.label {
+        crate::domain::validate_label(label)
+            .map_err(|e| write_error(DigWriteErrorKind::Limit, "Label", e.to_string()))?;
+        validate_write_string(label, "Label")?;
+    }
+    if element.value.is_some() && element.name != "Const" {
+        return Err(write_error(
+            DigWriteErrorKind::UnsupportedValue,
+            "Value",
+            "Value is supported only for Const",
+        ));
+    }
+    write_bytes(output, b"<visualElement><elementName>", "element")?;
+    write_text(output, &element.name, "elementName")?;
+    write_bytes(output, b"</elementName><elementAttributes", "element")?;
+    if element.label.is_none() && element.value.is_none() {
+        write_bytes(output, b"/><pos x=\"", "element")?;
+    } else {
+        write_bytes(output, b">", "element")?;
+        if let Some(label) = &element.label {
+            write_bytes(output, b"<entry><string>Label</string><string>", "Label")?;
+            write_text(output, label, "Label")?;
+            write_bytes(output, b"</string></entry>", "Label")?;
+        }
+        if let Some(value) = element.value {
+            write_bytes(output, b"<entry><string>Value</string><long>", "Value")?;
+            write_bytes(output, if value { b"1" } else { b"0" }, "Value")?;
+            write_bytes(output, b"</long></entry>", "Value")?;
+        }
+        write_bytes(output, b"</elementAttributes><pos x=\"", "element")?;
+    }
+    write_bytes(output, element.x.to_string().as_bytes(), "pos.x")?;
+    write_bytes(output, b"\" y=\"", "pos")?;
+    write_bytes(output, element.y.to_string().as_bytes(), "pos.y")?;
+    write_bytes(output, b"\"/></visualElement>", "element")
+}
+
+fn write_clipboard_wire(output: &mut Vec<u8>, wire: &DigWire) -> Result<(), DigWriteError> {
+    write_bytes(output, b"<wire><p1 x=\"", "wire")?;
+    write_point(output, wire.p1, "wire.p1")?;
+    write_bytes(output, b"/><p2 x=\"", "wire")?;
+    write_point(output, wire.p2, "wire.p2")?;
+    write_bytes(output, b"/></wire>", "wire")
+}
+
+fn parse_bounded_xml(bytes: &[u8]) -> Result<Node, DigReadError> {
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(error(
             DigReadErrorKind::InputLimit,
@@ -336,7 +478,12 @@ pub fn parse_v2(bytes: &[u8]) -> Result<DigV2, DigReadError> {
     if let Some((offset, _)) = input.char_indices().find(|(_, ch)| !matches!(*ch as u32, 0x9 | 0xa | 0xd | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)) {
         return Err(error(DigReadErrorKind::Xml, offset, "document", "input contains a character forbidden by XML 1.0"));
     }
-    let root = XmlParser::new(input).parse()?;
+    XmlParser::new(input).parse()
+}
+
+/// Parse strict `.dig` XML version 2, rejecting every field not represented here.
+pub fn parse_v2(bytes: &[u8]) -> Result<DigV2, DigReadError> {
+    let root = parse_bounded_xml(bytes)?;
     if root.name != "circuit" {
         return Err(error(
             DigReadErrorKind::Unsupported,
@@ -1874,6 +2021,76 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_list_uses_original_root_and_round_trips_all_supported_kinds_and_raw_wires() {
+        let list = DigV2 {
+            elements: crate::components::KINDS
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| DigElement {
+                    name: kind.digital_name().into(),
+                    x: index as i32 * 100 - 300,
+                    y: -80,
+                    label: Some(format!("λ {} & <raw>", kind.name())),
+                    value: (*kind == ComponentKind::Const).then_some(false),
+                })
+                .collect(),
+            wires: vec![
+                DigWire {
+                    p1: DigPoint { x: 7, y: -3 },
+                    p2: DigPoint { x: -19, y: 42 },
+                },
+                DigWire {
+                    p1: DigPoint { x: 10, y: 11 },
+                    p2: DigPoint { x: 1, y: -8 },
+                },
+            ],
+        };
+        let xml = serialize_clipboard_list(&list).unwrap();
+        let text = std::str::from_utf8(&xml).unwrap();
+        assert!(text.contains("<list>"));
+        assert!(!text.contains("<circuit>"));
+        let parsed = parse_clipboard_list(&xml).unwrap();
+        assert_eq!(parsed, list);
+    }
+
+    #[test]
+    fn clipboard_list_rejects_other_roots_classes_rotation_and_bounds() {
+        for source in [
+            b"<circuit/>".as_slice(),
+            b"<list><reference/></list>".as_slice(),
+            b"<list><visualElement rotation=\"90\"><elementName>In</elementName></visualElement></list>".as_slice(),
+            b"<list><visualElement><elementName>UnknownThing</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement></list>".as_slice(),
+        ] { assert!(parse_clipboard_list(source).is_err(), "{source:?}"); }
+        assert!(matches!(
+            parse_clipboard_list(&vec![b' '; MAX_INPUT_BYTES + 1])
+                .unwrap_err()
+                .kind,
+            DigReadErrorKind::InputLimit
+        ));
+        let nested = format!("<list>{}</list>", "<item>".repeat(MAX_DEPTH));
+        assert_eq!(
+            parse_clipboard_list(nested.as_bytes()).unwrap_err().kind,
+            DigReadErrorKind::Limit
+        );
+        let long_label = format!(
+            "<list><visualElement><elementName>In</elementName><elementAttributes><entry><string>Label</string><string>{}</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement></list>",
+            "x".repeat(MAX_STRING_BYTES + 1)
+        );
+        assert_eq!(
+            parse_clipboard_list(long_label.as_bytes())
+                .unwrap_err()
+                .kind,
+            DigReadErrorKind::Limit
+        );
+        let one_input = "<visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement>";
+        let too_many = format!("<list>{}</list>", one_input.repeat(MAX_ELEMENTS + 1));
+        assert_eq!(
+            parse_clipboard_list(too_many.as_bytes()).unwrap_err().kind,
+            DigReadErrorKind::Limit
+        );
+    }
 
     const EMPTY: &str =
         "<circuit><version>2</version><attributes/><visualElements/><wires/></circuit>";

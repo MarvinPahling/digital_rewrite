@@ -47,6 +47,35 @@ pub enum RouteTarget {
     },
 }
 
+#[derive(Clone, Debug)]
+pub struct ClipboardCutPlan {
+    pub text: String,
+    pub omitted_boundary_wires: usize,
+    deletion: crate::selection::Selection,
+    source_document: Document,
+}
+
+#[derive(Debug)]
+pub enum ClipboardError {
+    Edit(EditError),
+    Read(formats::DigReadError),
+    Write(formats::DigWriteError),
+    Domain(formats::DomainCodecError),
+    StaleCutPlan,
+}
+impl std::fmt::Display for ClipboardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Edit(error) => error.fmt(f),
+            Self::Read(error) => error.fmt(f),
+            Self::Write(error) => error.fmt(f),
+            Self::Domain(error) => error.fmt(f),
+            Self::StaleCutPlan => f.write_str("Circuit changed before cut could be committed"),
+        }
+    }
+}
+impl std::error::Error for ClipboardError {}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditError {
     /// Editing is locked while a simulation is active; stop it first.
@@ -253,6 +282,285 @@ impl Session {
     pub fn document(&self) -> &Document {
         &self.document
     }
+
+    pub fn selected_fragment(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Result<Option<formats::DigV2>, ClipboardError> {
+        self.ensure_editable().map_err(ClipboardError::Edit)?;
+        let component_ids: std::collections::BTreeSet<_> = self
+            .document
+            .components
+            .iter()
+            .map(|component| component.id)
+            .collect();
+        if selection
+            .components
+            .iter()
+            .any(|id| !component_ids.contains(id))
+        {
+            return Err(ClipboardError::Edit(EditError::InvalidSelection));
+        }
+        let segments = self
+            .document
+            .wires
+            .geometric()
+            .map_err(|error| ClipboardError::Edit(EditError::Geometry(error)))?;
+        let segment_ids: std::collections::BTreeSet<_> =
+            segments.iter().map(|segment| segment.id).collect();
+        if selection
+            .wires
+            .iter()
+            .any(|(id, mask)| !segment_ids.contains(id) || mask.is_empty())
+        {
+            return Err(ClipboardError::Edit(EditError::InvalidSelection));
+        }
+        let components = self
+            .document
+            .components
+            .iter()
+            .filter(|component| selection.components.contains(&component.id))
+            .cloned()
+            .collect();
+        // Digital copyElementsToMove includes only complete wires. Partial endpoint records are
+        // validated as selection identities above, then deliberately omitted (never clipped).
+        let wires = segments
+            .iter()
+            .filter(|segment| {
+                selection
+                    .wires
+                    .get(&segment.id)
+                    .is_some_and(|mask| mask.is_both())
+            })
+            .copied()
+            .collect();
+        let document = Document {
+            components,
+            wires: crate::domain::Wiring::GeometricSegments(wires),
+        };
+        if document.components.is_empty() && document.wires.is_empty() {
+            return Ok(None);
+        }
+        formats::from_domain(&document)
+            .map(Some)
+            .map_err(ClipboardError::Domain)
+    }
+
+    pub fn copy_selection_text(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Result<Option<String>, ClipboardError> {
+        self.selected_fragment(selection)?
+            .map(|fragment| {
+                formats::serialize_clipboard_list(&fragment)
+                    .map_err(ClipboardError::Write)
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|error| {
+                            ClipboardError::Write(formats::DigWriteError {
+                                kind: formats::DigWriteErrorKind::UnsupportedValue,
+                                context: "clipboard".into(),
+                                message: error.to_string(),
+                            })
+                        })
+                    })
+            })
+            .transpose()
+    }
+
+    /// Validate and encode a cut before the adapter publishes clipboard text. The prepared plan
+    /// deletes only selected components and complete wire records; partial boundary wires remain.
+    pub fn prepare_cut(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Result<Option<ClipboardCutPlan>, ClipboardError> {
+        let Some(fragment) = self.selected_fragment(selection)? else {
+            return Ok(None);
+        };
+        let bytes = formats::serialize_clipboard_list(&fragment).map_err(ClipboardError::Write)?;
+        let mut deletion = crate::selection::Selection {
+            components: selection.components.clone(),
+            wires: Default::default(),
+        };
+        let complete: std::collections::BTreeSet<_> = fragment
+            .wires
+            .iter()
+            .map(|wire| (wire.p1, wire.p2))
+            .collect();
+        for segment in self
+            .document
+            .wires
+            .geometric()
+            .map_err(|error| ClipboardError::Edit(EditError::Geometry(error)))?
+        {
+            if selection
+                .wires
+                .get(&segment.id)
+                .is_some_and(|mask| mask.is_both())
+                && complete.contains(&(
+                    formats::DigPoint {
+                        x: segment.a.x,
+                        y: segment.a.y,
+                    },
+                    formats::DigPoint {
+                        x: segment.b.x,
+                        y: segment.b.y,
+                    },
+                ))
+            {
+                deletion
+                    .wires
+                    .insert(segment.id, crate::selection::EndpointMask::BOTH);
+            }
+        }
+        let text = String::from_utf8(bytes).map_err(|_| {
+            ClipboardError::Write(formats::DigWriteError {
+                kind: formats::DigWriteErrorKind::UnsupportedValue,
+                context: "clipboard".into(),
+                message: "encoder produced invalid UTF-8".into(),
+            })
+        })?;
+        let omitted_boundary_wires = selection
+            .wires
+            .iter()
+            .filter(|(_, mask)| !mask.is_both())
+            .count();
+        Ok(Some(ClipboardCutPlan {
+            text,
+            omitted_boundary_wires,
+            deletion,
+            source_document: self.document.clone(),
+        }))
+    }
+
+    pub fn commit_cut(&mut self, plan: ClipboardCutPlan) -> Result<bool, ClipboardError> {
+        self.ensure_editable().map_err(ClipboardError::Edit)?;
+        if self.document != plan.source_document {
+            return Err(ClipboardError::StaleCutPlan);
+        }
+        self.delete_selection(&plan.deletion)
+            .map_err(ClipboardError::Edit)
+    }
+
+    /// Insert a decoded list-root fragment in one history transaction with fresh monotonic IDs.
+    /// Geometry is translated verbatim; no normalization or simulator compilation occurs.
+    pub fn insert_clipboard_fragment(
+        &mut self,
+        fragment: &formats::DigV2,
+        dx: i32,
+        dy: i32,
+    ) -> Result<Vec<ComponentId>, ClipboardError> {
+        self.ensure_editable().map_err(ClipboardError::Edit)?;
+        let mut imported = formats::to_domain(fragment).map_err(ClipboardError::Domain)?;
+        if imported.components.is_empty() && imported.wires.is_empty() {
+            return Ok(Vec::new());
+        }
+        let component_total = self
+            .document
+            .components
+            .len()
+            .checked_add(imported.components.len())
+            .ok_or_else(|| {
+                ClipboardError::Domain(formats::DomainCodecError::Invalid(
+                    "component count overflow".into(),
+                ))
+            })?;
+        let wire_total = self
+            .document
+            .wires
+            .len()
+            .checked_add(imported.wires.len())
+            .ok_or_else(|| {
+                ClipboardError::Domain(formats::DomainCodecError::Invalid(
+                    "wire count overflow".into(),
+                ))
+            })?;
+        if component_total > 10_000 || wire_total > crate::geometric_wiring::MAX_SEGMENTS {
+            return Err(ClipboardError::Domain(formats::DomainCodecError::Invalid(
+                "combined document exceeds component or wire limit".into(),
+            )));
+        }
+        let mut next_id = self.next_id;
+        let mut inserted = Vec::with_capacity(imported.components.len());
+        for component in &mut imported.components {
+            let id = ComponentId(next_id);
+            next_id = next_id
+                .checked_add(1)
+                .ok_or(ClipboardError::Edit(EditError::IdExhausted))?;
+            let move_coordinate = |value: f32, delta: i32| -> Result<f32, ClipboardError> {
+                let exact = f64::from(value) + f64::from(delta);
+                let moved = exact as f32;
+                if !moved.is_finite() || f64::from(moved) != exact {
+                    return Err(ClipboardError::Edit(EditError::InvalidPosition));
+                }
+                Ok(moved)
+            };
+            component.position = crate::domain::Position {
+                x: move_coordinate(component.position.x, dx)?,
+                y: move_coordinate(component.position.y, dy)?,
+            };
+            if !valid_geometric_position(component.position) {
+                return Err(ClipboardError::Edit(EditError::InvalidPosition));
+            }
+            component.id = id;
+            validate_component_pin_geometry(component).map_err(ClipboardError::Edit)?;
+            inserted.push(id);
+        }
+        let mut next_segment_id = self.next_segment_id;
+        for segment in imported
+            .wires
+            .geometric_mut()
+            .map_err(|error| ClipboardError::Edit(EditError::Geometry(error)))?
+        {
+            segment.id = next_segment_id;
+            next_segment_id =
+                next_segment_id
+                    .checked_add(1)
+                    .ok_or(ClipboardError::Edit(EditError::Geometry(
+                        crate::geometric_wiring::GeometryError::IdExhausted,
+                    )))?;
+            segment.a.x = segment
+                .a
+                .x
+                .checked_add(dx)
+                .ok_or(ClipboardError::Edit(EditError::InvalidPosition))?;
+            segment.a.y = segment
+                .a
+                .y
+                .checked_add(dy)
+                .ok_or(ClipboardError::Edit(EditError::InvalidPosition))?;
+            segment.b.x = segment
+                .b
+                .x
+                .checked_add(dx)
+                .ok_or(ClipboardError::Edit(EditError::InvalidPosition))?;
+            segment.b.y = segment
+                .b
+                .y
+                .checked_add(dy)
+                .ok_or(ClipboardError::Edit(EditError::InvalidPosition))?;
+        }
+        let mut candidate = self.document.clone();
+        candidate.components.extend(imported.components);
+        candidate
+            .wires
+            .geometric_mut()
+            .map_err(|error| ClipboardError::Edit(EditError::Geometry(error)))?
+            .extend(
+                imported
+                    .wires
+                    .geometric()
+                    .map_err(|error| ClipboardError::Edit(EditError::Geometry(error)))?
+                    .iter()
+                    .copied(),
+            );
+        let serialized = formats::from_domain(&candidate).map_err(ClipboardError::Domain)?;
+        formats::serialize_v2(&serialized).map_err(ClipboardError::Write)?;
+        self.edit(candidate);
+        self.next_id = next_id;
+        self.next_segment_id = next_segment_id;
+        Ok(inserted)
+    }
+
     /// Parse and convert completely before replacing session state.
     pub fn open_dig_bytes(&mut self, bytes: &[u8]) -> Result<(), SessionDigError> {
         if self.runtime.is_some() {
@@ -1305,6 +1613,178 @@ impl Session {
 mod tests {
     use super::*;
     use crate::geometric_wiring::Point;
+
+    #[test]
+    fn clipboard_fragment_insert_remaps_ids_once_and_never_reuses_ids_after_undo_branch() {
+        let mut session = Session::default();
+        let first = session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let selection = crate::selection::Selection {
+            components: [first].into_iter().collect(),
+            wires: Default::default(),
+        };
+        let text = session.copy_selection_text(&selection).unwrap().unwrap();
+        let fragment = formats::parse_clipboard_list(text.as_bytes()).unwrap();
+        let inserted = session
+            .insert_clipboard_fragment(&fragment, 100, 40)
+            .unwrap();
+        assert_eq!(inserted, vec![ComponentId(1)]);
+        assert_eq!(
+            session.document().components.last().unwrap().position.x,
+            100.0
+        );
+        session.undo().unwrap();
+        assert_eq!(session.document().components.len(), 1);
+        let next = session
+            .insert_clipboard_fragment(&fragment, 200, 80)
+            .unwrap();
+        assert_eq!(next, vec![ComponentId(2)]);
+        session.undo().unwrap();
+        session
+            .place(ComponentKind::Not, Position { x: 20.0, y: 20.0 })
+            .unwrap();
+        assert_eq!(
+            session.document().components.last().unwrap().id,
+            ComponentId(3)
+        );
+    }
+
+    #[test]
+    fn clipboard_wire_orientation_and_segment_ids_survive_repeated_insert_undo_branch() {
+        let source = simple_geometric_session();
+        let source_segment = source.document().wires.geometric().unwrap()[0];
+        let selection = crate::selection::Selection {
+            components: source
+                .document()
+                .components
+                .iter()
+                .map(|component| component.id)
+                .collect(),
+            wires: [(source_segment.id, crate::selection::EndpointMask::BOTH)]
+                .into_iter()
+                .collect(),
+        };
+        let fragment = source.selected_fragment(&selection).unwrap().unwrap();
+        assert_eq!(
+            fragment.wires[0].p1,
+            formats::DigPoint {
+                x: source_segment.a.x,
+                y: source_segment.a.y
+            }
+        );
+        assert_eq!(
+            fragment.wires[0].p2,
+            formats::DigPoint {
+                x: source_segment.b.x,
+                y: source_segment.b.y
+            }
+        );
+        let mut target = Session::default();
+        target
+            .insert_clipboard_fragment(&fragment, 100, -40)
+            .unwrap();
+        assert_eq!(target.document().wires.geometric().unwrap()[0].id, 0);
+        assert_eq!(
+            target.document().wires.geometric().unwrap()[0].a,
+            Point::new(source_segment.a.x + 100, source_segment.a.y - 40)
+        );
+        target.undo().unwrap();
+        target
+            .insert_clipboard_fragment(&fragment, 200, -20)
+            .unwrap();
+        assert_eq!(target.document().wires.geometric().unwrap()[0].id, 1);
+    }
+
+    #[test]
+    fn clipboard_cut_is_prepared_before_mutation_and_leaves_partial_wire_boundary() {
+        let mut session = Session::default();
+        let input = session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let output = session
+            .place(ComponentKind::Output, Position { x: 80.0, y: 0.0 })
+            .unwrap();
+        session
+            .connect([
+                crate::domain::PinRef {
+                    component: input,
+                    pin: crate::domain::PinId {
+                        direction: crate::domain::PinDirection::Output,
+                        index: 0,
+                    },
+                },
+                crate::domain::PinRef {
+                    component: output,
+                    pin: crate::domain::PinId {
+                        direction: crate::domain::PinDirection::Input,
+                        index: 0,
+                    },
+                },
+            ])
+            .unwrap();
+        let segment = session.document().wires.geometric().unwrap()[0];
+        let selection = crate::selection::Selection {
+            components: [input].into_iter().collect(),
+            wires: [(segment.id, crate::selection::EndpointMask::A)]
+                .into_iter()
+                .collect(),
+        };
+        let before = session.document().clone();
+        let plan = session.prepare_cut(&selection).unwrap().unwrap();
+        assert!(!plan.text.contains("<wire>"));
+        assert_eq!(session.document(), &before);
+        session.commit_cut(plan).unwrap();
+        assert!(
+            session
+                .document()
+                .components
+                .iter()
+                .all(|component| component.id != input)
+        );
+        assert_eq!(session.document().wires.geometric().unwrap(), &[segment]);
+        session.undo().unwrap();
+        assert_eq!(session.document(), &before);
+    }
+
+    #[test]
+    fn clipboard_failure_candidates_and_empty_selection_are_transactional() {
+        let mut session = Session::default();
+        assert!(
+            session
+                .copy_selection_text(&crate::selection::Selection::default())
+                .unwrap()
+                .is_none()
+        );
+        let id = session
+            .place(ComponentKind::Not, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let selection = crate::selection::Selection {
+            components: [id].into_iter().collect(),
+            wires: Default::default(),
+        };
+        let fragment = session.selected_fragment(&selection).unwrap().unwrap();
+        let before_doc = session.document().clone();
+        let before_undo = session.undo.len();
+        let before_next_id = session.next_id;
+        assert!(matches!(
+            session.insert_clipboard_fragment(&fragment, i32::MAX, 0),
+            Err(ClipboardError::Edit(EditError::InvalidPosition))
+        ));
+        assert_eq!(session.document(), &before_doc);
+        assert_eq!(session.undo.len(), before_undo);
+        assert_eq!(session.next_id, before_next_id);
+        let stale = session.prepare_cut(&selection).unwrap().unwrap();
+        session
+            .place(ComponentKind::Output, Position { x: 100.0, y: 0.0 })
+            .unwrap();
+        let unchanged = session.document().clone();
+        assert!(matches!(
+            session.commit_cut(stale),
+            Err(ClipboardError::StaleCutPlan)
+        ));
+        assert_eq!(session.document(), &unchanged);
+    }
     fn simple_geometric_session() -> Session {
         let mut session = Session::default();
         let input = session
