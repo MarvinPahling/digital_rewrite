@@ -2064,6 +2064,76 @@ mod tests {
     }
 
     #[test]
+    fn unrepresentable_origin_refuses_save_without_io_or_clean_mark() {
+        use crate::file_session::SaveAsIntent;
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::XOr, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        session
+            .move_component(
+                id,
+                Position {
+                    x: i32::MIN as f32,
+                    y: 0.0,
+                },
+            )
+            .unwrap();
+        assert!(session.dirty());
+        let mut io = NoFileAccess;
+        assert!(matches!(
+            session.save_as(&mut io, Path::new("refused.dig"), SaveAsIntent::Replace),
+            Err(SaveError::Codec(SessionDigError::Domain(_)))
+        ));
+        assert!(session.dirty());
+        assert!(session.path().is_none());
+    }
+
+    #[test]
+    fn save_reopens_component_placement_at_f32_precision_boundary() {
+        use crate::file_session::{DiscardIntent, LocalFileIo, SaveAsIntent};
+        let dir = std::env::temp_dir().join(format!(
+            "digital-rust-precision-save-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut io = LocalFileIo::new(&dir);
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::XOr, Position { x: 0.0, y: 20.0 })
+            .unwrap();
+        session
+            .move_component(
+                id,
+                Position {
+                    x: 67_108_864.0,
+                    y: 20.0,
+                },
+            )
+            .unwrap();
+        let expected = session.document().clone();
+        session
+            .save_as(
+                &mut io,
+                Path::new("precision.dig"),
+                SaveAsIntent::CreateOnly,
+            )
+            .unwrap();
+        assert!(!session.dirty());
+        let mut reopened = Session::default();
+        reopened
+            .open_path(
+                &mut io,
+                Path::new("precision.dig"),
+                DiscardIntent::RefuseDirty,
+            )
+            .unwrap();
+        assert_eq!(reopened.document().components, expected.components);
+        assert!(!reopened.dirty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn save_and_save_as_update_association_only_after_publish_and_keep_history() {
         use crate::file_session::{LocalFileIo, PublishOutcome, SaveAsIntent};
         let dir =
@@ -2131,6 +2201,146 @@ mod tests {
         assert!(reopened.path().is_some());
         assert_eq!(id, crate::domain::ComponentId(0));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn self_authored_adder_fixture(full: bool) -> Vec<u8> {
+        use crate::formats::{DigElement, DigPoint, DigV2, DigWire};
+        let mut elements = Vec::new();
+        let mut pins_to_connect = Vec::new();
+        let mut add = |name: &str, origin: (i32, i32)| -> usize {
+            let kind = crate::components::from_digital_name(name).unwrap();
+            let offset =
+                crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)
+                    .unwrap();
+            let id = elements.len();
+            elements.push(DigElement {
+                name: name.into(),
+                x: origin.0 + offset[0] as i32,
+                y: origin.1 + offset[1] as i32,
+                label: None,
+                value: None,
+            });
+            id
+        };
+        let a = add("In", (-100, 0));
+        let b = add("In", (-100, 40));
+        let cin = full.then(|| add("In", (-100, 80)));
+        let xor1 = add("XOr", (0, 0));
+        let and1 = add("And", (0, 100));
+        let xor2 = full.then(|| add("XOr", (200, 40)));
+        let and2 = full.then(|| add("And", (200, 140)));
+        let or = full.then(|| add("Or", (400, 100)));
+        let sum = add("Out", if full { (300, 60) } else { (300, 20) });
+        let carry = add("Out", if full { (500, 120) } else { (300, 120) });
+        let output = |id: usize| PinRef {
+            component: ComponentId(id as u64),
+            pin: crate::domain::PinId {
+                direction: crate::domain::PinDirection::Output,
+                index: 0,
+            },
+        };
+        let input = |id: usize, n: u8| PinRef {
+            component: ComponentId(id as u64),
+            pin: crate::domain::PinId {
+                direction: crate::domain::PinDirection::Input,
+                index: n,
+            },
+        };
+        let connect =
+            |pairs: &mut Vec<(PinRef, PinRef)>, from: PinRef, to: PinRef| pairs.push((from, to));
+        connect(&mut pins_to_connect, output(a), input(xor1, 0));
+        connect(&mut pins_to_connect, output(a), input(and1, 0));
+        connect(&mut pins_to_connect, output(b), input(xor1, 1));
+        connect(&mut pins_to_connect, output(b), input(and1, 1));
+        if let (Some(cin), Some(xor2), Some(and2), Some(or)) = (cin, xor2, and2, or) {
+            connect(&mut pins_to_connect, output(xor1), input(xor2, 0));
+            connect(&mut pins_to_connect, output(xor1), input(and2, 0));
+            connect(&mut pins_to_connect, output(cin), input(xor2, 1));
+            connect(&mut pins_to_connect, output(cin), input(and2, 1));
+            connect(&mut pins_to_connect, output(and1), input(or, 0));
+            connect(&mut pins_to_connect, output(and2), input(or, 1));
+            connect(&mut pins_to_connect, output(xor2), input(sum, 0));
+            connect(&mut pins_to_connect, output(or), input(carry, 0));
+        } else {
+            connect(&mut pins_to_connect, output(xor1), input(sum, 0));
+            connect(&mut pins_to_connect, output(and1), input(carry, 0));
+        }
+        let base = crate::formats::to_domain(&DigV2 {
+            elements: elements.clone(),
+            wires: Vec::new(),
+        })
+        .unwrap();
+        let wires = pins_to_connect
+            .into_iter()
+            .map(|(a, b)| {
+                let a =
+                    crate::pin_geometry::pin_point(&base.components[a.component.0 as usize], a.pin)
+                        .unwrap();
+                let b =
+                    crate::pin_geometry::pin_point(&base.components[b.component.0 as usize], b.pin)
+                        .unwrap();
+                assert_ne!(a, b);
+                DigWire {
+                    p1: DigPoint { x: a.x, y: a.y },
+                    p2: DigPoint { x: b.x, y: b.y },
+                }
+            })
+            .collect();
+        crate::formats::serialize_v2(&DigV2 { elements, wires }).unwrap()
+    }
+
+    #[test]
+    fn self_authored_half_and_full_adder_dig_truth_tables_survive_record_roundtrip() {
+        for full in [false, true] {
+            let source = self_authored_adder_fixture(full);
+            let semantic =
+                crate::formats::to_domain(&crate::formats::parse_v2(&source).unwrap()).unwrap();
+            let roundtrip =
+                crate::formats::serialize_v2(&crate::formats::from_domain(&semantic).unwrap())
+                    .unwrap();
+            for bytes in [&source, &roundtrip] {
+                let mut session = Session::default();
+                session.open_dig_bytes(bytes).unwrap();
+                let inputs = if full { 3 } else { 2 };
+                let outputs = [
+                    ComponentId((if full { 8 } else { 4 }) as u64),
+                    ComponentId((if full { 9 } else { 5 }) as u64),
+                ];
+                session.start_simulation().unwrap();
+                session.settle_simulation(1000).unwrap();
+                for row in 0..(1 << inputs) {
+                    for index in 0..inputs {
+                        session
+                            .set_input(ComponentId(index as u64), row & (1 << index) != 0)
+                            .unwrap();
+                        session.settle_simulation(1000).unwrap();
+                    }
+                    let a = row & 1 != 0;
+                    let b = row & 2 != 0;
+                    let cin = full && row & 4 != 0;
+                    let sum = a ^ b ^ cin;
+                    let carry = (a && b) || (a && cin) || (b && cin);
+                    assert_eq!(
+                        session.inspect().unwrap().output_value(outputs[0]),
+                        Some(if sum {
+                            crate::runtime::Level::High
+                        } else {
+                            crate::runtime::Level::Low
+                        }),
+                        "full={full}, row={row}"
+                    );
+                    assert_eq!(
+                        session.inspect().unwrap().output_value(outputs[1]),
+                        Some(if carry {
+                            crate::runtime::Level::High
+                        } else {
+                            crate::runtime::Level::Low
+                        }),
+                        "full={full}, row={row}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

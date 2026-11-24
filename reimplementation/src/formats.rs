@@ -1576,10 +1576,13 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
             x: x as f32,
             y: y as f32,
         };
+        // Validate the exact integer center, not a floating-point inverse subtraction.
+        // At large magnitudes `center as f32 - offset as f32` can round back to a
+        // different origin even though the integer `origin + offset` is the exact,
+        // representable center that export will produce. Export/import must share this
+        // integer placement contract so every accepted export can be reopened.
         if exact_i32(position.x, "component center x")? != x
             || exact_i32(position.y, "component center y")? != y
-            || (position.x - dx as f32) as f64 != element.x as f64
-            || (position.y - dy as f32) as f64 != element.y as f64
         {
             return Err(invalid("component origin/center loses f32 precision"));
         }
@@ -1828,9 +1831,6 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
         let oy = y
             .checked_sub(dy)
             .ok_or_else(|| invalid("component origin y overflow"))?;
-        if ox as f32 + dx as f32 != c.position.x || oy as f32 + dy as f32 != c.position.y {
-            return Err(invalid("component coordinate loses f32 precision"));
-        }
         elements.push(DigElement {
             name: name_from_kind(c.kind).into(),
             x: ox,
@@ -3396,6 +3396,42 @@ mod tests {
     }
 
     #[test]
+    fn every_supported_kind_roundtrips_integer_centers_near_f32_precision_boundary() {
+        let kinds = [
+            ComponentKind::Input,
+            ComponentKind::Output,
+            ComponentKind::And,
+            ComponentKind::NAnd,
+            ComponentKind::Or,
+            ComponentKind::NOr,
+            ComponentKind::XOr,
+            ComponentKind::XNOr,
+            ComponentKind::Not,
+            ComponentKind::Const,
+        ];
+        for kind in kinds {
+            for (x, y) in [(67_108_864.0, -67_108_864.0), (-67_108_864.0, 67_108_864.0)] {
+                let document = Document {
+                    components: vec![Component {
+                        id: ComponentId(0),
+                        kind,
+                        position: Position { x, y },
+                        label: String::new(),
+                        constant_value: true,
+                    }],
+                    wires: crate::domain::Wiring::GeometricSegments(Vec::new()),
+                };
+                let encoded = serialize_v2(&from_domain(&document).unwrap()).unwrap();
+                let reopened = to_domain(&parse_v2(&encoded).unwrap()).unwrap();
+                assert_eq!(
+                    reopened.components, document.components,
+                    "{kind:?} at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn const_values_preserve_absence_legacy_int_and_canonical_long() {
         let element = |entries: &str| {
             format!(
@@ -3629,10 +3665,23 @@ mod tests {
         );
         let imported = to_domain(&source).unwrap();
         assert_eq!(from_domain(&imported).unwrap(), source);
-        // Component placement that cannot be represented exactly by f32 is refused, not rounded.
-        let bad = DigV2 {
+        // Origin itself may not be exactly representable as f32; its integer-derived
+        // center can still be. Preserve that accepted origin exactly on export.
+        let representable_center = DigV2 {
             elements: vec![DigElement {
                 name: "In".into(),
+                x: 16_777_217,
+                y: 0,
+                label: None,
+                value: None,
+            }],
+            wires: vec![],
+        };
+        let roundtrip = from_domain(&to_domain(&representable_center).unwrap()).unwrap();
+        assert_eq!(roundtrip, representable_center);
+        let bad = DigV2 {
+            elements: vec![DigElement {
+                name: "XOr".into(),
                 x: 16_777_217,
                 y: 0,
                 label: None,
