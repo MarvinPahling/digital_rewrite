@@ -2625,6 +2625,21 @@ impl DigitalApp {
                         }
                     }
             }
+            // A widget click later in this same frame has not yet updated egui's
+            // focused-widget memory. Do not let a queued placement-focus request
+            // override that click when the draft was started by a shortcut/menu.
+            let clicked_seed_field = self.seed_field_rect.is_some_and(|seed_rect| {
+                ctx.input(|input| input.events.iter().any(|event| matches!(event,
+                    egui::Event::PointerButton { pos, pressed: true, .. } if seed_rect.contains(*pos)
+                )))
+            });
+            if clicked_seed_field && self.fragment_draft.is_some() {
+                self.fragment_draft = None;
+                self.fragment_focus_claimed = false;
+                self.fragment_canvas_had_focus = false;
+                self.restore_canvas_focus = false;
+                self.fragment_focus_check_pending = false;
+            }
             if self.restore_canvas_focus
                 && !self.modality_active()
                 && ctx.input(|input| input.focused)
@@ -3371,6 +3386,102 @@ mod tests {
             app.session.document().components.is_empty(),
             "seed Enter must not commit a fragment"
         );
+    }
+
+    #[test]
+    fn production_paste_and_duplicate_focus_request_yields_to_immediate_seed_click() {
+        let fragment = digital_rust::formats::DigV2 {
+            elements: vec![digital_rust::formats::DigElement {
+                name: "In".into(),
+                x: 0,
+                y: 0,
+                label: Some("Must not insert".into()),
+                value: None,
+            }],
+            wires: vec![],
+        };
+        let xml =
+            String::from_utf8(digital_rust::formats::serialize_clipboard_list(&fragment).unwrap())
+                .unwrap();
+        for duplicate in [false, true] {
+            let clipboard_state = Rc::new(RefCell::new(FakeClipboardState {
+                text: xml.clone(),
+                ..Default::default()
+            }));
+            let mut app = DigitalApp::with_file_io(None, None)
+                .with_clipboard(Box::new(FakeClipboard(clipboard_state)));
+            let source_id = app
+                .session
+                .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+                .unwrap();
+            if duplicate {
+                app.selection.components.insert(source_id);
+                app.selected = Some(source_id);
+            }
+            let ctx = egui::Context::default();
+            frame(&ctx, &mut app, vec![], true);
+            let canvas = app.canvas_rect.unwrap().center();
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerMoved(canvas), button(canvas, true)],
+                true,
+            );
+            frame(&ctx, &mut app, vec![button(canvas, false)], true);
+            ctx.memory_mut(|memory| memory.request_focus(app.canvas_id.unwrap()));
+            if duplicate {
+                app.selection.components.insert(source_id);
+                app.selected = Some(source_id);
+            }
+            frame(&ctx, &mut app, vec![], true);
+            let action = if duplicate {
+                key(
+                    egui::Key::D,
+                    egui::Modifiers {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                egui::Event::Paste(xml.clone())
+            };
+            frame(&ctx, &mut app, vec![action], true);
+            assert!(
+                app.fragment_draft.is_some(),
+                "production action should create placement draft (duplicate={duplicate}, focus={:?}, canvas={:?}, error={:?})",
+                ctx.memory(|memory| memory.focused()),
+                app.canvas_id,
+                app.clipboard_error
+            );
+            let seed = app.seed_field_rect.unwrap().center();
+            // This is deliberately the very next frame: egui's deferred canvas focus
+            // restoration must not steal the text field click.
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerMoved(seed), button(seed, true)],
+                true,
+            );
+            frame(&ctx, &mut app, vec![button(seed, false)], true);
+            assert!(
+                app.fragment_draft.is_none(),
+                "seed click cancels pending placement"
+            );
+            assert!(app.seed_field_focused, "seed editor retains focus");
+            frame(&ctx, &mut app, vec![egui::Event::Text("42".into())], true);
+            frame(
+                &ctx,
+                &mut app,
+                vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+                true,
+            );
+            assert_eq!(app.startup_seed_text, "42");
+            assert_eq!(
+                app.session.document().components.len(),
+                1,
+                "no paste/duplicate commit"
+            );
+        }
     }
 
     #[test]
