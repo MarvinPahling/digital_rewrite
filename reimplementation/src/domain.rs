@@ -73,15 +73,6 @@ pub struct PinRef {
     pub component: ComponentId,
     pub pin: PinId,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct WireId(pub u64);
-/// An explicit logical pin-pair connection. Component positions and rendered route geometry do
-/// not add endpoints or join nets in the current compiler.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Wire {
-    pub id: WireId,
-    pub endpoints: [PinRef; 2],
-}
 impl ComponentKind {
     pub fn has_pin(self, pin: PinId) -> bool {
         let count = match (self, pin.direction) {
@@ -120,9 +111,9 @@ pub struct Component {
     /// Configured one-bit constant output; meaningful only for `Const`, defaults HIGH.
     pub constant_value: bool,
 }
+/// Geometric wire segments are the sole authoritative connectivity representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wiring {
-    LegacyPinPairs(Vec<Wire>),
     GeometricSegments(Vec<crate::geometric_wiring::Segment>),
 }
 impl Default for Wiring {
@@ -130,49 +121,28 @@ impl Default for Wiring {
         Self::GeometricSegments(Vec::new())
     }
 }
-impl From<Vec<Wire>> for Wiring {
-    fn from(wires: Vec<Wire>) -> Self {
-        Self::LegacyPinPairs(wires)
-    }
-}
-impl FromIterator<Wire> for Wiring {
-    fn from_iter<T: IntoIterator<Item = Wire>>(iter: T) -> Self {
-        Self::LegacyPinPairs(iter.into_iter().collect())
-    }
-}
 impl Wiring {
     pub fn len(&self) -> usize {
         match self {
-            Self::LegacyPinPairs(w) => w.len(),
-            Self::GeometricSegments(s) => s.len(),
+            Self::GeometricSegments(segments) => segments.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-    pub fn iter_legacy(
-        &self,
-    ) -> Result<std::slice::Iter<'_, Wire>, crate::geometric_wiring::GeometryError> {
-        Ok(self.legacy()?.iter())
-    }
-    pub fn legacy_mut(&mut self) -> Result<&mut Vec<Wire>, crate::geometric_wiring::GeometryError> {
-        match self {
-            Self::LegacyPinPairs(wires) => Ok(wires),
-            Self::GeometricSegments(_) => Err(crate::geometric_wiring::GeometryError::WrongMode),
-        }
-    }
-    pub fn legacy(&self) -> Result<&[Wire], crate::geometric_wiring::GeometryError> {
-        match self {
-            Self::LegacyPinPairs(wires) => Ok(wires),
-            Self::GeometricSegments(_) => Err(crate::geometric_wiring::GeometryError::WrongMode),
-        }
     }
     pub fn geometric(
         &self,
     ) -> Result<&[crate::geometric_wiring::Segment], crate::geometric_wiring::GeometryError> {
         match self {
             Self::GeometricSegments(segments) => Ok(segments),
-            Self::LegacyPinPairs(_) => Err(crate::geometric_wiring::GeometryError::WrongMode),
+        }
+    }
+    pub fn geometric_mut(
+        &mut self,
+    ) -> Result<&mut Vec<crate::geometric_wiring::Segment>, crate::geometric_wiring::GeometryError>
+    {
+        match self {
+            Self::GeometricSegments(segments) => Ok(segments),
         }
     }
 }

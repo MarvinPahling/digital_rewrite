@@ -1380,19 +1380,13 @@ mod tests {
         }
     }
     fn document(kinds: &[(u64, ComponentKind)], wires: &[(PinRef, PinRef)]) -> Document {
+        let components = kinds
+            .iter()
+            .map(|&(id, kind)| component(id, kind))
+            .collect::<Vec<_>>();
         Document {
-            components: kinds
-                .iter()
-                .map(|&(id, kind)| component(id, kind))
-                .collect(),
-            wires: wires
-                .iter()
-                .enumerate()
-                .map(|(i, &(a, b))| Wire {
-                    id: WireId(i as u64),
-                    endpoints: [a, b],
-                })
-                .collect(),
+            wires: crate::test_support::routed_wires(&components, wires),
+            components,
         }
     }
     /// Input 1 and 2 feed a two-input gate 3 that drives Output 4.
@@ -1527,7 +1521,7 @@ mod tests {
             assert_eq!(snapshot(&whole, &doc), snapshot(&repeated, &doc));
             let mut reordered = doc.clone();
             reordered.components.reverse();
-            reordered.wires.legacy_mut().unwrap().reverse();
+            reordered.wires.geometric_mut().unwrap().reverse();
             let mut canonical = Runtime::start_with_seed(&reordered, seed).unwrap();
             settled(&mut canonical);
             assert_eq!(snapshot(&whole, &doc), snapshot(&canonical, &reordered));
@@ -1841,7 +1835,7 @@ mod tests {
             );
             if reverse {
                 doc.components.reverse();
-                doc.wires.legacy_mut().unwrap().reverse();
+                doc.wires.geometric_mut().unwrap().reverse();
             }
             doc
         };
@@ -2109,7 +2103,7 @@ mod tests {
         assert_eq!(runtime.output_value(ComponentId(4)), Some(Low));
         let mut reversed = doc.clone();
         reversed.components.reverse();
-        reversed.wires.legacy_mut().unwrap().reverse();
+        reversed.wires.geometric_mut().unwrap().reverse();
         let mut reordered = running(&reversed);
         settled(&mut reordered);
         assert_eq!(reordered.output_value(ComponentId(4)), Some(Low));
@@ -2132,16 +2126,14 @@ mod tests {
         let mut a = component(1, ComponentKind::Const);
         let b = component(2, ComponentKind::Const);
         a.constant_value = b.constant_value;
+        let components = vec![a, b];
         let doc = Document {
-            components: vec![a, b],
-            wires: crate::domain::Wiring::LegacyPinPairs(vec![Wire {
-                id: WireId(1),
-                endpoints: [out(1), out(2)],
-            }]),
+            wires: crate::test_support::routed_wires(&components, &[(out(1), out(2))]),
+            components,
         };
         assert!(matches!(
             Runtime::start(&doc),
-            Err(CompileError::MultipleDrivers { .. })
+            Err(CompileError::GeometricMultipleDrivers { .. })
         ));
     }
 
@@ -2669,7 +2661,7 @@ mod tests {
         let document = document(&[(1, ComponentKind::Not)], &[]);
         assert!(matches!(
             Runtime::start(&document),
-            Err(CompileError::MissingDriver { .. })
+            Err(CompileError::DisconnectedReceiver { .. })
         ));
     }
 

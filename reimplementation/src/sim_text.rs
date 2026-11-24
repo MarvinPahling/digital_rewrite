@@ -70,19 +70,9 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
         CompileError::DuplicateComponent(id) => {
             format!("Component id #{} is used more than once.", id.0)
         }
-        CompileError::DuplicateWire(id) => format!("Wire id #{} is used more than once.", id.0),
         CompileError::InvalidConstantConfiguration { component } => format!(
             "Component {} has a non-default constant configuration, but only Const components support it.",
             component_name(document, *component)
-        ),
-        CompileError::InvalidEndpoint { wire, pin } => format!(
-            "Wire #{} is attached to {}, which does not exist.",
-            wire.0,
-            pin_name(document, *pin)
-        ),
-        CompileError::MissingDriver { pins } => format!(
-            "Nothing drives {}. Wire an output pin to it.",
-            pin_list(document, pins)
         ),
         CompileError::DisconnectedReceiver { pin } => {
             format!("{} is disconnected.", pin_name(document, *pin))
@@ -95,10 +85,6 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
                 .map(|id| format!("#{id}"))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ),
-        CompileError::MultipleDrivers { pins } => format!(
-            "Several outputs drive one net: {}. A net may have only one output.",
-            pin_list(document, pins)
         ),
         CompileError::GeometricMultipleDrivers { pins, segment_ids } => format!(
             "Several outputs drive one geometric net: {} (segments {}). A net may have only one output.",
@@ -246,7 +232,7 @@ pub fn level_badge(level: Level) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Component, ComponentKind, PinId, Position, WireId};
+    use crate::domain::{Component, ComponentKind, PinId, Position};
 
     fn document() -> Document {
         let component = |id, kind: ComponentKind, label: &str| Component {
@@ -261,7 +247,7 @@ mod tests {
                 component(1, ComponentKind::And, "AND"),
                 component(2, ComponentKind::Or, "carry"),
             ],
-            wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
+            wires: crate::domain::Wiring::GeometricSegments(vec![]),
         }
     }
 
@@ -288,39 +274,29 @@ mod tests {
     }
 
     #[test]
-    fn compile_errors_name_the_offending_pins_and_components() {
+    fn geometric_compile_errors_name_the_offending_pins_and_components() {
         let document = document();
         let missing = describe_compile_error(
             &document,
-            &CompileError::MissingDriver {
-                pins: vec![pin(1, PinDirection::Input, 0)],
+            &CompileError::DisconnectedReceiver {
+                pin: pin(1, PinDirection::Input, 0),
             },
         );
         assert!(missing.contains("input pin 1 of AND #1"), "{missing}");
         let multiple = describe_compile_error(
             &document,
-            &CompileError::MultipleDrivers {
+            &CompileError::GeometricMultipleDrivers {
                 pins: vec![
                     pin(1, PinDirection::Output, 0),
                     pin(2, PinDirection::Output, 0),
                 ],
+                segment_ids: vec![4],
             },
         );
         assert!(multiple.contains("output pin 1 of AND #1"), "{multiple}");
         assert!(
             multiple.contains("output pin 1 of OR \"carry\" #2"),
             "{multiple}"
-        );
-        let endpoint = describe_compile_error(
-            &document,
-            &CompileError::InvalidEndpoint {
-                wire: WireId(4),
-                pin: pin(7, PinDirection::Output, 0),
-            },
-        );
-        assert!(
-            endpoint.contains("Wire #4") && endpoint.contains("unknown component #7"),
-            "{endpoint}"
         );
     }
 

@@ -6,7 +6,7 @@
 use crate::{
     canvas::{CanvasTransform, CanvasViewState, grid_lines},
     components::KINDS,
-    domain::{ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position, WireId},
+    domain::{ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position},
     engine::{EditError, SaveError, Session, SimulationError},
     file_session::{DiscardIntent, FileIo, LocalFileIo, PublishOutcome, SaveAsIntent},
     runtime::{InputChange, Level, SettleOutcome, SimulationOptions},
@@ -74,7 +74,6 @@ enum SimState {
 pub struct DigitalApp {
     session: Session,
     selected: Option<ComponentId>,
-    selected_wire: Option<WireId>,
     selected_segment: Option<u64>,
     wiring: bool,
     wire_start: Option<PinRef>,
@@ -169,7 +168,6 @@ impl DigitalApp {
         Self {
             session: Session::default(),
             selected: None,
-            selected_wire: None,
             selected_segment: None,
             wiring: false,
             wire_start: None,
@@ -286,27 +284,6 @@ fn document_view_bounds(
         label_height = label_height.max(galley.size().y);
     }
     match &doc.wires {
-        crate::domain::Wiring::LegacyPinPairs(wires) => {
-            for wire in wires {
-                let (Some(a), Some(b)) = (
-                    anchors.get(&wire.endpoints[0]),
-                    anchors.get(&wire.endpoints[1]),
-                ) else {
-                    return Err(format!(
-                        "Cannot fit: wire #{} has a missing endpoint",
-                        wire.id.0
-                    ));
-                };
-                let path =
-                    crate::wire_geometry::path((wire.endpoints[0], *a), (wire.endpoints[1], *b));
-                for point in path {
-                    if !include(point, &mut min, &mut max) {
-                        return Err(format!("Cannot fit: invalid wire geometry #{}", wire.id.0));
-                    }
-                }
-                have_geometry = true;
-            }
-        }
         crate::domain::Wiring::GeometricSegments(segments) => {
             for segment in segments {
                 for point in [segment.a, segment.b] {
@@ -511,7 +488,6 @@ impl DigitalApp {
         self.cancel_label_edit();
         self.pan_owner = None;
         self.selected = None;
-        self.selected_wire = None;
         self.cancel_gestures();
         self.failed_start = None;
         self.settling = false;
@@ -1642,30 +1618,6 @@ impl DigitalApp {
                             )
                         }).map(|segment| segment.id)
                     } else { None };
-                    self.selected_wire = if hit.is_none() && self.selected_segment.is_none() {
-                        self.session
-                            .document()
-                            .wires
-                            .iter_legacy()
-                            .ok()
-                            .into_iter()
-                            .flatten()
-                            .rev()
-                            .find(|wire| {
-                                let a = pins.iter().find(|v| v.0 == wire.endpoints[0]);
-                                let b = pins.iter().find(|v| v.0 == wire.endpoints[1]);
-                                a.zip(b).is_some_and(|(a, b)| {
-                                    crate::wire_geometry::hit(
-                                        &crate::wire_geometry::path(*a, *b),
-                                        world,
-                                        transform.length_to_world(6.),
-                                    )
-                                })
-                            })
-                            .map(|w| w.id)
-                    } else {
-                        None
-                    };
                     self.selected = hit.map(|v| v.0);
                     self.drag = hit.filter(|_| !locked).map(|(id, pos)| (id, pos, p));
                     if locked
@@ -1691,8 +1643,7 @@ impl DigitalApp {
                 match self.session.place(kind, snap_component_center(x, y)) {
                     Ok(id) => {
                         self.selected = Some(id);
-                        self.selected_wire = None;
-                        self.selected_segment = None;
+                                        self.selected_segment = None;
                     }
                     Err(e) => self.error = Some(e.to_string()),
                 }
@@ -1738,31 +1689,7 @@ impl DigitalApp {
                     (*pin, pos)
                 })
                 .collect();
-            for wire in self.session.document().wires.iter_legacy().into_iter().flatten() {
-                let a = wire_pins.iter().find(|v| v.0 == wire.endpoints[0]);
-                let b = wire_pins.iter().find(|v| v.0 == wire.endpoints[1]);
-                if let Some((a, b)) = a.zip(b) {
-                    let path = crate::wire_geometry::path(*a, *b);
-                    let color = if self.selected_wire == Some(wire.id) {
-                        palette.selection
-                    } else {
-                        palette.ink
-                    };
-                    if path.len() == 1 {
-                        painter.circle_filled(transform.to_screen(path[0]), 4., color);
-                    }
-                    for segment in path.windows(2) {
-                        painter.line_segment(
-                            [
-                                transform.to_screen(segment[0]),
-                                transform.to_screen(segment[1]),
-                            ],
-                            Stroke::new(2_f32, color),
-                        );
-                    }
-                }
-            }
-            if let crate::domain::Wiring::GeometricSegments(segments) = &self.session.document().wires {
+            let crate::domain::Wiring::GeometricSegments(segments) = &self.session.document().wires;
                 let mut incidence = std::collections::BTreeMap::<digital_rust::geometric_wiring::Point, usize>::new();
                 for segment in segments {
                     *incidence.entry(segment.a).or_default() += 1;
@@ -1778,7 +1705,6 @@ impl DigitalApp {
                         painter.circle_filled(transform.to_screen([point.x as f32, point.y as f32]), 3.0, palette.ink);
                     }
                 }
-            }
             if self.wiring {
                 for (pin, pos) in &wire_pins {
                     painter.circle_stroke(
@@ -2079,20 +2005,7 @@ impl DigitalApp {
                                 None => 0,
                             };
                             self.selected_segment = Some(segments[next].id);
-                            self.selected_wire = None;
-                            self.selected = None;
-                        } else if let Ok(wires) = self.session.document().wires.legacy()
-                            && !wires.is_empty()
-                        {
-                            let current = self.selected_wire.and_then(|id| wires.iter().position(|w| w.id == id));
-                            let next = match current {
-                                Some(i) if backwards => (i + wires.len() - 1) % wires.len(),
-                                Some(i) => (i + 1) % wires.len(),
-                                None if backwards => wires.len() - 1,
-                                None => 0,
-                            };
-                            self.selected_wire = Some(wires[next].id);
-                            self.selected = None;
+                                                self.selected = None;
                         }
                     }
                 }
@@ -2111,14 +2024,6 @@ impl DigitalApp {
                         Ok(_) => { self.selected_segment = None; self.error = None; }
                         Err(error) => self.error = Some(error.to_string()),
                     }
-                }
-                if self.selected_wire.is_some()
-                    && !locked
-                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-                    && let Some(id) = self.selected_wire.take()
-                    && let Err(e) = self.session.delete_wire(id)
-                {
-                    self.error = Some(e.to_string());
                 }
             }
             if owns_keyboard
@@ -2155,8 +2060,7 @@ impl DigitalApp {
                 self.focused_pin = None;
                 self.wire_start = None;
                 self.geometric_route_start = None;
-                self.selected_wire = None;
-                if self.session.undo().is_ok() {
+                        if self.session.undo().is_ok() {
                     self.selected = None;
                     self.drag = None;
                 }
@@ -2165,8 +2069,7 @@ impl DigitalApp {
                 self.focused_pin = None;
                 self.wire_start = None;
                 self.geometric_route_start = None;
-                self.selected_wire = None;
-                if self.session.redo().is_ok() {
+                        if self.session.redo().is_ok() {
                     self.selected = None;
                     self.drag = None;
                 }
@@ -2331,7 +2234,6 @@ mod tests {
             true,
         );
         frame(&ctx, &mut app, vec![button(p, false)], true);
-        assert!(app.selected_wire.is_none());
         frame(
             &ctx,
             &mut app,
@@ -4011,7 +3913,22 @@ mod tests {
                     },
                 },
             ];
-            let wire = app.session.connect(pins).unwrap();
+            app.session.connect(pins).unwrap();
+            let wire_segment_id = app
+                .session
+                .document()
+                .wires
+                .geometric()
+                .unwrap()
+                .iter()
+                .max_by_key(|segment| {
+                    (
+                        segment.a.x.abs_diff(segment.b.x),
+                        segment.a.y.abs_diff(segment.b.y),
+                    )
+                })
+                .unwrap()
+                .id;
             assert!(app.view.zoom_at(rect, rect.center(), zoom));
             assert!(app.view.pan(Vec2::new(17., -9.)));
             let rect = camera_rect(&ctx, &mut app);
@@ -4080,7 +3997,7 @@ mod tests {
             click_at(&ctx, &mut app, wire_inside);
             assert_eq!(
                 app.selected_segment,
-                Some(wire.0),
+                Some(wire_segment_id),
                 "wire pick includes 5.5 screen points at zoom {zoom}"
             );
             let wire_outside = transform.to_screen(mid) + along * 6.5;

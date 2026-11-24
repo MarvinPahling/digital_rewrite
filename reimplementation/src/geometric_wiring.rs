@@ -1,7 +1,7 @@
 //! Integer geometric wiring and transactional editing primitives.
 //!
-//! This is an opt-in staged model. The existing document/compiler/codec still consume legacy
-//! pin-pair wiring; callers must explicitly select a mode and cannot infer geometric behavior.
+//! Geometric segments are the authoritative document representation. Pin-to-pin editing helpers
+//! materialize segments; connectivity is resolved from endpoints, never from a parallel edge list.
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_SEGMENTS: usize = 30_000;
@@ -57,14 +57,13 @@ pub fn plan_orthogonal_route(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GeometryError {
-    WrongMode,
     ZeroLength,
     DuplicateId(u64),
     IdExhausted,
     SegmentLimit,
     WorkLimit,
     SimulationActive,
-    InvalidMigration(&'static str),
+    InvalidGeometry(&'static str),
 }
 impl std::fmt::Display for GeometryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

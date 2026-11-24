@@ -1,7 +1,9 @@
+mod common;
+use common::routed_wires;
 use digital_rust::{
     domain::{
         Component, ComponentId, ComponentKind as K, Document, PinDirection as D, PinId, PinRef,
-        Position, Wire, WireId,
+        Position,
     },
     engine::Session,
     runtime::{Level, Runtime, SettleOutcome, SimulationOptions, StepOutcome},
@@ -27,21 +29,20 @@ fn component(id: u64, kind: K, value: bool) -> Component {
     }
 }
 fn circuit(parts: &[(u64, K, bool)], wires: &[(u64, D, u8, u64, D, u8)]) -> Document {
+    let components = parts
+        .iter()
+        .map(|&(id, kind, value)| component(id, kind, value))
+        .collect::<Vec<_>>();
+    let pairs = wires
+        .iter()
+        .map(|&(a, ad, ai, b, bd, bi)| (pin(a, ad, ai), pin(b, bd, bi)))
+        .collect::<Vec<_>>();
     Document {
-        components: parts
-            .iter()
-            .map(|&(id, kind, value)| component(id, kind, value))
-            .collect(),
-        wires: wires
-            .iter()
-            .enumerate()
-            .map(|(i, &(a, ad, ai, b, bd, bi))| Wire {
-                id: WireId(i as u64),
-                endpoints: [pin(a, ad, ai), pin(b, bd, bi)],
-            })
-            .collect(),
+        wires: routed_wires(&components, &pairs),
+        components,
     }
 }
+
 fn settle(runtime: &mut Runtime, budget: usize) {
     for _ in 0..100_000 {
         match runtime.settle(budget) {
@@ -309,7 +310,7 @@ fn feedback_permitted_outcomes_and_normal_trace_ignore_net_index_order() {
     );
     let mut reordered = reconvergent.clone();
     reordered.components.reverse();
-    reordered.wires.legacy_mut().unwrap().reverse();
+    reordered.wires.geometric_mut().unwrap().reverse();
     let traces = [reconvergent, reordered].map(|doc| {
         let mut runtime =
             Runtime::start_with_trace(&doc, 77, TraceLog::new(4096, 77, 1).unwrap()).unwrap();

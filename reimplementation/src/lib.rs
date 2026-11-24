@@ -13,6 +13,8 @@ pub mod simulation;
 pub mod symbol_render;
 pub mod symbol_tessellate;
 pub mod symbols;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod topology;
 pub mod trace;
 pub mod wire_geometry;

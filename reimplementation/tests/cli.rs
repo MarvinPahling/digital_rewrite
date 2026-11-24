@@ -1,3 +1,5 @@
+mod common;
+use common::routed_wires;
 use std::{
     fs,
     path::PathBuf,
@@ -239,8 +241,7 @@ fn set_component_at(
 }
 fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
     use digital_rust::domain::{
-        ComponentId as C, ComponentKind as K, Document, PinDirection as D, PinId, PinRef, Wire,
-        WireId,
+        ComponentId as C, ComponentKind as K, Document, PinDirection as D, PinId, PinRef,
     };
     let p = |id, direction, index| PinRef {
         component: C(id),
@@ -251,35 +252,26 @@ fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
         set_component_at(&mut d, 0, K::Input, (0, 0), (0, 0), "input");
         set_component_at(&mut d, 1, K::Not, (100, 0), (0, 0), "inverter");
         set_component_at(&mut d, 2, K::Output, (200, 0), (0, 0), "result");
-        d.wires = digital_rust::domain::Wiring::LegacyPinPairs(vec![
-            Wire {
-                id: WireId(0),
-                endpoints: [p(0, D::Output, 0), p(1, D::Input, 0)],
-            },
-            Wire {
-                id: WireId(1),
-                endpoints: [p(1, D::Output, 0), p(2, D::Input, 0)],
-            },
-        ])
+        d.wires = routed_wires(
+            &d.components,
+            &[
+                (p(0, D::Output, 0), p(1, D::Input, 0)),
+                (p(1, D::Output, 0), p(2, D::Input, 0)),
+            ],
+        )
     } else {
         set_component_at(&mut d, 0, K::Input, (0, 0), (0, 0), "a");
         set_component_at(&mut d, 1, K::Input, (0, 40), (0, 0), "b");
         set_component_at(&mut d, 2, kind, (100, 0), (0, 0), "gate");
         set_component_at(&mut d, 3, K::Output, (220, 20), (0, 0), "result");
-        d.wires = digital_rust::domain::Wiring::LegacyPinPairs(vec![
-            Wire {
-                id: WireId(0),
-                endpoints: [p(0, D::Output, 0), p(2, D::Input, 0)],
-            },
-            Wire {
-                id: WireId(1),
-                endpoints: [p(1, D::Output, 0), p(2, D::Input, 1)],
-            },
-            Wire {
-                id: WireId(2),
-                endpoints: [p(2, D::Output, 0), p(3, D::Input, 0)],
-            },
-        ])
+        d.wires = routed_wires(
+            &d.components,
+            &[
+                (p(0, D::Output, 0), p(2, D::Input, 0)),
+                (p(1, D::Output, 0), p(2, D::Input, 1)),
+                (p(2, D::Output, 0), p(3, D::Input, 0)),
+            ],
+        )
     }
     digital_rust::formats::serialize_v2(&digital_rust::formats::from_domain(&d).unwrap()).unwrap()
 }
@@ -287,7 +279,6 @@ fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
 fn cli_reports_real_feedback_startup_oscillation_without_success_rows() {
     use digital_rust::domain::{
         Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position,
-        Wire, WireId,
     };
     let dir = TempDir::new();
     let id = ComponentId(0);
@@ -305,18 +296,16 @@ fn cli_reports_real_feedback_startup_oscillation_without_success_rows() {
             index: 0,
         },
     };
+    let components = vec![Component {
+        id,
+        kind: ComponentKind::Not,
+        position: Position { x: 0., y: 0. },
+        label: "ring".into(),
+        constant_value: true,
+    }];
     let document = Document {
-        components: vec![Component {
-            id,
-            kind: ComponentKind::Not,
-            position: Position { x: 0., y: 0. },
-            label: "ring".into(),
-            constant_value: true,
-        }],
-        wires: digital_rust::domain::Wiring::LegacyPinPairs(vec![Wire {
-            id: WireId(0),
-            endpoints: [output, input],
-        }]),
+        wires: routed_wires(&components, &[(output, input)]),
+        components,
     };
     let encoded = digital_rust::formats::serialize_v2(
         &digital_rust::formats::from_domain(&document).unwrap(),
@@ -731,7 +720,6 @@ fn startup_seed_cli_is_ascii_u64_deterministic_and_validated_before_file_access(
 fn feedback_startup_exhaustion_is_an_error_with_replay_seed_and_no_rows() {
     use digital_rust::domain::{
         Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position,
-        Wire, WireId,
     };
     let dir = TempDir::new();
     let id = ComponentId(0);
@@ -749,18 +737,16 @@ fn feedback_startup_exhaustion_is_an_error_with_replay_seed_and_no_rows() {
             index: 0,
         },
     };
+    let components = vec![Component {
+        id,
+        kind: ComponentKind::Not,
+        position: Position { x: 0., y: 0. },
+        label: "loop".into(),
+        constant_value: true,
+    }];
     let doc = Document {
-        components: vec![Component {
-            id,
-            kind: ComponentKind::Not,
-            position: Position { x: 0., y: 0. },
-            label: "loop".into(),
-            constant_value: true,
-        }],
-        wires: digital_rust::domain::Wiring::LegacyPinPairs(vec![Wire {
-            id: WireId(0),
-            endpoints: [output, input],
-        }]),
+        wires: routed_wires(&components, &[(output, input)]),
+        components,
     };
     let dig = digital_rust::formats::from_domain(&doc).unwrap();
     let bytes = digital_rust::formats::serialize_v2(&dig).unwrap();
@@ -816,7 +802,7 @@ fn bounded_trace_command_runs_ops_reports_ring_eviction_and_never_changes_file()
 fn trace_terminal_failure_reports_diagnostic_rows_without_settled_success() {
     use digital_rust::domain::{
         Component, ComponentId, ComponentKind as K, Document, PinDirection as D, PinId, PinRef,
-        Position, Wire, WireId,
+        Position,
     };
     let dir = TempDir::new();
     let pin = |id, direction| PinRef {
@@ -826,33 +812,31 @@ fn trace_terminal_failure_reports_diagnostic_rows_without_settled_success() {
             index: 0,
         },
     };
+    let components = vec![
+        Component {
+            id: ComponentId(1),
+            kind: K::Not,
+            position: Position { x: 0., y: 0. },
+            label: String::new(),
+            constant_value: true,
+        },
+        Component {
+            id: ComponentId(2),
+            kind: K::Output,
+            position: Position { x: 100., y: 0. },
+            label: String::new(),
+            constant_value: true,
+        },
+    ];
     let document = Document {
-        components: vec![
-            Component {
-                id: ComponentId(1),
-                kind: K::Not,
-                position: Position { x: 0., y: 0. },
-                label: String::new(),
-                constant_value: true,
-            },
-            Component {
-                id: ComponentId(2),
-                kind: K::Output,
-                position: Position { x: 100., y: 0. },
-                label: String::new(),
-                constant_value: true,
-            },
-        ],
-        wires: digital_rust::domain::Wiring::LegacyPinPairs(vec![
-            Wire {
-                id: WireId(1),
-                endpoints: [pin(1, D::Output), pin(1, D::Input)],
-            },
-            Wire {
-                id: WireId(2),
-                endpoints: [pin(1, D::Output), pin(2, D::Input)],
-            },
-        ]),
+        wires: routed_wires(
+            &components,
+            &[
+                (pin(1, D::Output), pin(1, D::Input)),
+                (pin(1, D::Output), pin(2, D::Input)),
+            ],
+        ),
+        components,
     };
     let bytes = digital_rust::formats::serialize_v2(
         &digital_rust::formats::from_domain(&document).unwrap(),

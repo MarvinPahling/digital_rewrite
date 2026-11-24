@@ -263,47 +263,16 @@ fn run_with_io_output(
                     }
                 );
             }
-            outln!(
-                "wiring={}",
-                match &session.document().wires {
-                    digital_rust::domain::Wiring::LegacyPinPairs(_) => "legacy-pin-pairs",
-                    digital_rust::domain::Wiring::GeometricSegments(_) => "geometric-segments",
-                }
-            );
-            match &session.document().wires {
-                digital_rust::domain::Wiring::LegacyPinPairs(wires) => {
-                    for wire in wires {
-                        let endpoint = |pin: &digital_rust::domain::PinRef| {
-                            let direction = match pin.pin.direction {
-                                digital_rust::domain::PinDirection::Input => "in",
-                                digital_rust::domain::PinDirection::Output => "out",
-                            };
-                            format!(
-                                "{}:{direction}{}",
-                                pin.component.0,
-                                u16::from(pin.pin.index) + 1
-                            )
-                        };
-                        outln!(
-                            "wire id={} {}--{}",
-                            wire.id.0,
-                            endpoint(&wire.endpoints[0]),
-                            endpoint(&wire.endpoints[1])
-                        );
-                    }
-                }
-                digital_rust::domain::Wiring::GeometricSegments(segments) => {
-                    for segment in segments {
-                        outln!(
-                            "segment id={} ({},{})--({},{})",
-                            segment.id,
-                            segment.a.x,
-                            segment.a.y,
-                            segment.b.x,
-                            segment.b.y
-                        );
-                    }
-                }
+            outln!("wiring=geometric-segments");
+            for segment in session.document().wires.geometric().unwrap() {
+                outln!(
+                    "segment id={} ({},{})--({},{})",
+                    segment.id,
+                    segment.a.x,
+                    segment.a.y,
+                    segment.b.x,
+                    segment.b.y
+                );
             }
         }
         "validate" => {
@@ -637,10 +606,31 @@ mod tests {
         }
     }
 
+    fn routed_wires(
+        components: &[digital_rust::domain::Component],
+        pairs: &[(digital_rust::domain::PinRef, digital_rust::domain::PinRef)],
+    ) -> digital_rust::domain::Wiring {
+        let segments = pairs
+            .iter()
+            .enumerate()
+            .map(|(id, &(a, b))| {
+                let point = |pin: digital_rust::domain::PinRef| {
+                    let component = components.iter().find(|c| c.id == pin.component).unwrap();
+                    digital_rust::pin_geometry::pin_point(component, pin.pin).unwrap()
+                };
+                digital_rust::geometric_wiring::Segment {
+                    id: id as u64 + 1,
+                    a: point(a),
+                    b: point(b),
+                }
+            })
+            .collect();
+        digital_rust::domain::Wiring::GeometricSegments(segments)
+    }
+
     fn feedback_with_output_dig() -> Vec<u8> {
         use digital_rust::domain::{
             Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position,
-            Wire, WireId,
         };
         let not = Component {
             id: ComponentId(1),
@@ -663,18 +653,16 @@ mod tests {
                 index: 0,
             },
         };
+        let components = vec![not, output];
         let document = Document {
-            components: vec![not, output],
-            wires: digital_rust::domain::Wiring::LegacyPinPairs(vec![
-                Wire {
-                    id: WireId(1),
-                    endpoints: [pin(1, PinDirection::Output), pin(1, PinDirection::Input)],
-                },
-                Wire {
-                    id: WireId(2),
-                    endpoints: [pin(1, PinDirection::Output), pin(2, PinDirection::Input)],
-                },
-            ]),
+            wires: routed_wires(
+                &components,
+                &[
+                    (pin(1, PinDirection::Output), pin(1, PinDirection::Input)),
+                    (pin(1, PinDirection::Output), pin(2, PinDirection::Input)),
+                ],
+            ),
+            components,
         };
         let dig = digital_rust::formats::from_domain(&document).unwrap();
         digital_rust::formats::serialize_v2(&dig).unwrap()

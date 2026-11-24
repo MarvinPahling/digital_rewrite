@@ -1,7 +1,9 @@
+mod common;
+use common::routed_wires;
 use digital_rust::{
     domain::{
         Component, ComponentId, ComponentKind as K, Document, PinDirection as D, PinId, PinRef,
-        Position, Wire, WireId,
+        Position,
     },
     engine::Session,
     runtime::{Level, SettleOutcome},
@@ -16,32 +18,28 @@ fn pin(id: u64, direction: D) -> PinRef {
     }
 }
 fn doc() -> Document {
-    Document {
-        components: [(1, K::Input), (2, K::Not), (3, K::Not), (4, K::Output)]
-            .into_iter()
-            .map(|(id, kind)| Component {
-                id: ComponentId(id),
-                kind,
-                position: Position {
-                    x: id as f32 * 100.,
-                    y: 0.,
-                },
-                label: String::new(),
-                constant_value: true,
-            })
-            .collect(),
-        wires: [
-            (1, 2, D::Output, D::Input),
-            (2, 3, D::Output, D::Input),
-            (3, 4, D::Output, D::Input),
-        ]
+    let components = [(1, K::Input), (2, K::Not), (3, K::Not), (4, K::Output)]
         .into_iter()
-        .enumerate()
-        .map(|(i, (a, b, ad, bd))| Wire {
-            id: WireId(i as u64),
-            endpoints: [pin(a, ad), pin(b, bd)],
+        .map(|(id, kind)| Component {
+            id: ComponentId(id),
+            kind,
+            position: Position {
+                x: id as f32 * 100.,
+                y: 0.,
+            },
+            label: String::new(),
+            constant_value: true,
         })
-        .collect(),
+        .collect::<Vec<_>>();
+    let pairs = [
+        (1, 2, D::Output, D::Input),
+        (2, 3, D::Output, D::Input),
+        (3, 4, D::Output, D::Input),
+    ]
+    .map(|(a, b, ad, bd)| (pin(a, ad), pin(b, bd)));
+    Document {
+        wires: routed_wires(&components, &pairs),
+        components,
     }
 }
 #[test]
@@ -384,16 +382,13 @@ fn pending_inspection_is_pure_sorted_and_distinguishes_partial_batch() {
         (2, 4, D::Output, D::Input),
         (3, 5, D::Output, D::Input),
     ];
+    let pairs = wires
+        .into_iter()
+        .map(|(a, b, ad, bd)| (pin(a, ad), pin(b, bd)))
+        .collect::<Vec<_>>();
     let parallel = Document {
+        wires: routed_wires(&components, &pairs),
         components,
-        wires: wires
-            .into_iter()
-            .enumerate()
-            .map(|(i, (a, b, ad, bd))| Wire {
-                id: WireId(i as u64),
-                endpoints: [pin(a, ad), pin(b, bd)],
-            })
-            .collect(),
     };
     let mut runtime = digital_rust::runtime::Runtime::start(&parallel).unwrap();
     assert!(matches!(runtime.settle(100), SettleOutcome::Settled { .. }));
