@@ -9356,10 +9356,27 @@ mod tests {
         click_text(&ctx, &mut app, "Undo");
         assert_eq!(app.session.document().components.len(), 6);
 
-        // A second paste is cancelled without consuming history or mutating the document.
+        // Capture the complete undo walk through visible production controls, then restore it.
+        // Repeating that walk after cancellation detects an extra entry even when can_undo stays
+        // true on both sides of the cancellation.
+        let walk_undo_history = |ctx: &egui::Context, app: &mut DigitalApp| {
+            let mut documents = vec![app.session.document().clone()];
+            while app.session.can_undo() {
+                click_text(ctx, app, "Undo");
+                documents.push(app.session.document().clone());
+            }
+            documents
+        };
         let before_cancel = app.session.document().clone();
-        let undo_before_cancel = app.session.can_undo();
-        let redo_before_cancel = app.session.can_redo();
+        let history_before_cancel = walk_undo_history(&ctx, &mut app);
+        assert_eq!(history_before_cancel.first(), Some(&before_cancel));
+        for expected in history_before_cancel.iter().rev().skip(1) {
+            click_text(&ctx, &mut app, "Redo");
+            assert_eq!(app.session.document(), expected);
+        }
+        assert_eq!(app.session.document(), &before_cancel);
+
+        // A second paste is cancelled without consuming history or mutating the document.
         click_text(&ctx, &mut app, "Paste");
         frame(
             &ctx,
@@ -9371,8 +9388,16 @@ mod tests {
         press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
         assert!(app.fragment_draft.is_none());
         assert_eq!(*app.session.document(), before_cancel);
-        assert_eq!(app.session.can_undo(), undo_before_cancel);
-        assert_eq!(app.session.can_redo(), redo_before_cancel);
+        let history_after_cancel = walk_undo_history(&ctx, &mut app);
+        assert_eq!(
+            history_after_cancel, history_before_cancel,
+            "cancelling a paste must not add or remove an exact document-history boundary"
+        );
+        for expected in history_after_cancel.iter().rev().skip(1) {
+            click_text(&ctx, &mut app, "Redo");
+            assert_eq!(app.session.document(), expected);
+        }
+        assert_eq!(app.session.document(), &before_cancel);
         assert!(before_history);
 
         // Save As and subsequent associated Save are driven through the visible file workflow.
@@ -9465,8 +9490,9 @@ mod tests {
         assert!(app.fragment_draft.is_none());
         assert!(!app.session.can_undo() && !app.session.can_redo());
 
-        // The actual bounded UI runner drives the shared compiler/runtime. The duplicate remains
-        // an independent second inverter; every output starts HIGH for LOW input.
+        // Force a real pending startup continuation through the production UI runner. A zero
+        // injected service budget prevents the tiny circuit from settling inside the Start click;
+        // the test then observes the pending repaint request before allowing bounded work.
         let outputs: Vec<_> = app
             .session
             .document()
@@ -9475,7 +9501,23 @@ mod tests {
             .filter(|c| c.kind == ComponentKind::Output)
             .map(|c| c.id)
             .collect();
+        app.settle_budget = 0;
         click_text(&ctx, &mut app, "Start");
+        let startup_pending = app.session.inspect().unwrap().pending_inspection();
+        assert!(
+            startup_pending.unique_count > 0,
+            "Start must leave real startup work"
+        );
+        let pending_frame = frame(&ctx, &mut app, vec![], true);
+        assert!(app.session.inspect().unwrap().is_pending());
+        assert!(
+            wants_immediate_repaint(&pending_frame),
+            "a pending continuation must request an immediate repaint"
+        );
+        let mut pending_repaint_observed =
+            app.session.inspect().unwrap().is_pending() && wants_immediate_repaint(&pending_frame);
+        assert!(pending_repaint_observed, "pending repaint was observed");
+        app.settle_budget = 1;
         let mut frames = 0;
         while app
             .session
@@ -9490,9 +9532,11 @@ mod tests {
                 app.error
             );
             if app.session.inspect().unwrap().is_pending() {
-                assert!(wants_immediate_repaint(&painted));
+                pending_repaint_observed |= wants_immediate_repaint(&painted);
             }
         }
+        assert!(frames > 0, "startup continuation actually ran");
+        assert!(pending_repaint_observed);
         for id in &outputs {
             assert_eq!(
                 app.session.inspect().unwrap().output_value(*id),
@@ -9507,37 +9551,45 @@ mod tests {
             .find(|c| c.kind == ComponentKind::Input)
             .unwrap()
             .id;
+        app.settle_budget = 0;
         click_text(&ctx, &mut app, &format!("Input #{}: 0 (low)", input_id.0));
-        assert_eq!(
-            app.session
-                .inspect()
-                .unwrap()
-                .pin_value(pin_ref(input_id, PinDirection::Output, 0)),
-            Some(Level::High)
+        let micro_pending_before = app.session.inspect().unwrap().pending_inspection();
+        assert!(
+            micro_pending_before.unique_count > 0,
+            "input schedules a gate"
         );
         click_text(&ctx, &mut app, "Microstep");
-        click_text(&ctx, &mut app, "Full step");
-        while app
-            .session
-            .inspect()
-            .is_some_and(|runtime| runtime.is_pending())
-        {
-            let painted = frame(&ctx, &mut app, vec![], true);
-            frames += 1;
-            assert!(frames < 200, "input propagation did not settle");
-            if app.session.inspect().unwrap().is_pending() {
-                assert!(wants_immediate_repaint(&painted));
-            }
+        assert_eq!(
+            app.session.inspect().unwrap().pending_inspection(),
+            micro_pending_before,
+            "the zero-budget step click cannot consume its pending frontier"
+        );
+        app.settle_budget = 1;
+        let mut micro_frames = 0;
+        let mut micro_pending_progress = false;
+        while app.microstepping {
+            let before = app.session.inspect().unwrap().pending_inspection();
+            frame(&ctx, &mut app, vec![], true);
+            let after = app.session.inspect().unwrap().pending_inspection();
+            assert!(micro_frames < 100, "microstep continuation stalled");
+            micro_pending_progress |= before != after;
+            micro_frames += 1;
         }
+        assert!(
+            micro_pending_progress,
+            "microstep advanced inspected pending work"
+        );
+        let micro_pending_after = app.session.inspect().unwrap().pending_inspection();
+        assert_eq!(micro_pending_after.unique_count, 0);
         assert_eq!(
             app.session.inspect().unwrap().output_value(outputs[0]),
             Some(Level::Low)
         );
         assert_eq!(
             app.session.inspect().unwrap().output_value(outputs[1]),
-            Some(Level::High),
-            "the unmodified duplicate keeps its independent LOW input"
+            Some(Level::High)
         );
+
         let second_input = app
             .session
             .document()
@@ -9547,25 +9599,46 @@ mod tests {
             .nth(1)
             .unwrap()
             .id;
+        app.settle_budget = 0;
         click_text(
             &ctx,
             &mut app,
             &format!("Input #{}: 0 (low)", second_input.0),
         );
-        click_text(&ctx, &mut app, "Microstep");
+        let full_pending_before = app.session.inspect().unwrap().pending_inspection();
+        assert!(
+            full_pending_before.unique_count > 0,
+            "second input schedules work"
+        );
         click_text(&ctx, &mut app, "Full step");
-        while app
-            .session
-            .inspect()
-            .is_some_and(|runtime| runtime.is_pending())
-        {
+        assert_eq!(
+            app.session.inspect().unwrap().pending_inspection(),
+            full_pending_before,
+            "the zero-budget full-step click cannot consume its pending frontier"
+        );
+        app.settle_budget = 1;
+        let mut full_frames = 0;
+        let mut full_step_pending_repaint_observed = false;
+        let mut full_pending_progress = false;
+        while app.settling {
+            let before = app.session.inspect().unwrap().pending_inspection();
             let painted = frame(&ctx, &mut app, vec![], true);
-            frames += 1;
-            assert!(frames < 300, "duplicate propagation did not settle");
-            if app.session.inspect().unwrap().is_pending() {
-                assert!(wants_immediate_repaint(&painted));
+            let after = app.session.inspect().unwrap().pending_inspection();
+            assert!(full_frames < 100, "full-step continuation stalled");
+            if after.unique_count > 0 {
+                full_step_pending_repaint_observed |= wants_immediate_repaint(&painted);
             }
+            full_pending_progress |= before != after;
+            full_frames += 1;
         }
+        assert!(
+            full_pending_progress,
+            "full step advanced inspected pending work"
+        );
+        let full_pending_after = app.session.inspect().unwrap().pending_inspection();
+        assert!(full_frames > 0);
+        assert!(full_step_pending_repaint_observed);
+        assert_eq!(full_pending_after.unique_count, 0);
         assert_eq!(
             app.session.inspect().unwrap().output_value(outputs[1]),
             Some(Level::Low)
