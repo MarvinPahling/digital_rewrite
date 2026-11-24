@@ -1,6 +1,124 @@
 //! Shared component catalog metadata; component behavior remains in the simulator.
 use crate::domain::ComponentKind;
 
+/// Public typed attribute IDs; unknown strings never enter the editing engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AttributeId {
+    Label,
+    Value,
+    Rotation,
+    Mirror,
+    WideShape,
+    Inputs,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttributeValue {
+    Label(String),
+    Value(bool),
+    Rotation(u8),
+    Mirror(bool),
+    WideShape(bool),
+    Inputs(u8),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttributeType {
+    Text,
+    Boolean,
+    QuarterTurns,
+    InputCount,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttributeDescriptor {
+    pub id: AttributeId,
+    pub name: &'static str,
+    pub value_type: AttributeType,
+    pub editable: bool,
+}
+const COMPONENT_ATTRIBUTES: &[AttributeDescriptor] = &[
+    AttributeDescriptor {
+        id: AttributeId::Label,
+        name: "Label",
+        value_type: AttributeType::Text,
+        editable: true,
+    },
+    AttributeDescriptor {
+        id: AttributeId::Value,
+        name: "Value",
+        value_type: AttributeType::Boolean,
+        editable: true,
+    },
+    AttributeDescriptor {
+        id: AttributeId::Rotation,
+        name: "rotation",
+        value_type: AttributeType::QuarterTurns,
+        editable: true,
+    },
+    AttributeDescriptor {
+        id: AttributeId::Mirror,
+        name: "mirror",
+        value_type: AttributeType::Boolean,
+        editable: true,
+    },
+    AttributeDescriptor {
+        id: AttributeId::WideShape,
+        name: "wideShape",
+        value_type: AttributeType::Boolean,
+        editable: true,
+    },
+    AttributeDescriptor {
+        id: AttributeId::Inputs,
+        name: "Inputs",
+        value_type: AttributeType::InputCount,
+        editable: false,
+    },
+];
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttributeError {
+    Unsupported(AttributeId),
+    WrongType(AttributeId),
+    WrongKind(AttributeId),
+    Invalid(AttributeId, String),
+    Duplicate(AttributeId),
+}
+impl std::fmt::Display for AttributeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid component attribute: {self:?}")
+    }
+}
+impl std::error::Error for AttributeError {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttributeChange {
+    pub id: AttributeId,
+    pub value: AttributeValue,
+}
+impl AttributeChange {
+    pub fn new(id: AttributeId, value: AttributeValue) -> Self {
+        Self { id, value }
+    }
+}
+pub fn attribute_descriptors(kind: ComponentKind) -> Vec<AttributeDescriptor> {
+    let supported = descriptor(kind).attributes;
+    COMPONENT_ATTRIBUTES
+        .iter()
+        .copied()
+        .filter(|d| supported.contains(&d.id))
+        .collect()
+}
+pub fn has_attribute(kind: ComponentKind, id: AttributeId) -> bool {
+    descriptor(kind).attributes.contains(&id)
+}
+pub fn supports_wide_shape(kind: ComponentKind) -> bool {
+    matches!(
+        kind,
+        ComponentKind::And
+            | ComponentKind::NAnd
+            | ComponentKind::Or
+            | ComponentKind::NOr
+            | ComponentKind::XOr
+            | ComponentKind::XNOr
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComponentDescriptor {
     pub kind: ComponentKind,
@@ -10,9 +128,28 @@ pub struct ComponentDescriptor {
     pub output_pins: u8,
     /// Digital defaults are recorded for compatibility; the strict v2 subset omits them.
     pub defaults: &'static [(&'static str, &'static str)],
+    pub attributes: &'static [AttributeId],
 }
 const CONST_DEFAULTS: &[(&str, &str)] = &[("Bits", "1"), ("Value", "1")];
 const ONE_BIT: &[(&str, &str)] = &[("Bits", "1")];
+const COMMON_ATTRIBUTES: &[AttributeId] = &[
+    AttributeId::Label,
+    AttributeId::Rotation,
+    AttributeId::Mirror,
+];
+const CONST_ATTRIBUTES: &[AttributeId] = &[
+    AttributeId::Label,
+    AttributeId::Value,
+    AttributeId::Rotation,
+    AttributeId::Mirror,
+];
+const BINARY_ATTRIBUTES: &[AttributeId] = &[
+    AttributeId::Label,
+    AttributeId::Rotation,
+    AttributeId::Mirror,
+    AttributeId::WideShape,
+    AttributeId::Inputs,
+];
 const TWO_INPUT_GATE: &[(&str, &str)] = &[("Bits", "1"), ("Inputs", "2"), ("wideShape", "false")];
 pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
     ComponentDescriptor {
@@ -22,6 +159,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 0,
         output_pins: 1,
         defaults: ONE_BIT,
+        attributes: COMMON_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::Output,
@@ -30,6 +168,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 1,
         output_pins: 0,
         defaults: ONE_BIT,
+        attributes: COMMON_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::And,
@@ -38,6 +177,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 2,
         output_pins: 1,
         defaults: TWO_INPUT_GATE,
+        attributes: BINARY_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::NAnd,
@@ -46,6 +186,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 2,
         output_pins: 1,
         defaults: TWO_INPUT_GATE,
+        attributes: BINARY_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::Or,
@@ -54,6 +195,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 2,
         output_pins: 1,
         defaults: TWO_INPUT_GATE,
+        attributes: BINARY_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::NOr,
@@ -62,6 +204,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 2,
         output_pins: 1,
         defaults: TWO_INPUT_GATE,
+        attributes: BINARY_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::XOr,
@@ -70,6 +213,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 2,
         output_pins: 1,
         defaults: TWO_INPUT_GATE,
+        attributes: BINARY_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::XNOr,
@@ -78,6 +222,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 2,
         output_pins: 1,
         defaults: TWO_INPUT_GATE,
+        attributes: BINARY_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::Not,
@@ -86,6 +231,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 1,
         output_pins: 1,
         defaults: ONE_BIT,
+        attributes: COMMON_ATTRIBUTES,
     },
     ComponentDescriptor {
         kind: ComponentKind::Const,
@@ -94,6 +240,7 @@ pub const DESCRIPTORS: [ComponentDescriptor; 10] = [
         input_pins: 0,
         output_pins: 1,
         defaults: CONST_DEFAULTS,
+        attributes: CONST_ATTRIBUTES,
     },
 ];
 pub const KINDS: [ComponentKind; 10] = [
@@ -172,6 +319,39 @@ mod tests {
         }
         for wrong_case in ["nand", "NOR", "xor", "XNOR"] {
             assert_eq!(from_digital_name(wrong_case), None);
+        }
+        for kind in KINDS {
+            let attrs = attribute_descriptors(kind);
+            assert!(
+                attrs
+                    .iter()
+                    .any(|attribute| attribute.id == AttributeId::Label && attribute.editable)
+            );
+            assert_eq!(
+                attrs
+                    .iter()
+                    .any(|attribute| attribute.id == AttributeId::Value),
+                kind == ComponentKind::Const
+            );
+            assert_eq!(
+                attrs
+                    .iter()
+                    .any(|attribute| attribute.id == AttributeId::WideShape),
+                supports_wide_shape(kind)
+            );
+            assert_eq!(
+                attrs
+                    .iter()
+                    .find(|attribute| attribute.id == AttributeId::Inputs)
+                    .is_some(),
+                supports_wide_shape(kind)
+            );
+            assert!(
+                attrs
+                    .iter()
+                    .filter(|attribute| attribute.id == AttributeId::Inputs)
+                    .all(|attribute| !attribute.editable)
+            );
         }
     }
 }

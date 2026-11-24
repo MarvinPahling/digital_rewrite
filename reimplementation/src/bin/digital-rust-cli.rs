@@ -638,6 +638,7 @@ mod tests {
             position: Position { x: 0., y: 0. },
             label: String::new(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         };
@@ -647,6 +648,7 @@ mod tests {
             position: Position { x: 100., y: 0. },
             label: "oscillating output".into(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         };

@@ -31,6 +31,7 @@ pub struct DigElement {
     pub label: Option<String>,
     /// Explicit Digital Const value; None distinguishes an omitted default from explicit HIGH.
     pub value: Option<bool>,
+    pub wide_shape: bool,
     pub rotation: u8,
     pub mirror: bool,
 }
@@ -134,6 +135,18 @@ pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
     }
     for (index, element) in document.elements.iter().enumerate() {
         validate_write_string(&element.name, &format!("elements[{index}].name"))?;
+        if element.wide_shape
+            && !matches!(
+                element.name.as_str(),
+                "And" | "NAnd" | "Or" | "NOr" | "XOr" | "XNOr"
+            )
+        {
+            return Err(write_error(
+                DigWriteErrorKind::UnsupportedValue,
+                format!("elements[{index}].wideShape"),
+                "wideShape is supported only for binary gates",
+            ));
+        }
         if element.value.is_some() && element.name != "Const" {
             return Err(write_error(
                 DigWriteErrorKind::UnsupportedValue,
@@ -184,6 +197,7 @@ pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
         write_bytes(&mut output, b"</elementName><elementAttributes", &context)?;
         if element.label.is_none()
             && element.value.is_none()
+            && !element.wide_shape
             && element.rotation == 0
             && !element.mirror
         {
@@ -207,6 +221,13 @@ pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
                 )?;
                 write_bytes(&mut output, if value { b"1" } else { b"0" }, &context)?;
                 write_bytes(&mut output, b"</long></entry>", &context)?;
+            }
+            if element.wide_shape {
+                write_bytes(
+                    &mut output,
+                    b"<entry><string>wideShape</string><boolean>true</boolean></entry>",
+                    &context,
+                )?;
             }
             if element.rotation != 0 {
                 write_bytes(
@@ -451,6 +472,18 @@ fn write_clipboard_element(
             .map_err(|e| write_error(DigWriteErrorKind::Limit, "Label", e.to_string()))?;
         validate_write_string(label, "Label")?;
     }
+    if element.wide_shape
+        && !matches!(
+            element.name.as_str(),
+            "And" | "NAnd" | "Or" | "NOr" | "XOr" | "XNOr"
+        )
+    {
+        return Err(write_error(
+            DigWriteErrorKind::UnsupportedValue,
+            "wideShape",
+            "wideShape is supported only for binary gates",
+        ));
+    }
     if element.value.is_some() && element.name != "Const" {
         return Err(write_error(
             DigWriteErrorKind::UnsupportedValue,
@@ -470,6 +503,7 @@ fn write_clipboard_element(
     write_bytes(output, b"</elementName><elementAttributes", "element")?;
     if element.label.is_none()
         && element.value.is_none()
+        && !element.wide_shape
         && element.rotation == 0
         && !element.mirror
     {
@@ -485,6 +519,13 @@ fn write_clipboard_element(
             write_bytes(output, b"<entry><string>Value</string><long>", "Value")?;
             write_bytes(output, if value { b"1" } else { b"0" }, "Value")?;
             write_bytes(output, b"</long></entry>", "Value")?;
+        }
+        if element.wide_shape {
+            write_bytes(
+                output,
+                b"<entry><string>wideShape</string><boolean>true</boolean></entry>",
+                "wideShape",
+            )?;
         }
         if element.rotation != 0 {
             write_bytes(
@@ -738,6 +779,8 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
     whitespace_text(attr_node, "elementAttributes")?;
     let mut label = None;
     let mut value = None;
+    let mut wide_shape = false;
+    let mut wide_shape_seen = false;
     let mut rotation = 0_u8;
     let mut rotation_seen = false;
     let mut mirror = false;
@@ -765,6 +808,45 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
         let key = leaf(&entry.children[0], "attribute key")?;
         let payload = &entry.children[1];
         match key {
+            "wideShape" => {
+                if wide_shape_seen {
+                    return Err(error(
+                        DigReadErrorKind::DuplicateField,
+                        entry.offset,
+                        "wideShape",
+                        "wideShape occurs more than once",
+                    ));
+                }
+                wide_shape_seen = true;
+                if !matches!(element_name, "And" | "NAnd" | "Or" | "NOr" | "XOr" | "XNOr") {
+                    return Err(error(
+                        DigReadErrorKind::Unsupported,
+                        entry.offset,
+                        "wideShape",
+                        "wideShape is supported only for binary gates",
+                    ));
+                }
+                if payload.name != "boolean" {
+                    return Err(error(
+                        DigReadErrorKind::Unsupported,
+                        payload.offset,
+                        "wideShape",
+                        "wideShape requires a boolean value",
+                    ));
+                }
+                wide_shape = match trim_xml_space(leaf(payload, "wideShape")?) {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(error(
+                            DigReadErrorKind::InvalidValue,
+                            payload.offset,
+                            "wideShape",
+                            "expected true or false",
+                        ));
+                    }
+                };
+            }
             "rotation" => {
                 if rotation_seen {
                     return Err(error(
@@ -953,6 +1035,7 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
         y: point.y,
         label,
         value,
+        wide_shape,
         rotation,
         mirror,
     })
@@ -1802,6 +1885,9 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
     for (index, element) in dig.elements.iter().enumerate() {
         let kind = kind_from_name(&element.name)
             .ok_or_else(|| invalid(format!("unsupported component {:?}", element.name)))?;
+        if element.wide_shape && !crate::components::supports_wide_shape(kind) {
+            return Err(invalid("wideShape is supported only for binary gates"));
+        }
         if element.rotation > 3 {
             return Err(invalid("rotation must be between 0 and 3 quarter-turns"));
         }
@@ -1809,7 +1895,10 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
             rotation: element.rotation,
             mirror: element.mirror,
         }
-        .transform(center_offset(kind)?.0, center_offset(kind)?.1)
+        .transform(
+            center_offset(kind)?.0 + if element.wide_shape { 10 } else { 0 },
+            center_offset(kind)?.1,
+        )
         .ok_or_else(|| invalid("invalid orientation"))?;
         let x = element
             .x
@@ -1833,6 +1922,9 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
         {
             return Err(invalid("component origin/center loses f32 precision"));
         }
+        if element.wide_shape && !crate::components::supports_wide_shape(kind) {
+            return Err(invalid("wideShape is supported only for binary gates"));
+        }
         if kind != ComponentKind::Const && element.value.is_some() {
             return Err(invalid("Value is supported only for Const"));
         }
@@ -1842,6 +1934,7 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
             position,
             label: element.label.clone().unwrap_or_default(),
             constant_value: element.value.unwrap_or(true),
+            wide_shape: element.wide_shape,
             rotation: element.rotation,
             mirror: element.mirror,
         });
@@ -2052,6 +2145,12 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
     let mut ids = BTreeSet::new();
     let mut elements = Vec::with_capacity(doc.components.len());
     for c in &doc.components {
+        if c.wide_shape && !crate::components::supports_wide_shape(c.kind) {
+            return Err(invalid(format!(
+                "component {} has unsupported wideShape configuration",
+                c.id.0
+            )));
+        }
         if c.kind != ComponentKind::Const && !c.constant_value {
             return Err(invalid(format!(
                 "component {} has a non-default constant value but is not Const",
@@ -2070,7 +2169,10 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
             rotation: c.rotation,
             mirror: c.mirror,
         }
-        .transform(center_offset(c.kind)?.0, center_offset(c.kind)?.1)
+        .transform(
+            center_offset(c.kind)?.0 + if c.wide_shape { 10 } else { 0 },
+            center_offset(c.kind)?.1,
+        )
         .ok_or_else(|| invalid("invalid orientation"))?;
         let ox = x
             .checked_sub(dx)
@@ -2092,6 +2194,7 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
             } else {
                 None
             },
+            wide_shape: c.wide_shape,
             rotation: c.rotation,
             mirror: c.mirror,
         });
@@ -2145,6 +2248,7 @@ mod tests {
                     y: -80,
                     label: Some(format!("λ {} & <raw>", kind.name())),
                     value: (*kind == ComponentKind::Const).then_some(false),
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 })
@@ -2231,6 +2335,7 @@ mod tests {
                     y: -12,
                     label: Some("λ input".into()),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2240,6 +2345,7 @@ mod tests {
                     y: -2,
                     label: Some(String::new()),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2249,6 +2355,7 @@ mod tests {
                     y: 40,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2258,6 +2365,7 @@ mod tests {
                     y: 7,
                     label: Some("OR".into()),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2267,6 +2375,7 @@ mod tests {
                     y: -40,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2276,6 +2385,7 @@ mod tests {
                     y: -80,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2285,6 +2395,7 @@ mod tests {
                     y: -120,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2294,6 +2405,7 @@ mod tests {
                     y: -160,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2303,6 +2415,7 @@ mod tests {
                     y: -4,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2365,6 +2478,7 @@ mod tests {
                 },
                 label: String::new(),
                 constant_value: true,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             };
@@ -2405,6 +2519,7 @@ mod tests {
             position: Position { x: 0., y: 0. },
             label: String::new(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         };
@@ -2414,6 +2529,7 @@ mod tests {
             position: Position { x: 100., y: 0. },
             label: String::new(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         };
@@ -2496,6 +2612,7 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2505,6 +2622,7 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2514,6 +2632,7 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2559,6 +2678,7 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2568,6 +2688,7 @@ mod tests {
                     y: 100,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -2618,6 +2739,7 @@ mod tests {
                         y,
                         label: None,
                         value: None,
+                        wide_shape: false,
                         rotation: 0,
                         mirror: false,
                     })
@@ -2767,6 +2889,7 @@ mod tests {
                 position: Position { x: 0., y: 0. },
                 label: String::new(),
                 constant_value: true,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             },
@@ -2776,6 +2899,7 @@ mod tests {
                 position: Position { x: 100., y: 80. },
                 label: String::new(),
                 constant_value: true,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             },
@@ -2829,6 +2953,7 @@ mod tests {
                 position: Position { x: 0.5, y: 0.0 },
                 label: String::new(),
                 constant_value: true,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -2845,6 +2970,7 @@ mod tests {
                 },
                 label: String::new(),
                 constant_value: true,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -2884,6 +3010,7 @@ mod tests {
                 y: 7,
                 label: Some("R & D <λ> 💡".into()),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }
@@ -2956,7 +3083,7 @@ mod tests {
             DigReadErrorKind::Unsupported,
             "elementAttributes",
         );
-        for (key, value) in [("Bits", "1"), ("Inputs", "2"), ("wideShape", "false")] {
+        for (key, value) in [("Bits", "1"), ("Inputs", "2")] {
             let explicit_default = format!(
                 "<visualElement><elementName>NAnd</elementName><elementAttributes><entry><string>{key}</string><string>{value}</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>"
             );
@@ -2966,6 +3093,19 @@ mod tests {
                 "elementAttributes",
             );
         }
+        let explicit_wide_default = "<visualElement><elementName>NAnd</elementName><elementAttributes><entry><string>wideShape</string><boolean>false</boolean></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>";
+        assert!(
+            !parse_v2(doc(explicit_wide_default, "").as_bytes())
+                .unwrap()
+                .elements[0]
+                .wide_shape
+        );
+        let wrong_tag = "<visualElement><elementName>NAnd</elementName><elementAttributes><entry><string>wideShape</string><string>false</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>";
+        expect_error(
+            &doc(wrong_tag, ""),
+            DigReadErrorKind::Unsupported,
+            "wideShape",
+        );
         let wrong_case = "<visualElement><elementName>nand</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement>";
         assert!(to_domain(&parse_v2(doc(wrong_case, "").as_bytes()).unwrap()).is_err());
         let resource = "<visualElement><elementName>ROM</elementName><elementAttributes><entry><string>Data</string><string>memory.hex</string></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement>";
@@ -3287,6 +3427,7 @@ mod tests {
                     y: i32::MAX,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -3296,6 +3437,7 @@ mod tests {
                     y: 8,
                     label: Some(String::new()),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -3305,6 +3447,7 @@ mod tests {
                     y: -10,
                     label: Some("ordered".into()),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -3348,6 +3491,7 @@ mod tests {
                 y: 1,
                 label: Some(value.into()),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3367,6 +3511,7 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 }],
@@ -3383,6 +3528,7 @@ mod tests {
                     y: 0,
                     label: Some(invalid.into()),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 }],
@@ -3403,6 +3549,7 @@ mod tests {
             y: 0,
             label: None,
             value: None,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         };
@@ -3469,6 +3616,7 @@ mod tests {
                 elements: vec![DigElement {
                     label: Some("a".repeat(MAX_STRING_BYTES)),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                     ..element.clone()
@@ -3482,6 +3630,7 @@ mod tests {
                 elements: vec![DigElement {
                     label: Some("a".repeat(MAX_STRING_BYTES + 1)),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                     ..element.clone()
@@ -3496,6 +3645,7 @@ mod tests {
         let empty_suffix = DigElement {
             label: Some(String::new()),
             value: None,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
             ..element.clone()
@@ -3511,6 +3661,7 @@ mod tests {
                 DigElement {
                     label: Some("x".repeat(MAX_STRING_BYTES)),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                     ..element.clone()
@@ -3527,6 +3678,7 @@ mod tests {
             DigElement {
                 label: Some("x".repeat(MAX_STRING_BYTES)),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
                 ..element.clone()
@@ -3561,6 +3713,7 @@ mod tests {
                     y: 0,
                     label: Some("&".repeat(MAX_STRING_BYTES)),
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 };
@@ -3619,6 +3772,7 @@ mod tests {
                         position: Position { x, y },
                         label: String::new(),
                         constant_value: true,
+                        wide_shape: false,
                         rotation: 0,
                         mirror: false,
                     }],
@@ -3733,6 +3887,7 @@ mod tests {
                 y: 0,
                 label: None,
                 value: Some(true),
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3759,6 +3914,7 @@ mod tests {
                 position: Position { x: 0.0, y: 0.0 },
                 label: String::new(),
                 constant_value: false,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3825,6 +3981,7 @@ mod tests {
                 y: 5,
                 label: Some(" source ".into()),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3883,6 +4040,7 @@ mod tests {
                 y: 0,
                 label: None,
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3897,6 +4055,7 @@ mod tests {
                 y: 0,
                 label: None,
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3926,6 +4085,7 @@ mod tests {
                 y: 0,
                 label: None,
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3980,6 +4140,7 @@ mod tests {
                 y: 20,
                 label: Some("rotated".into()),
                 value: None,
+                wide_shape: false,
                 rotation: 1,
                 mirror: true,
             }],
@@ -3999,6 +4160,55 @@ mod tests {
         let document = to_domain(&dig).unwrap();
         let exported = from_domain(&document).unwrap();
         assert_eq!(exported.elements, dig.elements);
+    }
+
+    #[test]
+    fn wide_shape_roundtrips_file_and_clipboard_and_rejects_invalid_applicability() {
+        let dig = DigV2 {
+            elements: vec![DigElement {
+                name: "NAnd".into(),
+                x: -40,
+                y: 20,
+                label: Some("wide".into()),
+                value: None,
+                wide_shape: true,
+                rotation: 3,
+                mirror: true,
+            }],
+            wires: vec![],
+        };
+        let xml = serialize_v2(&dig).unwrap();
+        assert!(
+            String::from_utf8_lossy(&xml)
+                .contains("<entry><string>wideShape</string><boolean>true</boolean></entry>")
+        );
+        assert_eq!(parse_v2(&xml).unwrap(), dig);
+        assert_eq!(
+            parse_clipboard_list(&serialize_clipboard_list(&dig).unwrap()).unwrap(),
+            dig
+        );
+        let domain = to_domain(&dig).unwrap();
+        assert!(domain.components[0].wide_shape);
+        assert_eq!(from_domain(&domain).unwrap(), dig);
+        for (kind, value) in [
+            ("And", "<string>true</string>"),
+            ("And", "<boolean>yes</boolean>"),
+            ("Not", "<boolean>true</boolean>"),
+            ("In", "<boolean>true</boolean>"),
+        ] {
+            let xml = format!(
+                "<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>{kind}</elementName><elementAttributes><entry><string>wideShape</string>{value}</entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>"
+            );
+            assert!(parse_v2(xml.as_bytes()).is_err(), "{xml}");
+        }
+        let duplicate = "<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>And</elementName><elementAttributes><entry><string>wideShape</string><boolean>true</boolean></entry><entry><string>wideShape</string><boolean>false</boolean></entry></elementAttributes><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>";
+        assert_eq!(
+            parse_v2(duplicate.as_bytes()).unwrap_err().kind,
+            DigReadErrorKind::DuplicateField
+        );
+        let mut invalid = domain.clone();
+        invalid.components[0].kind = ComponentKind::Not;
+        assert!(from_domain(&invalid).is_err());
     }
 
     #[test]

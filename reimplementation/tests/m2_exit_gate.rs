@@ -26,6 +26,7 @@ fn component(id: u64, kind: K, value: bool) -> Component {
         },
         label: String::new(),
         constant_value: value,
+        wide_shape: false,
         rotation: 0,
         mirror: false,
     }
@@ -412,6 +413,7 @@ fn public_geometric_connectivity_membership_diagnostics_and_resource_bounds() {
             },
             label: format!("c{id}"),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         }

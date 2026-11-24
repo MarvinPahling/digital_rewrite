@@ -142,7 +142,95 @@ pub struct SymbolDef {
 include!(concat!(env!("OUT_DIR"), "/component_symbols.rs"));
 
 /// Returns the symbol drawn for `kind` in `style`, if one has been drawn.
+#[allow(
+    dead_code,
+    reason = "the configured symbol resolver is used by production; this narrow wrapper supports legacy geometry tests"
+)]
 pub fn symbol(style: SymbolStyle, kind: ComponentKind) -> Option<&'static SymbolDef> {
+    symbol_with_wide(style, kind, false)
+}
+
+const WIDE_ANCHORS_NORMAL: [SymbolAnchor; 3] = [
+    SymbolAnchor {
+        name: "pin-in-0",
+        position: [0.0, 0.0],
+        direction: PortDirection::Input,
+    },
+    SymbolAnchor {
+        name: "pin-in-1",
+        position: [0.0, 40.0],
+        direction: PortDirection::Input,
+    },
+    SymbolAnchor {
+        name: "pin-out-0",
+        position: [80.0, 20.0],
+        direction: PortDirection::Output,
+    },
+];
+const WIDE_ANCHORS_INVERTED: [SymbolAnchor; 3] = [
+    WIDE_ANCHORS_NORMAL[0],
+    WIDE_ANCHORS_NORMAL[1],
+    SymbolAnchor {
+        name: "pin-out-0",
+        position: [100.0, 20.0],
+        direction: PortDirection::Output,
+    },
+];
+const fn wide_def(id: &'static str, style: SymbolStyle, kind: ComponentKind) -> SymbolDef {
+    let anchors = match kind {
+        ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr => &WIDE_ANCHORS_INVERTED,
+        _ => &WIDE_ANCHORS_NORMAL,
+    };
+    let right = match kind {
+        ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr => 100.0,
+        _ => 80.0,
+    };
+    SymbolDef {
+        id,
+        style,
+        kind,
+        master: "generic-wide-shape",
+        origin: [0.0, 0.0],
+        bounds: SymbolBounds {
+            min: [0.0, 0.0],
+            max: [right, 40.0],
+        },
+        paths: &[],
+        anchors,
+    }
+}
+static WIDE_RECT: [SymbolDef; 6] = [
+    wide_def("wide-rect-and", SymbolStyle::Rect, ComponentKind::And),
+    wide_def("wide-rect-nand", SymbolStyle::Rect, ComponentKind::NAnd),
+    wide_def("wide-rect-or", SymbolStyle::Rect, ComponentKind::Or),
+    wide_def("wide-rect-nor", SymbolStyle::Rect, ComponentKind::NOr),
+    wide_def("wide-rect-xor", SymbolStyle::Rect, ComponentKind::XOr),
+    wide_def("wide-rect-xnor", SymbolStyle::Rect, ComponentKind::XNOr),
+];
+static WIDE_IEEE: [SymbolDef; 6] = [
+    wide_def("wide-ieee-and", SymbolStyle::Ieee, ComponentKind::And),
+    wide_def("wide-ieee-nand", SymbolStyle::Ieee, ComponentKind::NAnd),
+    wide_def("wide-ieee-or", SymbolStyle::Ieee, ComponentKind::Or),
+    wide_def("wide-ieee-nor", SymbolStyle::Ieee, ComponentKind::NOr),
+    wide_def("wide-ieee-xor", SymbolStyle::Ieee, ComponentKind::XOr),
+    wide_def("wide-ieee-xnor", SymbolStyle::Ieee, ComponentKind::XNOr),
+];
+pub fn symbol_with_wide(
+    style: SymbolStyle,
+    kind: ComponentKind,
+    wide: bool,
+) -> Option<&'static SymbolDef> {
+    if wide {
+        if !crate::components::supports_wide_shape(kind) {
+            return None;
+        }
+        let list = if style == SymbolStyle::Rect {
+            &WIDE_RECT
+        } else {
+            &WIDE_IEEE
+        };
+        return list.iter().find(|def| def.kind == kind);
+    }
     if let Some(def) = SYMBOLS
         .iter()
         .find(|def| def.style == style && def.kind == kind)
@@ -296,7 +384,14 @@ pub fn origin_from_center(style: SymbolStyle, kind: ComponentKind, center: Point
     reason = "the library format adapter calls this through its own module instance"
 )]
 pub fn center_from_origin_offset(style: SymbolStyle, kind: ComponentKind) -> Option<Point> {
-    let bounds = symbol(style, kind)?.bounds;
+    center_from_origin_offset_config(style, kind, false)
+}
+pub fn center_from_origin_offset_config(
+    style: SymbolStyle,
+    kind: ComponentKind,
+    wide: bool,
+) -> Option<Point> {
+    let bounds = symbol_with_wide(style, kind, wide)?.bounds;
     Some([
         (bounds.min[0] + bounds.max[0]) * 0.5,
         (bounds.min[1] + bounds.max[1]) * 0.5,

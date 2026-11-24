@@ -30,19 +30,31 @@ fn integral(value: f32, kind: ComponentKind) -> Result<i32, PinGeometryError> {
 
 /// Canonical local artwork-center offset, used by origin-preserving orientation edits and codecs.
 pub fn origin_to_center_offset(kind: ComponentKind) -> Result<(i32, i32), PinGeometryError> {
-    let offset = symbols::center_from_origin_offset(SymbolStyle::Rect, kind)
+    origin_to_center_offset_wide(kind, false)
+}
+pub fn origin_to_center_offset_wide(
+    kind: ComponentKind,
+    wide: bool,
+) -> Result<(i32, i32), PinGeometryError> {
+    if wide && !crate::components::supports_wide_shape(kind) {
+        return Err(PinGeometryError::Unsupported(kind));
+    }
+    let offset = symbols::center_from_origin_offset_config(SymbolStyle::Rect, kind, wide)
         .ok_or(PinGeometryError::Unsupported(kind))?;
     Ok((integral(offset[0], kind)?, integral(offset[1], kind)?))
 }
 
 /// Resolve a pin using the integral bounds-center offset and Digital's origin-relative pin offsets.
 pub fn pin_point(component: &Component, pin: PinId) -> Result<Point, PinGeometryError> {
+    if component.wide_shape && !crate::components::supports_wide_shape(component.kind) {
+        return Err(PinGeometryError::Unsupported(component.kind));
+    }
     if !component.kind.has_pin(pin) {
         return Err(PinGeometryError::Unsupported(component.kind));
     }
     let cx = integral(component.position.x, component.kind)?;
     let cy = integral(component.position.y, component.kind)?;
-    let (ox, oy) = origin_to_center_offset(component.kind)?;
+    let (ox, oy) = origin_to_center_offset_wide(component.kind, component.wide_shape)?;
     let orientation = crate::domain::Orientation {
         rotation: component.rotation,
         mirror: component.mirror,
@@ -68,7 +80,7 @@ pub fn pin_point(component: &Component, pin: PinId) -> Result<Point, PinGeometry
             ComponentKind::And | ComponentKind::Or | ComponentKind::XOr,
             crate::domain::PinDirection::Output,
             0,
-        ) => (60, 20),
+        ) => (if component.wide_shape { 80 } else { 60 }, 20),
         (
             ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr,
             crate::domain::PinDirection::Input,
@@ -83,7 +95,7 @@ pub fn pin_point(component: &Component, pin: PinId) -> Result<Point, PinGeometry
             ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr,
             crate::domain::PinDirection::Output,
             0,
-        ) => (80, 20),
+        ) => (if component.wide_shape { 100 } else { 80 }, 20),
         _ => return Err(PinGeometryError::Unsupported(component.kind)),
     };
     let (px, py) = orientation
@@ -133,6 +145,7 @@ mod tests {
             position: crate::domain::Position { x, y },
             label: String::new(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         }
@@ -196,6 +209,68 @@ mod tests {
             Point::new(120, 200)
         );
     }
+    #[test]
+    fn wide_binary_gate_pins_and_origin_center_offset_are_literal_in_all_orientations() {
+        for kind in [
+            ComponentKind::And,
+            ComponentKind::Or,
+            ComponentKind::XOr,
+            ComponentKind::NAnd,
+            ComponentKind::NOr,
+            ComponentKind::XNOr,
+        ] {
+            let mut component = c(kind, 130., 40.);
+            component.wide_shape = true;
+            let offset = origin_to_center_offset_wide(kind, true).unwrap();
+            assert_eq!(offset.0, origin_to_center_offset(kind).unwrap().0 + 10);
+            let origin = (130 - offset.0, 40 - offset.1);
+            let out_x = if matches!(
+                kind,
+                ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr
+            ) {
+                100
+            } else {
+                80
+            };
+            assert_eq!(
+                pin_point(&component, p(Input, 0)).unwrap(),
+                Point::new(origin.0, origin.1)
+            );
+            assert_eq!(
+                pin_point(&component, p(Input, 1)).unwrap(),
+                Point::new(origin.0, origin.1 + 40)
+            );
+            assert_eq!(
+                pin_point(&component, p(Output, 0)).unwrap(),
+                Point::new(origin.0 + out_x, origin.1 + 20)
+            );
+            for rotation in 0..4 {
+                for mirror in [false, true] {
+                    let mut placed = component.clone();
+                    placed.rotation = rotation;
+                    placed.mirror = mirror;
+                    let transform = crate::domain::Orientation { rotation, mirror };
+                    let shifted = transform.transform(offset.0, offset.1).unwrap();
+                    let base_origin = (
+                        placed.position.x as i32 - shifted.0,
+                        placed.position.y as i32 - shifted.1,
+                    );
+                    for (pin, local) in [
+                        (p(Input, 0), (0, 0)),
+                        (p(Input, 1), (0, 40)),
+                        (p(Output, 0), (out_x, 20)),
+                    ] {
+                        let local = transform.transform(local.0, local.1).unwrap();
+                        assert_eq!(
+                            pin_point(&placed, pin).unwrap(),
+                            Point::new(base_origin.0 + local.0, base_origin.1 + local.1)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn invalid_fractional_and_overflow_placements_fail_without_rounding() {
         assert_eq!(

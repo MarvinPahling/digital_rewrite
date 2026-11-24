@@ -29,6 +29,7 @@ fn doc() -> Document {
             },
             label: String::new(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         })
@@ -376,6 +377,7 @@ fn pending_inspection_is_pure_sorted_and_distinguishes_partial_batch() {
             },
             label: String::new(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         });

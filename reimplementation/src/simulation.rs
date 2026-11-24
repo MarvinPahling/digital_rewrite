@@ -30,6 +30,9 @@ pub enum CompileError {
     InvalidConstantConfiguration {
         component: ComponentId,
     },
+    InvalidWideShapeConfiguration {
+        component: ComponentId,
+    },
     DisconnectedReceiver {
         pin: PinRef,
     },
@@ -72,6 +75,11 @@ pub fn geometric_pin_partitions(document: &Document) -> Result<Vec<Vec<PinRef>>,
     let mut components = HashMap::new();
     let mut placed = Vec::new();
     for component in &document.components {
+        if component.wide_shape && !crate::components::supports_wide_shape(component.kind) {
+            return Err(CompileError::InvalidWideShapeConfiguration {
+                component: component.id,
+            });
+        }
         if components.insert(component.id, ()).is_some() {
             return Err(CompileError::DuplicateComponent(component.id));
         }
@@ -136,6 +144,11 @@ pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
         return Err(CompileError::WorkLimit);
     }
     for component in &document.components {
+        if component.wide_shape && !crate::components::supports_wide_shape(component.kind) {
+            return Err(CompileError::InvalidWideShapeConfiguration {
+                component: component.id,
+            });
+        }
         if component.kind != ComponentKind::Const && !component.constant_value {
             return Err(CompileError::InvalidConstantConfiguration {
                 component: component.id,
@@ -243,6 +256,7 @@ mod tests {
             },
             label: String::new(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         }
@@ -253,6 +267,27 @@ mod tests {
             pin: PinId { direction, index },
         }
     }
+    #[test]
+    fn wide_shape_on_unsupported_component_is_rejected_at_compile_boundary() {
+        let mut doc = Document {
+            components: vec![component(4, ComponentKind::Not)],
+            wires: crate::domain::Wiring::default(),
+        };
+        doc.components[0].wide_shape = true;
+        assert_eq!(
+            compile(&doc),
+            Err(CompileError::InvalidWideShapeConfiguration {
+                component: ComponentId(4)
+            })
+        );
+        assert_eq!(
+            geometric_pin_partitions(&doc),
+            Err(CompileError::InvalidWideShapeConfiguration {
+                component: ComponentId(4)
+            })
+        );
+    }
+
     #[test]
     fn non_const_non_default_value_is_rejected_at_compile_boundary() {
         let mut invalid = component(7, ComponentKind::Input);
@@ -503,6 +538,7 @@ mod tests {
                 },
                 label: String::new(),
                 constant_value: true,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }

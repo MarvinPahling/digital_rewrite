@@ -22,19 +22,28 @@ const PICK_TOLERANCE: f32 = 2.0;
 /// Positions are artwork-bounds centers, but Digital places on the logical origin grid. Convert
 /// through each symbol's shared bounds offset before snapping so asymmetric artwork stays aligned.
 fn snap_component_center(style: SymbolStyle, kind: ComponentKind, x: f32, y: f32) -> Position {
-    snap_component_center_oriented(style, kind, crate::domain::Orientation::default(), x, y)
+    snap_component_center_oriented(
+        style,
+        kind,
+        crate::domain::Orientation::default(),
+        false,
+        x,
+        y,
+    )
 }
 fn snap_component_center_oriented(
     _style: SymbolStyle,
     kind: ComponentKind,
     orientation: crate::domain::Orientation,
+    wide: bool,
     x: f32,
     y: f32,
 ) -> Position {
-    let offset = crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)
-        .and_then(|d| orientation.transform_f32(d[0], d[1]))
-        .map(|p| [p.0, p.1])
-        .unwrap_or([0.0, 0.0]);
+    let offset =
+        crate::symbols::center_from_origin_offset_config(crate::symbols::DEFAULT_STYLE, kind, wide)
+            .and_then(|d| orientation.transform_f32(d[0], d[1]))
+            .map(|p| [p.0, p.1])
+            .unwrap_or([0.0, 0.0]);
     let snap = |coordinate: f32, center_offset: f32| {
         let origin = coordinate - center_offset;
         (origin / GRID_UNIT).round() * GRID_UNIT + center_offset
@@ -298,6 +307,11 @@ pub struct DigitalApp {
 struct LabelDraft {
     id: ComponentId,
     text: String,
+    value: bool,
+    rotation: u8,
+    mirror: bool,
+    wide_shape: bool,
+    kind: ComponentKind,
     error: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,7 +437,7 @@ impl DigitalApp {
                     crate::symbol_render::MAX_EXACT_SYMBOL_CENTER
                 ));
             }
-            let layout = SymbolLayout::oriented_on(
+            let layout = SymbolLayout::oriented_config_on(
                 self.style,
                 component.kind,
                 [component.position.x, component.position.y],
@@ -431,6 +445,7 @@ impl DigitalApp {
                     rotation: component.rotation,
                     mirror: component.mirror,
                 },
+                component.wide_shape,
             )
             .ok_or_else(|| format!("No geometry for {}", component.kind.name()))?;
             let bounds = layout.bounds();
@@ -728,7 +743,7 @@ fn document_view_bounds(
                 crate::symbol_render::MAX_EXACT_SYMBOL_CENTER
             ));
         }
-        let Some(layout) = SymbolLayout::oriented_on(
+        let Some(layout) = SymbolLayout::oriented_config_on(
             style,
             c.kind,
             [c.position.x, c.position.y],
@@ -736,6 +751,7 @@ fn document_view_bounds(
                 rotation: c.rotation,
                 mirror: c.mirror,
             },
+            c.wide_shape,
         ) else {
             return Err(format!(
                 "Cannot fit: missing symbol geometry for {}",
@@ -855,20 +871,25 @@ impl DigitalApp {
         let Some(id) = self.selected else {
             return;
         };
-        let Some(text) = self
+        let Some(component) = self
             .session
             .document()
             .components
             .iter()
             .find(|component| component.id == id)
-            .map(|component| component.label.clone())
+            .cloned()
         else {
             return;
         };
         self.cancel_gestures();
         self.label_modal = Some(LabelDraft {
             id,
-            text,
+            text: component.label,
+            value: component.constant_value,
+            rotation: component.rotation,
+            mirror: component.mirror,
+            wide_shape: component.wide_shape,
+            kind: component.kind,
             error: None,
         });
     }
@@ -878,15 +899,37 @@ impl DigitalApp {
         }
     }
     fn finish_label_edit(&mut self) {
-        let Some((id, text)) = self
-            .label_modal
-            .as_ref()
-            .map(|draft| (draft.id, draft.text.clone()))
-        else {
+        let Some(draft) = self.label_modal.as_ref().cloned() else {
             return;
         };
-        match self.session.set_label(id, &text) {
-            Ok(()) => {
+        let mut changes = vec![
+            crate::components::AttributeChange::new(
+                crate::components::AttributeId::Label,
+                crate::components::AttributeValue::Label(draft.text.clone()),
+            ),
+            crate::components::AttributeChange::new(
+                crate::components::AttributeId::Rotation,
+                crate::components::AttributeValue::Rotation(draft.rotation),
+            ),
+            crate::components::AttributeChange::new(
+                crate::components::AttributeId::Mirror,
+                crate::components::AttributeValue::Mirror(draft.mirror),
+            ),
+        ];
+        if crate::components::has_attribute(draft.kind, crate::components::AttributeId::Value) {
+            changes.push(crate::components::AttributeChange::new(
+                crate::components::AttributeId::Value,
+                crate::components::AttributeValue::Value(draft.value),
+            ));
+        }
+        if crate::components::has_attribute(draft.kind, crate::components::AttributeId::WideShape) {
+            changes.push(crate::components::AttributeChange::new(
+                crate::components::AttributeId::WideShape,
+                crate::components::AttributeValue::WideShape(draft.wide_shape),
+            ));
+        }
+        match self.session.set_component_attributes(draft.id, &changes) {
+            Ok(_) => {
                 self.error = None;
                 self.cancel_label_edit();
             }
@@ -1297,17 +1340,21 @@ impl DigitalApp {
             self.finish_label_edit();
         }
         let mut action = None;
-        egui::Modal::new(egui::Id::new("component_label_modal")).show(ctx, |ui| {
-            ui.set_min_width(380.);
+        egui::Modal::new(egui::Id::new("component_attributes_modal")).show(ctx, |ui| {
+            ui.set_min_width(420.);
             if let Some(draft) = self.label_modal.as_mut() {
-                ui.heading(format!("Edit label — component #{}", draft.id.0));
+                ui.heading(format!("Edit attributes — component #{}", draft.id.0));
                 ui.add(
                     egui::TextEdit::multiline(&mut draft.text)
                         .desired_rows(5)
                         .desired_width(f32::INFINITY)
                         .hint_text("Component label"),
                 );
-                ui.label(format!("{} / 4096 UTF-8 bytes", draft.text.len()));
+                ui.label(format!("Label: {} / 4096 UTF-8 bytes", draft.text.len()));
+                if crate::components::has_attribute(draft.kind, crate::components::AttributeId::Value) { ui.horizontal(|ui| { ui.label("Value"); ui.selectable_value(&mut draft.value, false, "LOW (0)"); ui.selectable_value(&mut draft.value, true, "HIGH (1)"); }); }
+                ui.horizontal(|ui| { ui.label("Rotation"); egui::ComboBox::from_id_salt("attribute_rotation").selected_text(["0°", "90°", "180°", "270°"][draft.rotation as usize]).show_ui(ui, |ui| { for (turn, label) in ["0°", "90°", "180°", "270°"].into_iter().enumerate() { ui.selectable_value(&mut draft.rotation, turn as u8, label); } }); ui.checkbox(&mut draft.mirror, "Mirror"); });
+                if crate::components::has_attribute(draft.kind, crate::components::AttributeId::WideShape) { ui.checkbox(&mut draft.wide_shape, "Wide shape"); }
+                ui.small("Inputs are fixed at 2; input inversion and Bits are not supported here. NOT wideShape uses different geometry and is unsupported.");
                 if let Err(error) = crate::domain::validate_label(&draft.text) {
                     ui.colored_label(ui.visuals().error_fg_color, error.to_string());
                 }
@@ -2030,7 +2077,7 @@ impl DigitalApp {
                             if ui.add_enabled(!locked && !value, egui::Button::new("Set HIGH (1)" )).clicked() { let _ = self.session.set_constant_value(id, true); }
                         });
                     }
-                    if ui.add_enabled(!locked, egui::Button::new("Edit label… (F2)")).clicked() {
+                    if ui.add_enabled(!locked, egui::Button::new("Edit attributes… (F2)")).clicked() {
                         self.begin_label_edit();
                     }
                 }
@@ -2390,7 +2437,7 @@ impl DigitalApp {
                 .iter()
                 .flat_map(|c| {
                     let layout =
-                        SymbolLayout::oriented_on(style, c.kind, [c.position.x, c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror });
+                        SymbolLayout::oriented_config_on(style, c.kind, [c.position.x, c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }, c.wide_shape);
                     [PinDirection::Input, PinDirection::Output]
                         .into_iter()
                         .flat_map(move |direction| {
@@ -2442,7 +2489,7 @@ impl DigitalApp {
                         .iter()
                         .rev()
                         .find(|c| {
-                            SymbolLayout::oriented_on(style, c.kind, [c.position.x, c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror })
+                            SymbolLayout::oriented_config_on(style, c.kind, [c.position.x, c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }, c.wide_shape)
                                 .is_some_and(|layout| layout.hit(world, tolerance))
                         })
                         .map(|c| (c.id, c.position));
@@ -2545,7 +2592,7 @@ impl DigitalApp {
                 let (snapped_dx, snapped_dy) = if self.selection.components.len()==1 && self.selection.wires.is_empty() {
                     let id=self.selection.components.iter().next().copied();
                     let component=id.and_then(|id| self.session.document().components.iter().find(|c| c.id==id));
-                    component.map(|component| { let snapped=snap_component_center_oriented(style,component.kind,crate::domain::Orientation{rotation:component.rotation,mirror:component.mirror},start.x+dx,start.y+dy); ((snapped.x-start.x) as i32,(snapped.y-start.y) as i32) }).unwrap_or(((dx/20.).round() as i32*20,(dy/20.).round() as i32*20))
+                    component.map(|component| { let snapped=snap_component_center_oriented(style,component.kind,crate::domain::Orientation{rotation:component.rotation,mirror:component.mirror},component.wide_shape,start.x+dx,start.y+dy); ((snapped.x-start.x) as i32,(snapped.y-start.y) as i32) }).unwrap_or(((dx/20.).round() as i32*20,(dy/20.).round() as i32*20))
                 } else { ((dx/20.).round() as i32*20,(dy/20.).round() as i32*20) };
                 match self.session.move_selection(&self.selection, snapped_dx, snapped_dy) {
                     Ok(_) => {
@@ -2567,7 +2614,7 @@ impl DigitalApp {
                 let world_rect = crate::selection::Rect::normalized(transform.to_world(start), transform.to_world(end));
                 let doc = self.session.document();
                 let components = doc.components.iter().filter_map(|c| {
-                    SymbolLayout::oriented_on(style, c.kind, [c.position.x,c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }).map(|layout| { let b=layout.bounds(); (c.id,b.min,b.max) })
+                    SymbolLayout::oriented_config_on(style, c.kind, [c.position.x,c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }, c.wide_shape).map(|layout| { let b=layout.bounds(); (c.id,b.min,b.max) })
                 }).collect::<Vec<_>>();
                 let wires = doc.wires.geometric().map(|s| s.to_vec()).unwrap_or_default();
                 self.selection.apply_marquee(crate::selection::marquee(components,&wires,world_rect), modifiers.shift, modifiers.command || modifiers.ctrl);
@@ -2585,7 +2632,7 @@ impl DigitalApp {
                 let [dx,dy]=transform.delta_to_world(p-origin);
                 if self.selection.components.len()==1 && self.selection.wires.is_empty() && drag_id != ComponentId(u64::MAX) {
                     let component=self.selection.components.iter().next().and_then(|id| self.session.document().components.iter().find(|c| c.id==*id));
-                    component.map(|component| { let snapped=snap_component_center_oriented(style,component.kind,crate::domain::Orientation{rotation:component.rotation,mirror:component.mirror},start.x+dx,start.y+dy); [snapped.x-start.x,snapped.y-start.y] }).unwrap_or([((dx/20.).round()*20.),((dy/20.).round()*20.)])
+                    component.map(|component| { let snapped=snap_component_center_oriented(style,component.kind,crate::domain::Orientation{rotation:component.rotation,mirror:component.mirror},component.wide_shape,start.x+dx,start.y+dy); [snapped.x-start.x,snapped.y-start.y] }).unwrap_or([((dx/20.).round()*20.),((dy/20.).round()*20.)])
                 } else { [((dx/20.).round()*20.),((dy/20.).round()*20.)] }
             } else {[0.,0.]};
             // Use a single snapped preview delta for every selected symbol and endpoint.
@@ -2699,7 +2746,7 @@ impl DigitalApp {
                 }
                 let affected = self.session.oscillation_diagnostic().is_some_and(|diagnostic| diagnostic.components.iter().any(|component| component.id == c.id));
                 let state = if affected { PaintState::Error } else if self.selection.components.contains(&c.id) || self.selected == Some(c.id) { PaintState::Selection } else { PaintState::Ink };
-                let Some(layout) = SymbolLayout::oriented_on(style, c.kind, [pos.x, pos.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }) else {
+                let Some(layout) = SymbolLayout::oriented_config_on(style, c.kind, [pos.x, pos.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }, c.wide_shape) else {
                     self.error = Some(if [pos.x, pos.y].into_iter().any(|value| value.abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER) {
                         format!("Component #{} is outside exact symbol-rendering range (±{} world units); its precise pin/wire coordinates are retained but canvas geometry is withheld", c.id.0, crate::symbol_render::MAX_EXACT_SYMBOL_CENTER)
                     } else {
@@ -2714,7 +2761,7 @@ impl DigitalApp {
                         | ComponentKind::NOr
                         | ComponentKind::XOr
                         | ComponentKind::XNOr
-                ) {
+                ) || c.wide_shape {
                     // No cleared IEEE artwork is available for these gates. Keep one shared
                     // bounds/anchor/picking layout and render an explicit named text box instead
                     // of misleadingly reusing a plain AND/OR symbol.
@@ -2833,8 +2880,8 @@ impl DigitalApp {
                         ], Stroke::new(2.0_f32, palette.selection));
                     }
                     for component in &document.components {
-                        if let Some(layout) = SymbolLayout::oriented_on(style, component.kind, [component.position.x, component.position.y], crate::domain::Orientation { rotation: component.rotation, mirror: component.mirror }) {
-                            if matches!(component.kind, ComponentKind::Const | ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XOr | ComponentKind::XNOr) {
+                        if let Some(layout) = SymbolLayout::oriented_config_on(style, component.kind, [component.position.x, component.position.y], crate::domain::Orientation { rotation: component.rotation, mirror: component.mirror }, component.wide_shape) {
+                            if component.wide_shape || matches!(component.kind, ComponentKind::Const | ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XOr | ComponentKind::XNOr) {
                                 let bounds = layout.bounds();
                                 let screen = Rect::from_min_max(transform.to_screen(bounds.min), transform.to_screen(bounds.max));
                                 painter.rect_stroke(screen, 3.0, Stroke::new(STROKE_WIDTH, palette.selection), egui::StrokeKind::Inside);
@@ -3400,6 +3447,7 @@ mod tests {
                 y: 0,
                 label: None,
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3450,6 +3498,7 @@ mod tests {
                     y: -not_offset.1,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 }],
@@ -3571,6 +3620,7 @@ mod tests {
                 y: 0,
                 label: Some("Hover paste".into()),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3658,6 +3708,7 @@ mod tests {
                 y: 0,
                 label: Some("Must not insert".into()),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3714,6 +3765,7 @@ mod tests {
                 y: 0,
                 label: Some("Must not insert".into()),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -3812,6 +3864,7 @@ mod tests {
                 y: 0,
                 label: Some("Paste λ".into()),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -7361,6 +7414,7 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -7370,6 +7424,7 @@ mod tests {
                     y: 80,
                     label: None,
                     value: None,
+                    wide_shape: false,
                     rotation: 0,
                     mirror: false,
                 },
@@ -7927,6 +7982,58 @@ mod tests {
     }
 
     #[test]
+    fn attributes_dialog_is_descriptor_driven_and_applies_one_atomic_edit() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let id = app
+            .session
+            .place(ComponentKind::And, Position { x: 100., y: 100. })
+            .unwrap();
+        app.selected = Some(id);
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
+        assert!(app.label_modal.is_some());
+        let shown = frame(&ctx, &mut app, vec![], true);
+        for text in [
+            "Edit attributes",
+            "Label",
+            "Rotation",
+            "Mirror",
+            "Wide shape",
+            "Inputs are fixed at 2",
+            "Apply",
+            "Cancel",
+        ] {
+            assert!(
+                has_text(&shown, text),
+                "missing {text}: {:?}",
+                texts(&shown)
+            );
+        }
+        let draft = app.label_modal.as_mut().unwrap();
+        draft.text = "wide gate".into();
+        draft.rotation = 1;
+        draft.mirror = true;
+        draft.wide_shape = true;
+        click_text(&ctx, &mut app, "Apply");
+        let component = &app.session.document().components[0];
+        assert_eq!(component.id, id);
+        assert_eq!(component.label, "wide gate");
+        assert_eq!(
+            (component.rotation, component.mirror, component.wide_shape),
+            (1, true, true)
+        );
+        app.session.undo().unwrap();
+        assert_eq!(
+            (
+                app.session.document().components[0].rotation,
+                app.session.document().components[0].mirror,
+                app.session.document().components[0].wide_shape
+            ),
+            (0, false, false)
+        );
+    }
+
+    #[test]
     fn label_editor_modal_applies_cancels_validates_and_blocks_every_background_route() {
         let ctx = egui::Context::default();
         let mut app = DigitalApp::default();
@@ -7936,7 +8043,7 @@ mod tests {
             .unwrap();
         app.selected = Some(id);
         let original = app.session.document().clone();
-        click_text(&ctx, &mut app, "Edit label… (F2)");
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
         assert!(app.label_modal.is_some());
         assert_eq!(app.label_modal.as_ref().unwrap().text, "Output");
         app.label_modal.as_mut().unwrap().text = "invalid\u{1}".into();
@@ -7979,7 +8086,7 @@ mod tests {
         assert!(app.label_modal.is_none());
 
         app.selected = Some(id);
-        click_text(&ctx, &mut app, "Edit label… (F2)");
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
         app.label_modal.as_mut().unwrap().text = "Résultat & <Q>".into();
         frame(
             &ctx,
@@ -8175,7 +8282,7 @@ mod tests {
             .id;
         click_at(&ctx, &mut app, Pos2::new(508., 108.));
         assert_eq!(app.selected, Some(output));
-        click_text(&ctx, &mut app, "Edit label… (F2)");
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
         assert!(app.label_modal.is_some());
         let modal = frame(&ctx, &mut app, vec![], true);
         let text_pos = modal
@@ -8311,7 +8418,7 @@ mod tests {
         let output_pos = component_screen(&app, output);
         click_at(&ctx, &mut app, output_pos);
         assert_eq!(app.selected, Some(output));
-        click_text(&ctx, &mut app, "Edit label… (F2)");
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
         assert!(
             app.label_modal.is_none(),
             "label editing must be disabled during simulation"
@@ -8320,7 +8427,7 @@ mod tests {
         assert!(app.session.simulation_active());
         assert_eq!(*app.session.document(), document);
         press(&ctx, &mut app, egui::Key::F5, egui::Modifiers::SHIFT);
-        click_text(&ctx, &mut app, "Edit label… (F2)");
+        click_text(&ctx, &mut app, "Edit attributes… (F2)");
         let modal = frame(&ctx, &mut app, vec![], true);
         let text_pos = modal
             .shapes
@@ -8520,6 +8627,7 @@ mod tests {
                 y: 100,
                 label: Some("preview".into()),
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             }],
@@ -8566,7 +8674,7 @@ mod tests {
             };
             assert_ne!(preview.components, app.session.document().components);
             let preview_component = &preview.components[0];
-            let preview_layout = SymbolLayout::oriented_on(
+            let preview_layout = SymbolLayout::oriented_config_on(
                 app.style,
                 preview_component.kind,
                 [preview_component.position.x, preview_component.position.y],
@@ -8574,6 +8682,7 @@ mod tests {
                     rotation: preview_component.rotation,
                     mirror: preview_component.mirror,
                 },
+                preview_component.wide_shape,
             )
             .unwrap();
             let preview_bounds = preview_layout.bounds();
@@ -8591,7 +8700,7 @@ mod tests {
                 );
             }
             let committed_component = &app.session.document().components[0];
-            let committed_layout = SymbolLayout::oriented_on(
+            let committed_layout = SymbolLayout::oriented_config_on(
                 app.style,
                 committed_component.kind,
                 [
@@ -8602,6 +8711,7 @@ mod tests {
                     rotation: committed_component.rotation,
                     mirror: committed_component.mirror,
                 },
+                committed_component.wide_shape,
             )
             .unwrap();
             assert_eq!(committed_component.position, preview_component.position);

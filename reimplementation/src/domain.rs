@@ -149,6 +149,8 @@ pub struct Component {
     pub label: String,
     /// Configured one-bit constant output; meaningful only for `Const`, defaults HIGH.
     pub constant_value: bool,
+    /// Digital's generic gate shape option; meaningful only for the six binary gates.
+    pub wide_shape: bool,
     pub rotation: u8,
     pub mirror: bool,
 }

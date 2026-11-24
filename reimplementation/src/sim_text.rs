@@ -74,6 +74,10 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
             "Component {} has a non-default constant configuration, but only Const components support it.",
             component_name(document, *component)
         ),
+        CompileError::InvalidWideShapeConfiguration { component } => format!(
+            "Component {} has unsupported wideShape attributes; wide shapes apply only to binary gates.",
+            component_name(document, *component)
+        ),
         CompileError::DisconnectedReceiver { pin } => {
             format!("{} is disconnected.", pin_name(document, *pin))
         }
@@ -241,6 +245,7 @@ mod tests {
             position: Position { x: 0., y: 0. },
             label: label.into(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         };

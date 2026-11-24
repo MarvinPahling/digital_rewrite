@@ -1359,6 +1359,7 @@ mod tests {
             },
             label: String::new(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         }

@@ -21,7 +21,7 @@ use crate::domain::{ComponentKind, PinDirection, PinId};
 use crate::{
     canvas::CanvasTransform,
     symbol_tessellate::{PathLayer, TessellateError, tessellate_path},
-    symbols::{Point, PortDirection, SymbolBounds, SymbolDef, SymbolStyle, symbol},
+    symbols::{Point, PortDirection, SymbolBounds, SymbolDef, SymbolStyle},
 };
 use eframe::egui::{
     Color32, Mesh, Painter, Shape, Visuals,
@@ -96,21 +96,35 @@ impl SymbolLayout {
         Self::oriented_on(style, kind, center, crate::domain::Orientation::default())
     }
 
+    #[cfg(test)]
     pub fn oriented_on(
         style: SymbolStyle,
         kind: ComponentKind,
         center: Point,
         orientation: crate::domain::Orientation,
     ) -> Option<Self> {
-        let def = symbol(style, kind)?;
+        Self::oriented_config_on(style, kind, center, orientation, false)
+    }
+
+    pub fn oriented_config_on(
+        style: SymbolStyle,
+        kind: ComponentKind,
+        center: Point,
+        orientation: crate::domain::Orientation,
+        wide: bool,
+    ) -> Option<Self> {
+        let def = crate::symbols::symbol_with_wide(style, kind, wide)?;
         if center
             .iter()
             .any(|coordinate| !coordinate.is_finite() || coordinate.abs() > MAX_EXACT_SYMBOL_CENTER)
         {
             return None;
         }
-        let offset =
-            crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)?;
+        let offset = crate::symbols::center_from_origin_offset_config(
+            crate::symbols::DEFAULT_STYLE,
+            kind,
+            wide,
+        )?;
         let (ox, oy) = orientation.transform_f32(offset[0], offset[1])?;
         Some(Self {
             def,
@@ -442,6 +456,63 @@ mod tests {
                 .collect()
             };
             assert_eq!(pins(SymbolStyle::Rect), pins(SymbolStyle::Ieee), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn wide_layouts_keep_pin_geometry_and_style_parity_without_scaling_artwork() {
+        for kind in [
+            ComponentKind::And,
+            ComponentKind::NAnd,
+            ComponentKind::Or,
+            ComponentKind::NOr,
+            ComponentKind::XOr,
+            ComponentKind::XNOr,
+        ] {
+            let mut layouts = Vec::new();
+            for style in STYLES {
+                let layout = SymbolLayout::oriented_config_on(
+                    style,
+                    kind,
+                    [200., 100.],
+                    crate::domain::Orientation::default(),
+                    true,
+                )
+                .unwrap();
+                let anchors = layout
+                    .anchors()
+                    .map(|a| (a.name, a.position))
+                    .collect::<Vec<_>>();
+                layouts.push((layout.bounds(), anchors));
+            }
+            assert_eq!(layouts[0], layouts[1]);
+            let inverted = matches!(
+                kind,
+                ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr
+            );
+            assert_eq!(
+                layouts[0].0.max[0] - layouts[0].0.min[0],
+                if inverted { 100. } else { 80. }
+            );
+            let origin_x = 200. - if inverted { 50. } else { 40. };
+            assert_eq!(
+                layouts[0]
+                    .1
+                    .iter()
+                    .find(|(name, _)| *name == "pin-in-0")
+                    .unwrap()
+                    .1,
+                [origin_x, 80.]
+            );
+            assert_eq!(
+                layouts[0]
+                    .1
+                    .iter()
+                    .find(|(name, _)| *name == "pin-out-0")
+                    .unwrap()
+                    .1[0],
+                if inverted { 250. } else { 240. }
+            );
         }
     }
 

@@ -84,6 +84,7 @@ pub enum EditError {
     UnknownComponent,
     WrongComponentKind,
     InvalidLabel(LabelError),
+    InvalidAttribute(crate::components::AttributeError),
     IdExhausted,
     InvalidPin,
     SameEndpoint,
@@ -100,6 +101,7 @@ impl std::fmt::Display for EditError {
             Self::UnknownComponent => "Unknown component",
             Self::WrongComponentKind => "Operation requires a Const component",
             Self::InvalidLabel(error) => return write!(f, "Invalid component label: {error}"),
+            Self::InvalidAttribute(error) => return error.fmt(f),
             Self::IdExhausted => "No component IDs remaining",
             Self::InvalidPin => "Invalid pin",
             Self::SameEndpoint => "Wire endpoints must differ",
@@ -229,6 +231,26 @@ fn validate_component_pin_geometry(component: &Component) -> Result<(), EditErro
                 "component pin is not exactly representable",
             ))
         })
+}
+
+fn component_origin(component: &Component) -> Result<(i32, i32), EditError> {
+    let (x, y) = crate::pin_geometry::origin_to_center_offset(component.kind)
+        .map_err(|_| EditError::WrongComponentKind)?;
+    let wide = if component.wide_shape { 10 } else { 0 };
+    let o = crate::domain::Orientation {
+        rotation: component.rotation,
+        mirror: component.mirror,
+    }
+    .transform(x.checked_add(wide).ok_or(EditError::InvalidPosition)?, y)
+    .ok_or(EditError::InvalidPosition)?;
+    Ok((
+        exact_position(component.position.x)?
+            .checked_sub(o.0)
+            .ok_or(EditError::InvalidPosition)?,
+        exact_position(component.position.y)?
+            .checked_sub(o.1)
+            .ok_or(EditError::InvalidPosition)?,
+    ))
 }
 
 fn exact_position(value: f32) -> Result<i32, EditError> {
@@ -1036,6 +1058,7 @@ impl Session {
             position,
             label: kind.name().into(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         };
@@ -1045,57 +1068,133 @@ impl Session {
         self.next_id = next_id;
         Ok(id)
     }
-    /// Set a constant's configured one-bit level; runtime values are independent.
-    pub fn set_constant_value(&mut self, id: ComponentId, value: bool) -> Result<(), EditError> {
+    /// Apply multiple typed attributes as one validated, atomic history transaction.
+    pub fn set_component_attributes(
+        &mut self,
+        id: ComponentId,
+        changes: &[crate::components::AttributeChange],
+    ) -> Result<bool, EditError> {
+        use crate::components::{AttributeError as AE, AttributeId as I, AttributeValue as V};
         self.ensure_editable()?;
-        let Some(component) = self
-            .document
-            .components
-            .iter()
-            .find(|component| component.id == id)
-        else {
-            return Err(EditError::UnknownComponent);
-        };
-        if component.kind != ComponentKind::Const {
-            return Err(EditError::WrongComponentKind);
-        }
-        if component.constant_value == value {
-            return Ok(());
-        }
-        let mut next = self.document.clone();
-        next.components
-            .iter_mut()
-            .find(|component| component.id == id)
-            .ok_or(EditError::UnknownComponent)?
-            .constant_value = value;
-        self.edit(next);
-        Ok(())
-    }
-    /// Change only the selected component's label. Lock and identity checks precede validation;
-    /// validation completes before any document/history mutation.
-    pub fn set_label(&mut self, id: ComponentId, label: &str) -> Result<(), EditError> {
-        self.ensure_editable()?;
-        let Some(component) = self
-            .document
-            .components
-            .iter()
-            .find(|component| component.id == id)
-        else {
-            return Err(EditError::UnknownComponent);
-        };
-        crate::domain::validate_label(label).map_err(EditError::InvalidLabel)?;
-        if component.label == label {
-            return Ok(());
-        }
         let mut next = self.document.clone();
         let component = next
             .components
             .iter_mut()
-            .find(|component| component.id == id)
+            .find(|c| c.id == id)
             .ok_or(EditError::UnknownComponent)?;
-        component.label = label.to_owned();
-        self.edit(next);
-        Ok(())
+        let mut seen = std::collections::BTreeSet::new();
+        for change in changes {
+            if !seen.insert(change.id) {
+                return Err(EditError::InvalidAttribute(AE::Duplicate(change.id)));
+            }
+            let bad = |error| EditError::InvalidAttribute(error);
+            match (change.id, &change.value) {
+                (I::Label, V::Label(value)) => {
+                    crate::domain::validate_label(value).map_err(EditError::InvalidLabel)?
+                }
+                (I::Value, V::Value(_)) if component.kind == ComponentKind::Const => {}
+                (I::Rotation, V::Rotation(value)) if *value <= 3 => {}
+                (I::Mirror, V::Mirror(_)) => {}
+                (I::WideShape, V::WideShape(_))
+                    if crate::components::supports_wide_shape(component.kind) => {}
+                (I::Inputs, _) => return Err(bad(AE::Unsupported(I::Inputs))),
+                (I::Value, V::Value(_)) => return Err(bad(AE::WrongKind(I::Value))),
+                (I::WideShape, V::WideShape(_)) => return Err(bad(AE::WrongKind(I::WideShape))),
+                (I::Rotation, V::Rotation(_)) => {
+                    return Err(bad(AE::Invalid(
+                        I::Rotation,
+                        "rotation must be 0 through 3".into(),
+                    )));
+                }
+                (key, _) => return Err(bad(AE::WrongType(key))),
+            }
+        }
+        let before = component.clone();
+        for change in changes {
+            match (&change.id, &change.value) {
+                (I::Label, V::Label(value)) => component.label = value.clone(),
+                (I::Value, V::Value(value)) => component.constant_value = *value,
+                (I::Rotation, V::Rotation(value)) => component.rotation = *value,
+                (I::Mirror, V::Mirror(value)) => component.mirror = *value,
+                (I::WideShape, V::WideShape(value)) => component.wide_shape = *value,
+                _ => unreachable!("attribute types validated before application"),
+            }
+        }
+        if *component != before {
+            let old_origin = component_origin(&before)?;
+            let offset = crate::pin_geometry::origin_to_center_offset(component.kind)
+                .map_err(|_| EditError::WrongComponentKind)?;
+            let transformed = crate::domain::Orientation {
+                rotation: component.rotation,
+                mirror: component.mirror,
+            }
+            .transform(offset.0, offset.1)
+            .ok_or(EditError::InvalidPosition)?;
+            // The wide generic shape extends rightward 20 world units; its logical center shifts 10.
+            let wide_delta = if component.wide_shape { 10 } else { 0 };
+            let shift = crate::domain::Orientation {
+                rotation: component.rotation,
+                mirror: component.mirror,
+            }
+            .transform(wide_delta, 0)
+            .ok_or(EditError::InvalidPosition)?;
+            let x = old_origin
+                .0
+                .checked_add(transformed.0)
+                .and_then(|v| v.checked_add(shift.0))
+                .ok_or(EditError::InvalidPosition)?;
+            let y = old_origin
+                .1
+                .checked_add(transformed.1)
+                .and_then(|v| v.checked_add(shift.1))
+                .ok_or(EditError::InvalidPosition)?;
+            component.position = Position {
+                x: x as f32,
+                y: y as f32,
+            };
+            if f64::from(component.position.x) != f64::from(x)
+                || f64::from(component.position.y) != f64::from(y)
+            {
+                return Err(EditError::InvalidPosition);
+            }
+            validate_component_pin_geometry(component)?;
+            self.edit(next);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn set_constant_value(&mut self, id: ComponentId, value: bool) -> Result<(), EditError> {
+        self.ensure_editable()?;
+        if self
+            .document
+            .components
+            .iter()
+            .find(|component| component.id == id)
+            .ok_or(EditError::UnknownComponent)?
+            .kind
+            != ComponentKind::Const
+        {
+            return Err(EditError::WrongComponentKind);
+        }
+        self.set_component_attributes(
+            id,
+            &[crate::components::AttributeChange::new(
+                crate::components::AttributeId::Value,
+                crate::components::AttributeValue::Value(value),
+            )],
+        )
+        .map(|_| ())
+    }
+    pub fn set_label(&mut self, id: ComponentId, label: &str) -> Result<(), EditError> {
+        self.set_component_attributes(
+            id,
+            &[crate::components::AttributeChange::new(
+                crate::components::AttributeId::Label,
+                crate::components::AttributeValue::Label(label.to_owned()),
+            )],
+        )
+        .map(|_| ())
     }
     pub fn move_component(&mut self, id: ComponentId, position: Position) -> Result<(), EditError> {
         self.ensure_editable()?;
@@ -1127,7 +1226,7 @@ impl Session {
         self.edit(next);
         Ok(())
     }
-    /// Change one component's local orientation while preserving its logical origin.
+    /// Change orientation through the same typed, atomic attribute transaction.
     pub fn set_component_orientation(
         &mut self,
         id: ComponentId,
@@ -1138,55 +1237,19 @@ impl Session {
         if rotation > 3 {
             return Err(EditError::InvalidPosition);
         }
-        let mut next = self.document.clone();
-        let component = next
-            .components
-            .iter_mut()
-            .find(|c| c.id == id)
-            .ok_or(EditError::UnknownComponent)?;
-        if component.rotation == rotation && component.mirror == mirror {
-            return Ok(false);
-        }
-        let center = crate::pin_geometry::origin_to_center_offset(component.kind)
-            .map_err(|_| EditError::WrongComponentKind)?;
-        let offset = |c: &Component| -> Result<(i32, i32), EditError> {
-            let d = crate::pin_geometry::origin_to_center_offset(c.kind)
-                .map_err(|_| EditError::WrongComponentKind)?;
-            crate::domain::Orientation {
-                rotation: c.rotation,
-                mirror: c.mirror,
-            }
-            .transform(d.0, d.1)
-            .ok_or(EditError::InvalidPosition)
-        };
-        let old = offset(component)?;
-        let ox = exact_position(component.position.x)?
-            .checked_sub(old.0)
-            .ok_or(EditError::InvalidPosition)?;
-        let oy = exact_position(component.position.y)?
-            .checked_sub(old.1)
-            .ok_or(EditError::InvalidPosition)?;
-        let new_orientation = crate::domain::Orientation { rotation, mirror };
-        let new_offset = new_orientation
-            .transform(center.0, center.1)
-            .ok_or(EditError::InvalidPosition)?;
-        let x = ox
-            .checked_add(new_offset.0)
-            .ok_or(EditError::InvalidPosition)?;
-        let y = oy
-            .checked_add(new_offset.1)
-            .ok_or(EditError::InvalidPosition)?;
-        let px = x as f32;
-        let py = y as f32;
-        if f64::from(px) != f64::from(x) || f64::from(py) != f64::from(y) {
-            return Err(EditError::InvalidPosition);
-        }
-        component.position = Position { x: px, y: py };
-        component.rotation = rotation;
-        component.mirror = mirror;
-        validate_component_pin_geometry(component)?;
-        self.edit(next);
-        Ok(true)
+        self.set_component_attributes(
+            id,
+            &[
+                crate::components::AttributeChange::new(
+                    crate::components::AttributeId::Rotation,
+                    crate::components::AttributeValue::Rotation(rotation),
+                ),
+                crate::components::AttributeChange::new(
+                    crate::components::AttributeId::Mirror,
+                    crate::components::AttributeValue::Mirror(mirror),
+                ),
+            ],
+        )
     }
 
     /// Apply quarter-turns or a world-space vertical mirror to selected objects atomically.
@@ -1215,7 +1278,7 @@ impl Session {
                 .ok_or(EditError::UnknownComponent)?;
             indices.push(i);
             let c = &next.components[i];
-            let offset = crate::pin_geometry::origin_to_center_offset(c.kind)
+            let offset = crate::pin_geometry::origin_to_center_offset_wide(c.kind, c.wide_shape)
                 .map_err(|_| EditError::WrongComponentKind)?;
             let old = crate::domain::Orientation {
                 rotation: c.rotation,
@@ -1231,8 +1294,12 @@ impl Session {
                     .checked_sub(old.1)
                     .ok_or(EditError::InvalidPosition)?,
             );
-            let def = crate::symbols::symbol(crate::symbols::DEFAULT_STYLE, c.kind)
-                .ok_or(EditError::WrongComponentKind)?;
+            let def = crate::symbols::symbol_with_wide(
+                crate::symbols::DEFAULT_STYLE,
+                c.kind,
+                c.wide_shape,
+            )
+            .ok_or(EditError::WrongComponentKind)?;
             let orientation = crate::domain::Orientation {
                 rotation: c.rotation,
                 mirror: c.mirror,
@@ -1326,7 +1393,7 @@ impl Session {
                 .iter()
                 .find(|c| selection.components.contains(&c.id))
                 .ok_or(EditError::UnknownComponent)?;
-            let offset = crate::pin_geometry::origin_to_center_offset(c.kind)
+            let offset = crate::pin_geometry::origin_to_center_offset_wide(c.kind, c.wide_shape)
                 .map_err(|_| EditError::WrongComponentKind)?;
             let old = crate::domain::Orientation {
                 rotation: c.rotation,
@@ -1366,7 +1433,7 @@ impl Session {
         };
         for i in indices {
             let c = &mut next.components[i];
-            let offset = crate::pin_geometry::origin_to_center_offset(c.kind)
+            let offset = crate::pin_geometry::origin_to_center_offset_wide(c.kind, c.wide_shape)
                 .map_err(|_| EditError::WrongComponentKind)?;
             let old = crate::domain::Orientation {
                 rotation: c.rotation,
@@ -3175,6 +3242,147 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn descriptor_attribute_patch_is_atomic_one_history_step_and_noop_preserves_redo() {
+        use crate::components::{AttributeChange as C, AttributeId as I, AttributeValue as V};
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::And, Position { x: 50., y: 20. })
+            .unwrap();
+        let base = session.document().clone();
+        let undo_before = session.undo.len();
+        let patch = [
+            C::new(I::Label, V::Label("A  ".into())),
+            C::new(I::WideShape, V::WideShape(true)),
+            C::new(I::Rotation, V::Rotation(1)),
+            C::new(I::Mirror, V::Mirror(true)),
+        ];
+        assert_eq!(session.set_component_attributes(id, &patch), Ok(true));
+        assert_eq!(session.undo.len(), undo_before + 1);
+        let edited = session.document().components[0].clone();
+        assert!(edited.wide_shape);
+        assert_eq!(edited.label, "A  ");
+        let invalid = [
+            C::new(I::Label, V::Label("would mutate".into())),
+            C::new(I::Rotation, V::Rotation(4)),
+        ];
+        let snapshot = session.document().clone();
+        let undo = session.undo.len();
+        assert!(session.set_component_attributes(id, &invalid).is_err());
+        assert_eq!(session.document(), &snapshot);
+        assert_eq!(session.undo.len(), undo);
+        session.undo().unwrap();
+        assert_eq!(session.document(), &base);
+        session.redo().unwrap();
+        assert_eq!(session.document().components[0], edited);
+        session.undo().unwrap();
+        session.set_label(id, "branch").unwrap();
+        let redo = session.redo.len();
+        assert_eq!(session.set_label(id, "branch"), Ok(()));
+        assert_eq!(session.redo.len(), redo);
+        assert!(matches!(
+            session.set_component_attributes(ComponentId(999), &patch),
+            Err(EditError::UnknownComponent)
+        ));
+        let const_id = session
+            .place(ComponentKind::Const, Position { x: 0., y: 0. })
+            .unwrap();
+        assert!(matches!(
+            session.set_component_attributes(const_id, &patch),
+            Err(EditError::InvalidAttribute(
+                crate::components::AttributeError::WrongKind(_)
+            ))
+        ));
+        let inputs = [C::new(I::Inputs, V::Inputs(2))];
+        assert!(matches!(
+            session.set_component_attributes(id, &inputs),
+            Err(EditError::InvalidAttribute(
+                crate::components::AttributeError::Unsupported(I::Inputs)
+            ))
+        ));
+        let mut locked_session = Session::default();
+        let locked_id = locked_session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        locked_session.start_simulation().unwrap();
+        let locked = locked_session.document().clone();
+        assert_eq!(
+            locked_session.set_component_attributes(locked_id, &[]),
+            Err(EditError::SimulationActive)
+        );
+        assert_eq!(locked_session.document(), &locked);
+    }
+
+    #[test]
+    fn wide_gate_saves_reopens_and_simulates_with_its_extended_output_pin() {
+        use crate::domain::{PinDirection as D, PinId};
+        use crate::file_session::{DiscardIntent, SaveAsIntent};
+        let mut session = Session::default();
+        let a = session
+            .place(ComponentKind::Const, Position { x: 0., y: 0. })
+            .unwrap();
+        let b = session
+            .place(ComponentKind::Const, Position { x: 0., y: 100. })
+            .unwrap();
+        let gate = session
+            .place(ComponentKind::And, Position { x: 200., y: 40. })
+            .unwrap();
+        let out = session
+            .place(ComponentKind::Output, Position { x: 400., y: 40. })
+            .unwrap();
+        session
+            .set_component_attributes(
+                gate,
+                &[crate::components::AttributeChange::new(
+                    crate::components::AttributeId::WideShape,
+                    crate::components::AttributeValue::WideShape(true),
+                )],
+            )
+            .unwrap();
+        let pin = |component, direction, index| PinRef {
+            component,
+            pin: PinId { direction, index },
+        };
+        session
+            .connect([pin(a, D::Output, 0), pin(gate, D::Input, 0)])
+            .unwrap();
+        session
+            .connect([pin(b, D::Output, 0), pin(gate, D::Input, 1)])
+            .unwrap();
+        session
+            .connect([pin(gate, D::Output, 0), pin(out, D::Input, 0)])
+            .unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("digital-rust-wide-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut io = crate::file_session::LocalFileIo::new(&dir);
+        session
+            .save_as(&mut io, Path::new("wide.dig"), SaveAsIntent::CreateOnly)
+            .unwrap();
+        let mut reopened = Session::default();
+        reopened
+            .open_path(&mut io, Path::new("wide.dig"), DiscardIntent::RefuseDirty)
+            .unwrap();
+        assert!(
+            reopened
+                .document()
+                .components
+                .iter()
+                .find(|c| c.id == gate)
+                .unwrap()
+                .wide_shape
+        );
+        assert_eq!(reopened.document().wires, session.document().wires);
+        reopened.start_running_for_test().unwrap();
+        reopened.settle_simulation(1000).unwrap();
+        assert_eq!(
+            reopened.inspect().unwrap().output_value(out),
+            Some(crate::runtime::Level::High)
+        );
+        reopened.stop_simulation().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn self_authored_adder_fixture(full: bool) -> Vec<u8> {
         use crate::formats::{DigElement, DigPoint, DigV2, DigWire};
         let mut elements = Vec::new();
@@ -3191,6 +3399,7 @@ mod tests {
                 y: origin.1 + offset[1] as i32,
                 label: None,
                 value: None,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             });
@@ -3979,6 +4188,7 @@ mod tests {
             position: Position { x: 0., y: 0. },
             label: "NOT".into(),
             constant_value: true,
+            wide_shape: false,
             rotation: 0,
             mirror: false,
         }];
@@ -4022,6 +4232,7 @@ mod tests {
                 },
                 label: format!("N{id}"),
                 constant_value: true,
+                wide_shape: false,
                 rotation: 0,
                 mirror: false,
             })
@@ -4862,7 +5073,8 @@ mod tests {
             .unwrap();
         session.set_component_orientation(id, 1, false).unwrap();
         let c = session.document().components[0].clone();
-        let offset = crate::pin_geometry::origin_to_center_offset(c.kind).unwrap();
+        let offset =
+            crate::pin_geometry::origin_to_center_offset_wide(c.kind, c.wide_shape).unwrap();
         let old = crate::domain::Orientation {
             rotation: c.rotation,
             mirror: c.mirror,
