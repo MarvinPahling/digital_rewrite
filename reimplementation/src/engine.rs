@@ -219,6 +219,13 @@ impl Session {
         }
         let parsed = formats::parse_v2(bytes).map_err(SessionDigError::Read)?;
         let document = formats::to_domain(&parsed).map_err(SessionDigError::Domain)?;
+        self.install_opened_document(document, None)
+    }
+    fn install_opened_document(
+        &mut self,
+        document: Document,
+        path: Option<PathBuf>,
+    ) -> Result<(), SessionDigError> {
         let next_id = u64::try_from(document.components.len()).map_err(|_| {
             SessionDigError::Domain(formats::DomainCodecError::Invalid(
                 "component ID counter overflow".into(),
@@ -229,17 +236,30 @@ impl Session {
                 "wire ID counter overflow".into(),
             ))
         })?;
+        let next_segment_id = match document
+            .wires
+            .geometric()
+            .ok()
+            .and_then(|segments| segments.iter().map(|s| s.id).max())
+        {
+            Some(max) => max.checked_add(1).ok_or_else(|| {
+                SessionDigError::Domain(formats::DomainCodecError::Invalid(
+                    "segment ID counter overflow".into(),
+                ))
+            })?,
+            None => 0,
+        };
         self.document = document.clone();
         self.trace = None;
         self.oscillation_diagnostic = None;
         self.terminal_simulation_context = None;
         self.saved = document;
-        self.path = None;
+        self.path = path;
         self.undo.clear();
         self.redo.clear();
         self.next_id = next_id;
         self.next_wire_id = next_wire_id;
-        self.next_segment_id = 0;
+        self.next_segment_id = next_segment_id;
         Ok(())
     }
     /// Export is read-only and never marks the session saved.
@@ -301,28 +321,7 @@ impl Session {
     ) -> Result<(), SessionDigError> {
         let parsed = formats::parse_v2(bytes).map_err(SessionDigError::Read)?;
         let document = formats::to_domain(&parsed).map_err(SessionDigError::Domain)?;
-        let next_id = u64::try_from(document.components.len()).map_err(|_| {
-            SessionDigError::Domain(formats::DomainCodecError::Invalid(
-                "component ID counter overflow".into(),
-            ))
-        })?;
-        let next_wire_id = u64::try_from(document.wires.len()).map_err(|_| {
-            SessionDigError::Domain(formats::DomainCodecError::Invalid(
-                "wire ID counter overflow".into(),
-            ))
-        })?;
-        self.document = document.clone();
-        self.trace = None;
-        self.oscillation_diagnostic = None;
-        self.terminal_simulation_context = None;
-        self.saved = document;
-        self.undo.clear();
-        self.redo.clear();
-        self.next_id = next_id;
-        self.next_wire_id = next_wire_id;
-        self.next_segment_id = 0;
-        self.path = path;
-        Ok(())
+        self.install_opened_document(document, path)
     }
 
     /// Save to the current association. All encoding finishes before the filesystem is touched.
@@ -1370,7 +1369,7 @@ mod tests {
         locked_session.stop_simulation().unwrap();
     }
     #[test]
-    fn canonical_migration_is_transactional_undoable_and_export_refuses_before_io() {
+    fn canonical_migration_is_transactional_undoable_and_exports_geometry_verbatim() {
         let mut session = simple_legacy_session();
         assert!(matches!(
             session.document().wires,
@@ -1382,20 +1381,19 @@ mod tests {
         let segments = geometric.wires.geometric().unwrap();
         assert!(!segments.is_empty());
         assert!(session.dirty());
-        assert!(matches!(
-            session.export_dig_bytes(),
-            Err(SessionDigError::Domain(
-                formats::DomainCodecError::GeometricWiring
-            ))
-        ));
-        let mut io = NoFileAccess;
-        let save = session.save_as(&mut io, Path::new("blocked.dig"), SaveAsIntent::Replace);
-        assert!(matches!(
-            save,
-            Err(SaveError::Codec(SessionDigError::Domain(
-                formats::DomainCodecError::GeometricWiring
-            )))
-        ));
+        let exported = formats::parse_v2(&session.export_dig_bytes().unwrap()).unwrap();
+        assert_eq!(exported.wires.len(), segments.len());
+        assert_eq!(
+            exported
+                .wires
+                .iter()
+                .map(|w| (w.p1.x, w.p1.y, w.p2.x, w.p2.y))
+                .collect::<Vec<_>>(),
+            segments
+                .iter()
+                .map(|s| (s.a.x, s.a.y, s.b.x, s.b.y))
+                .collect::<Vec<_>>()
+        );
         assert!(session.undo().is_ok());
         assert_eq!(session.document(), &legacy);
         assert!(session.redo().is_ok());
@@ -1712,7 +1710,7 @@ mod tests {
         let before = snapshot(&session);
         assert!(session.open_dig_bytes(b"not xml").is_err());
         assert_unchanged(&session, &before);
-        let noncanonical = b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement><visualElement><elementName>Out</elementName><elementAttributes/><pos x=\"100\" y=\"100\"/></visualElement></visualElements><wires><wire><p1 x=\"0\" y=\"0\"/><p2 x=\"0\" y=\"100\"/></wire><wire><p1 x=\"0\" y=\"100\"/><p2 x=\"100\" y=\"100\"/></wire></wires></circuit>";
+        let noncanonical = b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires><wire><p1 x=\"0\" y=\"0\"/><p2 x=\"0\" y=\"0\"/></wire></wires></circuit>";
         assert!(matches!(
             session.open_dig_bytes(noncanonical),
             Err(SessionDigError::Domain(_))
@@ -1729,6 +1727,34 @@ mod tests {
         assert_eq!(new, ComponentId(1));
         assert_ne!(new, id);
     }
+    #[test]
+    fn imported_geometric_segments_seed_ids_for_next_edit() {
+        let input = b"<circuit><version>2</version><attributes/><visualElements/><wires><wire><p1 x=\"10\" y=\"0\"/><p2 x=\"0\" y=\"0\"/></wire><wire><p1 x=\"0\" y=\"0\"/><p2 x=\"10\" y=\"0\"/></wire></wires></circuit>";
+        let mut session = Session::default();
+        session.open_dig_bytes(input).unwrap();
+        let segments = session.document().wires.geometric().unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| (s.id, s.a.x, s.b.x))
+                .collect::<Vec<_>>(),
+            vec![(0, 10, 0), (1, 0, 10)]
+        );
+        assert_eq!(session.next_segment_id, 2);
+        session
+            .add_geometric_segments(&[(Point::new(30, 0), Point::new(40, 0))])
+            .unwrap();
+        assert!(
+            session
+                .document()
+                .wires
+                .geometric()
+                .unwrap()
+                .iter()
+                .any(|s| s.id >= 2)
+        );
+    }
+
     #[test]
     fn export_is_read_only_and_open_refuses_simulation_without_mutation() {
         let mut session = Session::default();
@@ -2094,7 +2120,14 @@ mod tests {
                 crate::file_session::DiscardIntent::RefuseDirty,
             )
             .unwrap();
-        assert_eq!(reopened.document(), session.document());
+        assert_eq!(
+            reopened.document().components,
+            session.document().components
+        );
+        assert!(matches!(
+            reopened.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
         assert!(reopened.path().is_some());
         assert_eq!(id, crate::domain::ComponentId(0));
         std::fs::remove_dir_all(dir).unwrap();
@@ -2142,7 +2175,10 @@ mod tests {
         let xml=b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement><visualElement><elementName>Not</elementName><elementAttributes/><pos x=\"100\" y=\"0\"/></visualElement><visualElement><elementName>Out</elementName><elementAttributes/><pos x=\"200\" y=\"0\"/></visualElement></visualElements><wires><wire><p1 x=\"0\" y=\"0\"/><p2 x=\"100\" y=\"0\"/></wire><wire><p1 x=\"140\" y=\"0\"/><p2 x=\"200\" y=\"0\"/></wire></wires></circuit>";
         let mut session = Session::default();
         session.open_dig_bytes(xml).unwrap();
-        session.migrate_to_geometric_wiring().unwrap();
+        assert!(matches!(
+            session.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
         session.start_running_for_test().unwrap();
         session.settle_simulation(100).unwrap();
         assert_eq!(

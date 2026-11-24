@@ -487,6 +487,73 @@ fn oversized_unsupported_component_and_bad_geometry_fail_without_success_output(
     assert!(out.stdout.is_empty());
 }
 
+#[test]
+fn geometric_cli_open_preserves_records_and_validate_reports_floating_net_without_writing() {
+    let dir = TempDir::new();
+    let open_xml = b"<circuit><version>2</version><attributes/><visualElements/><wires><wire><p1 x=\"9\" y=\"8\"/><p2 x=\"2\" y=\"3\"/></wire><wire><p1 x=\"9\" y=\"8\"/><p2 x=\"2\" y=\"3\"/></wire><wire><p1 x=\"-2147483648\" y=\"2147483647\"/><p2 x=\"2147483647\" y=\"-2147483648\"/></wire></wires></circuit>";
+    fs::write(dir.0.join("geometry.dig"), open_xml).unwrap();
+    let opened = cli(&dir, &["open", "geometry.dig"]);
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let output = String::from_utf8_lossy(&opened.stdout);
+    assert!(output.contains("wiring=geometric-segments"));
+    assert!(output.contains("segment id=0 (9,8)--(2,3)"));
+    assert!(output.contains("segment id=1 (9,8)--(2,3)"));
+    assert_eq!(fs::read(dir.0.join("geometry.dig")).unwrap(), open_xml);
+    let valid = cli(&dir, &["validate", "geometry.dig"]);
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+
+    let floating = b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>Out</elementName><elementAttributes/><pos x=\"100\" y=\"100\"/></visualElement></visualElements><wires><wire><p1 x=\"100\" y=\"100\"/><p2 x=\"110\" y=\"100\"/></wire></wires></circuit>";
+    fs::write(dir.0.join("floating-geometry.dig"), floating).unwrap();
+    let invalid = cli(&dir, &["validate", "floating-geometry.dig"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    let diagnostic = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        diagnostic.contains("Receiver net has no driver"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("Output"),
+        "diagnostic should identify the receiver component: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("segments #0"),
+        "diagnostic should locate the geometric wire: {diagnostic}"
+    );
+    assert_eq!(
+        fs::read(dir.0.join("floating-geometry.dig")).unwrap(),
+        floating
+    );
+}
+
+/// Self-authored Boolean oracle for adder circuits: Digital source d118dce079b6b8867024d40f9b14dfa667e52106,
+/// `core/basic/And.java` and `XOr.java` define the primitive operations used here. No fixture is copied.
+#[test]
+fn half_and_full_adder_formulas_match_exhaustive_binary_addition_tables() {
+    for a in [false, true] {
+        for b in [false, true] {
+            let sum = a ^ b;
+            let carry = a & b;
+            let expected = u8::from(a) + u8::from(b);
+            assert_eq!(u8::from(sum) | (u8::from(carry) << 1), expected);
+            for cin in [false, true] {
+                let propagate = a ^ b;
+                let full_sum = propagate ^ cin;
+                let full_carry = (a & b) | (propagate & cin);
+                let expected = u8::from(a) + u8::from(b) + u8::from(cin);
+                assert_eq!(u8::from(full_sum) | (u8::from(full_carry) << 1), expected);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_filename_is_passed_as_an_os_path() {
@@ -535,28 +602,21 @@ fn validate_keeps_driver_errors_but_accepts_feedback_without_claiming_convergenc
     .unwrap();
     let out = cli(&dir, &["validate", "floating.dig"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Nothing drives"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("disconnected"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut multiple = formats::to_domain(&formats::parse_v2(&base).unwrap()).unwrap();
-    multiple.wires.legacy_mut().unwrap().push(Wire {
-        id: WireId(99),
-        endpoints: [
-            PinRef {
-                component: C(0),
-                pin: PinId {
-                    direction: D::Output,
-                    index: 0,
-                },
-            },
-            PinRef {
-                component: C(1),
-                pin: PinId {
-                    direction: D::Output,
-                    index: 0,
-                },
-            },
-        ],
+    set_component_at(&mut multiple, 4, K::Input, (50, 0), (0, 0), "second driver");
+    let mut segments = multiple.wires.geometric().unwrap().to_vec();
+    segments.push(digital_rust::geometric_wiring::Segment {
+        id: segments.iter().map(|segment| segment.id).max().unwrap_or(0) + 1,
+        a: digital_rust::geometric_wiring::Point::new(0, 0),
+        b: digital_rust::geometric_wiring::Point::new(50, 0),
     });
+    multiple.wires = digital_rust::domain::Wiring::GeometricSegments(segments);
     let bytes = formats::serialize_v2(&formats::from_domain(&multiple).unwrap()).unwrap();
     fs::write(dir.0.join("drivers.dig"), bytes).unwrap();
     let out = cli(&dir, &["validate", "drivers.dig"]);

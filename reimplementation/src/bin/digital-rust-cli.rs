@@ -263,30 +263,47 @@ fn run_with_io_output(
                     }
                 );
             }
-            outln!("wires={}", session.document().wires.len());
-            for wire in session
-                .document()
-                .wires
-                .legacy()
-                .map_err(|error| (error.to_string(), 1))?
-            {
-                let endpoint = |pin: &digital_rust::domain::PinRef| {
-                    let direction = match pin.pin.direction {
-                        digital_rust::domain::PinDirection::Input => "in",
-                        digital_rust::domain::PinDirection::Output => "out",
-                    };
-                    format!(
-                        "{}:{direction}{}",
-                        pin.component.0,
-                        u16::from(pin.pin.index) + 1
-                    )
-                };
-                outln!(
-                    "wire id={} {}--{}",
-                    wire.id.0,
-                    endpoint(&wire.endpoints[0]),
-                    endpoint(&wire.endpoints[1])
-                );
+            outln!(
+                "wiring={}",
+                match &session.document().wires {
+                    digital_rust::domain::Wiring::LegacyPinPairs(_) => "legacy-pin-pairs",
+                    digital_rust::domain::Wiring::GeometricSegments(_) => "geometric-segments",
+                }
+            );
+            match &session.document().wires {
+                digital_rust::domain::Wiring::LegacyPinPairs(wires) => {
+                    for wire in wires {
+                        let endpoint = |pin: &digital_rust::domain::PinRef| {
+                            let direction = match pin.pin.direction {
+                                digital_rust::domain::PinDirection::Input => "in",
+                                digital_rust::domain::PinDirection::Output => "out",
+                            };
+                            format!(
+                                "{}:{direction}{}",
+                                pin.component.0,
+                                u16::from(pin.pin.index) + 1
+                            )
+                        };
+                        outln!(
+                            "wire id={} {}--{}",
+                            wire.id.0,
+                            endpoint(&wire.endpoints[0]),
+                            endpoint(&wire.endpoints[1])
+                        );
+                    }
+                }
+                digital_rust::domain::Wiring::GeometricSegments(segments) => {
+                    for segment in segments {
+                        outln!(
+                            "segment id={} ({},{})--({},{})",
+                            segment.id,
+                            segment.a.x,
+                            segment.a.y,
+                            segment.b.x,
+                            segment.b.y
+                        );
+                    }
+                }
             }
         }
         "validate" => {

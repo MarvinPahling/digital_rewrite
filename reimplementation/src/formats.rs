@@ -4,8 +4,7 @@
 //! resolve component names, mutate the editor document, or perform file I/O.
 
 use crate::domain::{
-    Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position, Wire,
-    WireId,
+    Component, ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -1463,9 +1462,7 @@ impl std::fmt::Display for DomainCodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(message) => f.write_str(message),
-            Self::GeometricWiring => {
-                f.write_str("geometric wiring cannot be exported by the legacy .dig writer")
-            }
+            Self::GeometricWiring => f.write_str("operation requires legacy pin-pair wiring"),
         }
     }
 }
@@ -1581,8 +1578,10 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
         };
         if exact_i32(position.x, "component center x")? != x
             || exact_i32(position.y, "component center y")? != y
+            || (position.x - dx as f32) as f64 != element.x as f64
+            || (position.y - dy as f32) as f64 != element.y as f64
         {
-            return Err(invalid("component position loses f32 precision"));
+            return Err(invalid("component origin/center loses f32 precision"));
         }
         if kind != ComponentKind::Const && element.value.is_some() {
             return Err(invalid("Value is supported only for Const"));
@@ -1595,40 +1594,32 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
             constant_value: element.value.unwrap_or(true),
         });
     }
-    let mut document = Document {
+    // Validate every supported pin's exact integer placement without requiring valid or
+    // compilable connectivity. Coincident pins and arbitrary segment topology remain preserved.
+    all_pins(&Document {
+        components: components.clone(),
+        wires: crate::domain::Wiring::GeometricSegments(Vec::new()),
+    })?;
+    let mut segment_ids = BTreeSet::new();
+    let mut segments = Vec::with_capacity(dig.wires.len());
+    for (index, wire) in dig.wires.iter().enumerate() {
+        if wire.p1 == wire.p2 {
+            return Err(invalid(format!("wires[{index}] is a zero-length segment")));
+        }
+        let id = u64::try_from(index).map_err(|_| invalid("segment ID overflow"))?;
+        if !segment_ids.insert(id) {
+            return Err(invalid(format!("duplicate segment ID {id}")));
+        }
+        segments.push(crate::geometric_wiring::Segment {
+            id,
+            a: crate::geometric_wiring::Point::new(wire.p1.x, wire.p1.y),
+            b: crate::geometric_wiring::Point::new(wire.p2.x, wire.p2.y),
+        });
+    }
+    Ok(Document {
         components,
-        wires: crate::domain::Wiring::LegacyPinPairs(Vec::new()),
-    };
-    let pins = all_pins(&document)?;
-    let pin_at = unique_pin_coordinates(&pins)?;
-    let coordinate_by_pin: BTreeMap<PinRef, Coord> =
-        pins.iter().map(|(pin, coord)| (*pin, *coord)).collect();
-    geometry_groups(&dig.wires, &pin_at)?;
-    let edges = pin_to_pin_chains(&dig.wires, &pin_at, &coordinate_by_pin)?;
-    if edges.len() > MAX_WIRES {
-        return Err(invalid("normalized wire limit exceeded"));
-    }
-    document.wires = edges
-        .into_iter()
-        .enumerate()
-        .map(|(index, endpoints)| Wire {
-            id: WireId(index as u64),
-            endpoints,
-        })
-        .collect();
-    // Enforce the compatibility invariant at the import boundary: every accepted
-    // document must export immediately, without changing any geometric segment.
-    let exported = from_domain(&document)?;
-    let segments = |items: &[DigWire]| {
-        items
-            .iter()
-            .map(|wire| canonical_segment((wire.p1.x, wire.p1.y), (wire.p2.x, wire.p2.y)))
-            .collect::<BTreeSet<_>>()
-    };
-    if segments(&exported.wires) != segments(&dig.wires) {
-        return Err(invalid("import/export changes wire segment geometry"));
-    }
-    Ok(document)
+        wires: crate::domain::Wiring::GeometricSegments(segments),
+    })
 }
 fn canonical_pair(a: PinRef, b: PinRef) -> [PinRef; 2] {
     if a <= b { [a, b] } else { [b, a] }
@@ -1796,96 +1787,6 @@ fn geometry_groups(
     groups.sort();
     Ok(groups)
 }
-type Segment = (Coord, Coord);
-fn canonical_segment(a: Coord, b: Coord) -> Segment {
-    if a <= b { (a, b) } else { (b, a) }
-}
-
-/// Recover each geometric pin-to-pin chain verbatim. Pins are graph boundaries, so a net
-/// with fanout is represented as the actual set of branches, never as a synthesized star.
-fn pin_to_pin_chains(
-    wires: &[DigWire],
-    pin_at: &BTreeMap<Coord, PinRef>,
-    coordinate_by_pin: &BTreeMap<PinRef, Coord>,
-) -> Result<BTreeSet<[PinRef; 2]>, DomainCodecError> {
-    let mut adj: BTreeMap<Coord, Vec<Coord>> = BTreeMap::new();
-    let mut all_segments = BTreeSet::new();
-    for wire in wires {
-        let a = (wire.p1.x, wire.p1.y);
-        let b = (wire.p2.x, wire.p2.y);
-        all_segments.insert(canonical_segment(a, b));
-        adj.entry(a).or_default().push(b);
-        adj.entry(b).or_default().push(a);
-    }
-    let mut consumed = BTreeSet::new();
-    let mut edges = BTreeSet::new();
-    for (&start, &start_pin) in pin_at {
-        if let Some(firsts) = adj.get(&start) {
-            for &first in firsts {
-                let first_segment = canonical_segment(start, first);
-                if consumed.contains(&first_segment) {
-                    continue;
-                }
-                let mut chain = BTreeSet::new();
-                let mut previous = start;
-                let mut current = first;
-                chain.insert(first_segment);
-                while !pin_at.contains_key(&current) {
-                    let neighbors = adj
-                        .get(&current)
-                        .ok_or_else(|| invalid("broken pin-to-pin chain"))?;
-                    let next = *neighbors
-                        .iter()
-                        .find(|&&point| point != previous)
-                        .ok_or_else(|| invalid("dangling wire chain"))?;
-                    chain.insert(canonical_segment(current, next));
-                    previous = current;
-                    current = next;
-                }
-                if chain.iter().any(|segment| !consumed.insert(*segment)) {
-                    return Err(invalid("wire segment belongs to multiple pin chains"));
-                }
-                let end_pin = pin_at[&current];
-                if start_pin == end_pin {
-                    return Err(invalid("wire chain returns to same pin"));
-                }
-                let pair = canonical_pair(start_pin, end_pin);
-                let a = *coordinate_by_pin
-                    .get(&pair[0])
-                    .ok_or_else(|| invalid("wire chain references unknown pin"))?;
-                let b = *coordinate_by_pin
-                    .get(&pair[1])
-                    .ok_or_else(|| invalid("wire chain references unknown pin"))?;
-                let route = crate::wire_geometry::path(
-                    (pair[0], [a.0 as f32, a.1 as f32]),
-                    (pair[1], [b.0 as f32, b.1 as f32]),
-                );
-                let expected = route
-                    .windows(2)
-                    .map(|part| {
-                        canonical_segment(
-                            (part[0][0] as i32, part[0][1] as i32),
-                            (part[1][0] as i32, part[1][1] as i32),
-                        )
-                    })
-                    .collect::<BTreeSet<_>>();
-                if chain != expected {
-                    return Err(invalid("wire pin-to-pin chain is not the canonical route"));
-                }
-                if !edges.insert(pair) {
-                    return Err(invalid("duplicate pin-to-pin wire chain"));
-                }
-            }
-        }
-    }
-    if consumed != all_segments {
-        return Err(invalid(
-            "wire segments are not covered by pin-to-pin chains",
-        ));
-    }
-    Ok(edges)
-}
-
 fn ranges_overlap(a: i32, b: i32, c: i32, d: i32) -> bool {
     a.min(b) < c.max(d) && c.min(d) < a.max(b)
 }
@@ -1900,11 +1801,9 @@ fn point_on_interior(p: Coord, w: &DigWire) -> bool {
     }
 }
 
-/// Convert editable data to the supported Digital v2 representation, validating resulting geometric nets.
+/// Convert editable data to the supported Digital v2 representation. Geometric segments are
+/// serialized verbatim; topology/compiler validation is deliberately not a codec prerequisite.
 pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
-    if !matches!(doc.wires, crate::domain::Wiring::LegacyPinPairs(_)) {
-        return Err(DomainCodecError::GeometricWiring);
-    }
     if doc.components.len() > MAX_ELEMENTS || doc.wires.len() > MAX_WIRES {
         return Err(invalid("document exceeds element/wire limit"));
     }
@@ -1949,6 +1848,37 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
         });
     }
     let pins = all_pins(doc)?;
+    if let crate::domain::Wiring::GeometricSegments(segments) = &doc.wires {
+        if segments.len() > MAX_WIRES {
+            return Err(invalid("segment count exceeds 30,000"));
+        }
+        let mut ids = BTreeSet::new();
+        let mut wires = Vec::with_capacity(segments.len());
+        for (index, segment) in segments.iter().enumerate() {
+            if !ids.insert(segment.id) {
+                return Err(invalid(format!(
+                    "duplicate segment ID {} at index {index}",
+                    segment.id
+                )));
+            }
+            if segment.a == segment.b {
+                return Err(invalid(format!("zero-length segment at index {index}")));
+            }
+            wires.push(DigWire {
+                p1: DigPoint {
+                    x: segment.a.x,
+                    y: segment.a.y,
+                },
+                p2: DigPoint {
+                    x: segment.b.x,
+                    y: segment.b.y,
+                },
+            });
+        }
+        let dig = DigV2 { elements, wires };
+        serialize_v2(&dig).map_err(|e| invalid(e.to_string()))?;
+        return Ok(dig);
+    }
     let pin_at = unique_pin_coordinates(&pins)?;
     let pin_coords: BTreeMap<PinRef, Coord> =
         pins.iter().map(|(pin, coord)| (*pin, *coord)).collect();
@@ -2389,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn import_rejects_noncanonical_route_instead_of_rerouting() {
+    fn import_preserves_noncanonical_route_without_rerouting() {
         let source = DigV2 {
             elements: vec![
                 DigElement {
@@ -2418,8 +2348,12 @@ mod tests {
                 },
             ],
         };
-        let error = to_domain(&source).unwrap_err();
-        assert!(error.to_string().contains("canonical"), "{error}");
+        let imported = to_domain(&source).unwrap();
+        assert_eq!(from_domain(&imported).unwrap().wires, source.wires);
+        assert!(matches!(
+            imported.wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
     }
 
     #[test]
@@ -2630,7 +2564,12 @@ mod tests {
         reversed.wires.legacy_mut().unwrap()[0].endpoints.swap(0, 1);
         assert_eq!(from_domain(&reversed).unwrap().wires, dig.wires);
         let restored = to_domain(&dig).unwrap();
-        assert_eq!(restored.wires.len(), 1);
+        assert_eq!(restored.wires.len(), 2);
+        assert_eq!(
+            from_domain(&restored).unwrap().wires,
+            dig.wires,
+            "route records remain geometric rather than becoming pin pairs"
+        );
         assert_eq!(restored.components[1].position, b.position);
     }
     #[test]
@@ -2796,6 +2735,13 @@ mod tests {
         assert_eq!(parsed.wires[0].p2, DigPoint { x: 2, y: 3 });
         assert_eq!(parsed.wires[1].p1, DigPoint { x: 8, y: 9 });
         assert_eq!(parsed.wires[2].p1, parsed.wires[2].p2);
+        assert_eq!(parse_v2(&serialize_v2(&parsed).unwrap()).unwrap(), parsed);
+        assert!(
+            to_domain(&parsed)
+                .unwrap_err()
+                .to_string()
+                .contains("wires[2]")
+        );
     }
 
     #[test]
@@ -3597,5 +3543,167 @@ mod tests {
             "version",
         );
         assert_eq!(err.offset, 9);
+    }
+
+    fn geometric_document(wires: Vec<DigWire>, elements: Vec<DigElement>) -> DigV2 {
+        DigV2 { elements, wires }
+    }
+    fn dw(a: (i32, i32), b: (i32, i32)) -> DigWire {
+        DigWire {
+            p1: DigPoint { x: a.0, y: a.1 },
+            p2: DigPoint { x: b.0, y: b.1 },
+        }
+    }
+
+    #[test]
+    fn geometric_conversion_is_verbatim_and_does_not_require_a_netlist() {
+        let source = geometric_document(
+            vec![
+                dw((10, 0), (0, 0)),   // reversed orientation
+                dw((10, 0), (0, 0)),   // duplicate geometry remains a separate record
+                dw((0, 0), (10, 0)),   // reversed duplicate
+                dw((10, 0), (10, 10)), // T
+                dw((10, 0), (20, 0)),
+                dw((10, 0), (10, -10)),     // four-way endpoint
+                dw((40, 0), (50, 10)),      // diagonal
+                dw((100, 100), (101, 101)), // disconnected branch
+                dw((120, 100), (130, 100)), // loop edge 1
+                dw((130, 100), (130, 110)), // loop edge 2
+                dw((130, 110), (120, 110)), // loop edge 3
+                dw((120, 110), (120, 100)), // loop edge 4
+                dw((200, 0), (210, 10)),    // crossing edge 1
+                dw((200, 10), (210, 0)),    // crossing edge 2
+                dw((300, 0), (320, 0)),     // positive collinear overlap
+                dw((310, 0), (330, 0)),
+            ],
+            vec![DigElement {
+                name: "In".into(),
+                x: -20,
+                y: 5,
+                label: Some(" source ".into()),
+                value: None,
+            }],
+        );
+        let document = to_domain(&source).unwrap();
+        assert!(matches!(
+            document.wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
+        let segments = document.wires.geometric().unwrap();
+        assert_eq!(segments.len(), source.wires.len());
+        assert_eq!(
+            segments.iter().map(|s| s.id).collect::<Vec<_>>(),
+            (0..16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| (s.a.x, s.a.y, s.b.x, s.b.y))
+                .collect::<Vec<_>>(),
+            source
+                .wires
+                .iter()
+                .map(|w| (w.p1.x, w.p1.y, w.p2.x, w.p2.y))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(from_domain(&document).unwrap(), source);
+        let xml = serialize_v2(&source).unwrap();
+        assert_eq!(parse_v2(&xml).unwrap(), source);
+    }
+
+    #[test]
+    fn empty_and_extreme_coordinate_geometric_documents_roundtrip() {
+        assert_eq!(
+            to_domain(&geometric_document(vec![], vec![]))
+                .unwrap()
+                .wires
+                .len(),
+            0
+        );
+        let source = geometric_document(
+            vec![
+                dw((i32::MIN, i32::MAX), (i32::MAX, i32::MIN)),
+                dw((i32::MAX, i32::MAX), (i32::MIN, i32::MIN)),
+            ],
+            vec![],
+        );
+        let imported = to_domain(&source).unwrap();
+        assert_eq!(from_domain(&imported).unwrap(), source);
+        // Component placement that cannot be represented exactly by f32 is refused, not rounded.
+        let bad = DigV2 {
+            elements: vec![DigElement {
+                name: "In".into(),
+                x: 16_777_217,
+                y: 0,
+                label: None,
+                value: None,
+            }],
+            wires: vec![],
+        };
+        assert!(
+            to_domain(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("precision")
+        );
+    }
+
+    #[test]
+    fn geometric_conversion_refuses_zero_length_and_invalid_component_placements_only() {
+        let zero = geometric_document(vec![dw((i32::MIN, 0), (i32::MIN, 0))], vec![]);
+        assert!(
+            to_domain(&zero)
+                .unwrap_err()
+                .to_string()
+                .contains("wires[0]")
+        );
+        let invalid_position = DigV2 {
+            elements: vec![DigElement {
+                name: "And".into(),
+                x: i32::MAX,
+                y: 0,
+                label: None,
+                value: None,
+            }],
+            wires: vec![],
+        };
+        assert!(to_domain(&invalid_position).is_err());
+        let duplicate_ids = Document {
+            components: vec![],
+            wires: crate::domain::Wiring::GeometricSegments(vec![
+                crate::geometric_wiring::Segment {
+                    id: 7,
+                    a: crate::geometric_wiring::Point::new(0, 0),
+                    b: crate::geometric_wiring::Point::new(1, 1),
+                },
+                crate::geometric_wiring::Segment {
+                    id: 7,
+                    a: crate::geometric_wiring::Point::new(2, 2),
+                    b: crate::geometric_wiring::Point::new(3, 3),
+                },
+            ]),
+        };
+        assert!(
+            from_domain(&duplicate_ids)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate segment ID")
+        );
+        let zero_domain = Document {
+            components: vec![],
+            wires: crate::domain::Wiring::GeometricSegments(vec![
+                crate::geometric_wiring::Segment {
+                    id: 9,
+                    a: crate::geometric_wiring::Point::new(4, 4),
+                    b: crate::geometric_wiring::Point::new(4, 4),
+                },
+            ]),
+        };
+        assert!(
+            from_domain(&zero_domain)
+                .unwrap_err()
+                .to_string()
+                .contains("index 0")
+        );
     }
 }

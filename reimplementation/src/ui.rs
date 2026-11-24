@@ -270,23 +270,41 @@ fn document_view_bounds(
         label_width = label_width.max(galley.size().x);
         label_height = label_height.max(galley.size().y);
     }
-    for wire in doc.wires.iter_legacy().into_iter().flatten() {
-        let (Some(a), Some(b)) = (
-            anchors.get(&wire.endpoints[0]),
-            anchors.get(&wire.endpoints[1]),
-        ) else {
-            return Err(format!(
-                "Cannot fit: wire #{} has a missing endpoint",
-                wire.id.0
-            ));
-        };
-        let path = crate::wire_geometry::path((wire.endpoints[0], *a), (wire.endpoints[1], *b));
-        for point in path {
-            if !include(point, &mut min, &mut max) {
-                return Err(format!("Cannot fit: invalid wire geometry #{}", wire.id.0));
+    match &doc.wires {
+        crate::domain::Wiring::LegacyPinPairs(wires) => {
+            for wire in wires {
+                let (Some(a), Some(b)) = (
+                    anchors.get(&wire.endpoints[0]),
+                    anchors.get(&wire.endpoints[1]),
+                ) else {
+                    return Err(format!(
+                        "Cannot fit: wire #{} has a missing endpoint",
+                        wire.id.0
+                    ));
+                };
+                let path =
+                    crate::wire_geometry::path((wire.endpoints[0], *a), (wire.endpoints[1], *b));
+                for point in path {
+                    if !include(point, &mut min, &mut max) {
+                        return Err(format!("Cannot fit: invalid wire geometry #{}", wire.id.0));
+                    }
+                }
+                have_geometry = true;
             }
         }
-        have_geometry = true;
+        crate::domain::Wiring::GeometricSegments(segments) => {
+            for segment in segments {
+                for point in [segment.a, segment.b] {
+                    if !include([point.x as f32, point.y as f32], &mut min, &mut max) {
+                        return Err(format!(
+                            "Cannot fit: invalid segment geometry #{}",
+                            segment.id
+                        ));
+                    }
+                }
+                have_geometry = true;
+            }
+        }
     }
     if !have_geometry {
         return Ok(None);
@@ -1155,7 +1173,11 @@ impl DigitalApp {
                             self.wire_start = None;
                         }
                     }
-                    if ui.selectable_label(self.wiring, "Wire (W)").clicked() {
+                    let geometric = matches!(self.session.document().wires, crate::domain::Wiring::GeometricSegments(_));
+                    let wire_label = if geometric { "Wire (W) — read-only" } else { "Wire (W)" };
+                    if ui.add_enabled(!geometric, egui::Button::new(wire_label).selected(self.wiring))
+                        .on_hover_text(if geometric { "Geometric segments are read-only in the native editor" } else { "Create a pin-pair wire (W)" })
+                        .clicked() {
                         self.wiring = !self.wiring;
                         self.wire_start = None;
                         self.placing = None;
@@ -1676,6 +1698,14 @@ impl DigitalApp {
                     }
                 }
             }
+            if let crate::domain::Wiring::GeometricSegments(segments) = &self.session.document().wires {
+                for segment in segments {
+                    painter.line_segment(
+                        [transform.to_screen([segment.a.x as f32, segment.a.y as f32]), transform.to_screen([segment.b.x as f32, segment.b.y as f32])],
+                        Stroke::new(2.0_f32, palette.ink),
+                    );
+                }
+            }
             if self.wiring {
                 for (pin, pos) in &wire_pins {
                     painter.circle_stroke(
@@ -1917,7 +1947,12 @@ impl DigitalApp {
                 && !locked
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W))
             {
-                self.wiring = !self.wiring;
+                if matches!(self.session.document().wires, crate::domain::Wiring::GeometricSegments(_)) {
+                    self.wiring = false;
+                    self.error = Some("Geometric segments are read-only in the native editor; wire editing is not implemented".into());
+                } else {
+                    self.wiring = !self.wiring;
+                }
                 self.wire_start = None;
                 self.placing = None;
                 self.drag = None;
@@ -4559,6 +4594,58 @@ mod tests {
     }
 
     #[test]
+    fn native_open_draws_geometric_segments_and_disables_wire_editing() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("native-geometric-readonly");
+        let geometric = digital_rust::formats::DigV2 {
+            elements: vec![],
+            wires: vec![digital_rust::formats::DigWire {
+                p1: digital_rust::formats::DigPoint { x: 9, y: 8 },
+                p2: digital_rust::formats::DigPoint { x: 2, y: 3 },
+            }],
+        };
+        std::fs::write(
+            dir.join("geometry.dig"),
+            digital_rust::formats::serialize_v2(&geometric).unwrap(),
+        )
+        .unwrap();
+        let mut app = ui_file_app(&dir);
+        frame(&ctx, &mut app, vec![], true);
+        app.begin_pending(PendingAction::Open(dir.join("geometry.dig")));
+        assert!(matches!(
+            app.session.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
+        assert_eq!(app.session.document().wires.geometric().unwrap().len(), 1);
+        assert_eq!(app.session.path(), Some(dir.join("geometry.dig").as_path()));
+        assert!(!app.session.dirty());
+        assert!(!app.wiring);
+        if let Some(rect) = app.canvas_rect {
+            click_at(&ctx, &mut app, rect.center());
+        }
+        let output = frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::W, egui::Modifiers::NONE)],
+            true,
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|message| message.contains("read-only"))
+        );
+        assert!(!app.wiring);
+        let transform = app.view.transform(app.canvas_rect.unwrap()).unwrap();
+        let a = transform.to_screen([9.0, 8.0]);
+        let b = transform.to_screen([2.0, 3.0]);
+        assert!(
+            has_line(&output, a, b, 2.0) || has_line(&output, b, a, 2.0),
+            "the exact geometric segment must be drawn"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn dirty_open_save_discard_and_cancel_all_preserve_or_replace_the_document_as_chosen() {
         let ctx = egui::Context::default();
         let dir = test_dir("dirty-open-choices");
@@ -4612,7 +4699,11 @@ mod tests {
         );
         assert_eq!(app.session.path(), Some(dir.join("source.dig").as_path()));
         assert!(!app.session.dirty());
-        assert_eq!(*app.session.document(), old);
+        assert_eq!(app.session.document().components, old.components);
+        assert!(matches!(
+            app.session.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
