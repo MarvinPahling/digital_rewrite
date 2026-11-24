@@ -179,6 +179,54 @@ struct FragmentDraft {
     keyboard_adjusted: bool,
 }
 
+/// Materialize exactly the transformed, offset document consumed by the placement preview.
+fn fragment_preview_document(draft: &FragmentDraft) -> Result<Document, String> {
+    let mut document =
+        digital_rust::formats::to_domain(&draft.fragment).map_err(|error| error.to_string())?;
+    for component in &mut document.components {
+        let x = f64::from(component.position.x) + f64::from(draft.delta[0]);
+        let y = f64::from(component.position.y) + f64::from(draft.delta[1]);
+        if !x.is_finite()
+            || !y.is_finite()
+            || x.abs() > f32::MAX as f64
+            || y.abs() > f32::MAX as f64
+        {
+            return Err("Placement offset exceeds supported component coordinates".into());
+        }
+        component.position = Position {
+            x: x as f32,
+            y: y as f32,
+        };
+    }
+    for segment in document
+        .wires
+        .geometric_mut()
+        .map_err(|error| error.to_string())?
+    {
+        segment.a.x = segment
+            .a
+            .x
+            .checked_add(draft.delta[0])
+            .ok_or_else(|| "Placement offset exceeds supported wire coordinates".to_owned())?;
+        segment.a.y = segment
+            .a
+            .y
+            .checked_add(draft.delta[1])
+            .ok_or_else(|| "Placement offset exceeds supported wire coordinates".to_owned())?;
+        segment.b.x = segment
+            .b
+            .x
+            .checked_add(draft.delta[0])
+            .ok_or_else(|| "Placement offset exceeds supported wire coordinates".to_owned())?;
+        segment.b.y = segment
+            .b
+            .y
+            .checked_add(draft.delta[1])
+            .ok_or_else(|| "Placement offset exceeds supported wire coordinates".to_owned())?;
+    }
+    Ok(document)
+}
+
 #[derive(Clone, Debug)]
 enum ClipboardAction {
     Copy,
@@ -359,6 +407,15 @@ impl DigitalApp {
             digital_rust::formats::to_domain(&fragment).map_err(|error| error.to_string())?;
         let mut max = [f64::NEG_INFINITY; 2];
         for component in &document.components {
+            if [component.position.x, component.position.y]
+                .into_iter()
+                .any(|value| value.abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER)
+            {
+                return Err(format!(
+                    "Clipboard component center exceeds exact symbol-rendering range (±{} world units)",
+                    crate::symbol_render::MAX_EXACT_SYMBOL_CENTER
+                ));
+            }
             let layout = SymbolLayout::oriented_on(
                 self.style,
                 component.kind,
@@ -639,6 +696,16 @@ fn document_view_bounds(
         true
     };
     for c in &doc.components {
+        if [c.position.x, c.position.y]
+            .into_iter()
+            .any(|value| value.abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER)
+        {
+            return Err(format!(
+                "Cannot fit: component #{} exceeds exact symbol-rendering range (±{} world units)",
+                c.id.0,
+                crate::symbol_render::MAX_EXACT_SYMBOL_CENTER
+            ));
+        }
         let Some(layout) = SymbolLayout::oriented_on(
             style,
             c.kind,
@@ -696,6 +763,16 @@ fn document_view_bounds(
         crate::domain::Wiring::GeometricSegments(segments) => {
             for segment in segments {
                 for point in [segment.a, segment.b] {
+                    if point.x.unsigned_abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER as u32
+                        || point.y.unsigned_abs()
+                            > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER as u32
+                    {
+                        return Err(format!(
+                            "Cannot fit: wire #{} exceeds exact floating view-bound range (±{} world units)",
+                            segment.id,
+                            crate::symbol_render::MAX_EXACT_SYMBOL_CENTER
+                        ));
+                    }
                     if !include([point.x as f32, point.y as f32], &mut min, &mut max) {
                         return Err(format!(
                             "Cannot fit: invalid segment geometry #{}",
@@ -1294,6 +1371,24 @@ impl DigitalApp {
     ) -> Vec<crate::engine::RouteTarget> {
         use crate::engine::RouteTarget;
         use digital_rust::geometric_wiring::Point;
+        let Ok(segments) = self.session.document().wires.geometric() else {
+            self.error = Some("Cannot pick route targets: invalid wire geometry".into());
+            return Vec::new();
+        };
+        if segments
+            .iter()
+            .flat_map(|segment| [segment.a, segment.b])
+            .any(|point| {
+                point.x.unsigned_abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER as u32
+                    || point.y.unsigned_abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER as u32
+            })
+        {
+            self.error = Some(format!(
+                "Wire routing is limited to exact canvas coordinates within ±{} world units; stored integer wires are still rendered exactly",
+                crate::symbol_render::MAX_EXACT_SYMBOL_CENTER
+            ));
+            return Vec::new();
+        }
         let mut choices: Vec<(u8, f32, u64, u8, i32, i32, RouteTarget)> = Vec::new();
         for (pin, pos) in pins {
             let distance = transform.to_screen(*pos).distance(pointer);
@@ -1309,14 +1404,10 @@ impl DigitalApp {
                 ));
             }
         }
-        let Ok(segments) = self.session.document().wires.geometric() else {
-            self.error = Some("Cannot pick route targets: invalid wire geometry".into());
-            return Vec::new();
-        };
         for segment in segments {
             for endpoint in [segment.a, segment.b] {
                 let distance = transform
-                    .to_screen([endpoint.x as f32, endpoint.y as f32])
+                    .to_screen_i32(endpoint.x, endpoint.y)
                     .distance(pointer);
                 if distance <= 8. {
                     choices.push((
@@ -1330,8 +1421,8 @@ impl DigitalApp {
                     ));
                 }
             }
-            let a = transform.to_screen([segment.a.x as f32, segment.a.y as f32]);
-            let b = transform.to_screen([segment.b.x as f32, segment.b.y as f32]);
+            let a = transform.to_screen_i32(segment.a.x, segment.a.y);
+            let b = transform.to_screen_i32(segment.b.x, segment.b.y);
             let delta = b - a;
             let t = if delta.length_sq() > 0. {
                 ((pointer - a).dot(delta) / delta.length_sq()).clamp(0., 1.)
@@ -1361,9 +1452,7 @@ impl DigitalApp {
                     && point != segment.a
                     && point != segment.b
                 {
-                    let distance = transform
-                        .to_screen([point.x as f32, point.y as f32])
-                        .distance(pointer);
+                    let distance = transform.to_screen_i32(point.x, point.y).distance(pointer);
                     if distance <= 8. {
                         choices.push((
                             2,
@@ -2214,7 +2303,9 @@ impl DigitalApp {
                         ctx.memory_mut(|memory| memory.request_focus(seed_id));
                     }
                 }
-                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
+                if !cancelled
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R))
+                {
                     let mut selection = self.selection.clone();
                     if selection.is_empty() && let Some(id)=self.selected { selection.select_component(id,false,false); }
                     match self.session.transform_selection(&selection,1,false) { Ok(_) => self.reconcile_selection(), Err(error) => self.error=Some(error.to_string()) }
@@ -2337,9 +2428,12 @@ impl DigitalApp {
                         match self.session.document().wires.geometric() {
                             Ok(segments) => segments.iter().rev().find(|segment| {
                                 crate::wire_geometry::hit(
-                                    &[[segment.a.x as f32, segment.a.y as f32], [segment.b.x as f32, segment.b.y as f32]],
-                                    world,
-                                    transform.length_to_world(6.),
+                                    &[
+                                        { let p = transform.to_screen_i32(segment.a.x, segment.a.y); [p.x, p.y] },
+                                        { let p = transform.to_screen_i32(segment.b.x, segment.b.y); [p.x, p.y] },
+                                    ],
+                                    [p.x, p.y],
+                                    6.0,
                                 )
                             }).map(|segment| segment.id),
                             Err(error) => { self.error = Some(format!("Cannot select wire: {error}")); None }
@@ -2494,7 +2588,13 @@ impl DigitalApp {
                     Vec::new()
                 }
             };
-                let mut incidence = std::collections::BTreeMap::<digital_rust::geometric_wiring::Point, usize>::new();
+            if segments.iter().flat_map(|segment| [segment.a, segment.b]).any(|point| {
+                point.x.unsigned_abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER as u32
+                    || point.y.unsigned_abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER as u32
+            }) {
+                self.error = Some(format!("Large wire coordinates are drawn from exact integer points; fit, route picking, and interior editing are limited to ±{} world units", crate::symbol_render::MAX_EXACT_SYMBOL_CENTER));
+            }
+            let mut incidence = std::collections::BTreeMap::<digital_rust::geometric_wiring::Point, usize>::new();
                 for segment in segments {
                     let mut a=segment.a; let mut b=segment.b;
                     if let Some(mask)=self.selection.wires.get(&segment.id) {
@@ -2505,13 +2605,13 @@ impl DigitalApp {
                     *incidence.entry(b).or_default() += 1;
                     let color = if self.selected_segment == Some(segment.id) || self.selection.wires.contains_key(&segment.id) { palette.selection } else { palette.ink };
                     painter.line_segment(
-                        [transform.to_screen([a.x as f32, a.y as f32]), transform.to_screen([b.x as f32, b.y as f32])],
+                        [transform.to_screen_i32(a.x, a.y), transform.to_screen_i32(b.x, b.y)],
                         Stroke::new(2.0_f32, color),
                     );
                 }
                 for (point, count) in incidence {
                     if count > 2 {
-                        painter.circle_filled(transform.to_screen([point.x as f32, point.y as f32]), 3.0, palette.ink);
+                        painter.circle_filled(transform.to_screen_i32(point.x, point.y), 3.0, palette.ink);
                     }
                 }
             if self.wiring {
@@ -2524,7 +2624,7 @@ impl DigitalApp {
                     && let Some(point) = self.route_target_point(target)
                 {
                     painter.circle_stroke(
-                        transform.to_screen([point.x as f32, point.y as f32]),
+                        transform.to_screen_i32(point.x, point.y),
                         9.0,
                         Stroke::new(2.0_f32, palette.selection),
                     );
@@ -2533,7 +2633,7 @@ impl DigitalApp {
                     && let Some(point) = self.route_target_point(target)
                 {
                     painter.circle_filled(
-                        transform.to_screen([point.x as f32, point.y as f32]),
+                        transform.to_screen_i32(point.x, point.y),
                         3.5,
                         palette.selection,
                     );
@@ -2560,7 +2660,7 @@ impl DigitalApp {
                     let points = digital_rust::geometric_wiring::plan_orthogonal_route(a, b, self.route_orientation);
                     for pair in points.windows(2) {
                         painter.line_segment(
-                            [transform.to_screen([pair[0].x as f32, pair[0].y as f32]), transform.to_screen([pair[1].x as f32, pair[1].y as f32])],
+                            [transform.to_screen_i32(pair[0].x, pair[0].y), transform.to_screen_i32(pair[1].x, pair[1].y)],
                             Stroke::new(1_f32, palette.selection),
                         );
                     }
@@ -2578,7 +2678,11 @@ impl DigitalApp {
                 let affected = self.session.oscillation_diagnostic().is_some_and(|diagnostic| diagnostic.components.iter().any(|component| component.id == c.id));
                 let state = if affected { PaintState::Error } else if self.selection.components.contains(&c.id) || self.selected == Some(c.id) { PaintState::Selection } else { PaintState::Ink };
                 let Some(layout) = SymbolLayout::oriented_on(style, c.kind, [pos.x, pos.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }) else {
-                    self.error = Some(format!("No symbol is drawn for {}", c.kind.name()));
+                    self.error = Some(if [pos.x, pos.y].into_iter().any(|value| value.abs() > crate::symbol_render::MAX_EXACT_SYMBOL_CENTER) {
+                        format!("Component #{} is outside exact symbol-rendering range (±{} world units); its precise pin/wire coordinates are retained but canvas geometry is withheld", c.id.0, crate::symbol_render::MAX_EXACT_SYMBOL_CENTER)
+                    } else {
+                        format!("No symbol is drawn for {}", c.kind.name())
+                    });
                     continue;
                 };
                 if matches!(
@@ -2686,21 +2790,16 @@ impl DigitalApp {
                 }
             }
             if let Some(draft) = &self.fragment_draft
-                && let Ok(document) = digital_rust::formats::to_domain(&draft.fragment)
+                && let Ok(document) = fragment_preview_document(draft)
             {
                     for segment in document.wires.geometric().unwrap_or(&[]) {
-                        let add = |point: digital_rust::geometric_wiring::Point| -> Option<Pos2> {
-                            Some(transform.to_screen([point.x.checked_add(draft.delta[0])? as f32, point.y.checked_add(draft.delta[1])? as f32]))
-                        };
-                        if let (Some(a), Some(b)) = (add(segment.a), add(segment.b)) {
-                            painter.line_segment([a, b], Stroke::new(2.0_f32, palette.selection));
-                        }
+                        painter.line_segment([
+                            transform.to_screen_i32(segment.a.x, segment.a.y),
+                            transform.to_screen_i32(segment.b.x, segment.b.y),
+                        ], Stroke::new(2.0_f32, palette.selection));
                     }
                     for component in &document.components {
-                        let x = f64::from(component.position.x) + f64::from(draft.delta[0]);
-                        let y = f64::from(component.position.y) + f64::from(draft.delta[1]);
-                        if !x.is_finite() || !y.is_finite() || x.abs() > f32::MAX as f64 || y.abs() > f32::MAX as f64 { continue; }
-                        if let Some(layout) = SymbolLayout::oriented_on(style, component.kind, [x as f32, y as f32], crate::domain::Orientation { rotation: component.rotation, mirror: component.mirror }) {
+                        if let Some(layout) = SymbolLayout::oriented_on(style, component.kind, [component.position.x, component.position.y], crate::domain::Orientation { rotation: component.rotation, mirror: component.mirror }) {
                             if matches!(component.kind, ComponentKind::Const | ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XOr | ComponentKind::XNOr) {
                                 let bounds = layout.bounds();
                                 let screen = Rect::from_min_max(transform.to_screen(bounds.min), transform.to_screen(bounds.max));
@@ -2925,7 +3024,7 @@ impl DigitalApp {
                             match self.session.document().wires.geometric() {
                                 Ok(segments) => for segment in segments {
                                     for point in [segment.a, segment.b] {
-                                        if rect.contains(transform.to_screen([point.x as f32, point.y as f32])) {
+                                        if rect.contains(transform.to_screen_i32(point.x, point.y)) {
                                             targets.push(crate::engine::RouteTarget::ExistingEndpoint(point));
                                         }
                                     }
@@ -2935,7 +3034,7 @@ impl DigitalApp {
                                     if (segment.a.x == segment.b.x || segment.a.y == segment.b.y)
                                         && midpoint != segment.a
                                         && midpoint != segment.b
-                                        && rect.contains(transform.to_screen([midpoint.x as f32, midpoint.y as f32])) {
+                                        && rect.contains(transform.to_screen_i32(midpoint.x, midpoint.y)) {
                                         targets.push(crate::engine::RouteTarget::SegmentInterior { segment_id: segment.id, point: midpoint });
                                     }
                                 },
@@ -3850,8 +3949,8 @@ mod tests {
             );
             assert!(route.windows(2).all(|pair| has_line(
                 &preview,
-                transform.to_screen([pair[0].x as f32, pair[0].y as f32]),
-                transform.to_screen([pair[1].x as f32, pair[1].y as f32]),
+                transform.to_screen_i32(pair[0].x, pair[0].y),
+                transform.to_screen_i32(pair[1].x, pair[1].y),
                 1.0,
             )));
             if enter {
@@ -3901,7 +4000,7 @@ mod tests {
             let rect = app.canvas_rect.unwrap();
             let transform = app.view.transform(rect).unwrap();
             let start_point = Point::new(120, 100);
-            let start = transform.to_screen([start_point.x as f32, start_point.y as f32]);
+            let start = transform.to_screen_i32(start_point.x, start_point.y);
             click_at(&ctx, &mut app, start);
             let stale_focus = crate::engine::RouteTarget::ExistingEndpoint(start_point);
             assert_eq!(app.focused_route_target, Some(stale_focus));
@@ -4772,7 +4871,7 @@ mod tests {
         for segment in app.session.document().wires.geometric().unwrap() {
             for point in [segment.a, segment.b] {
                 assert!(
-                    rect.contains(transform.to_screen([point.x as f32, point.y as f32])),
+                    rect.contains(transform.to_screen_i32(point.x, point.y)),
                     "fitted wire path remains visible"
                 );
             }
@@ -8246,44 +8345,169 @@ mod tests {
     }
 
     #[test]
-    fn paste_draft_r_rotates_preview_without_moving_placement_pivot_and_commit_matches() {
+    fn cancelled_canvas_gesture_cannot_rotate_selection_in_the_same_frame() {
+        for cancel in [
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerGone,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = DigitalApp::default();
+            let id = app
+                .session
+                .place(ComponentKind::And, Position { x: 100., y: 100. })
+                .unwrap();
+            app.selected = Some(id);
+            app.selection.select_component(id, false, false);
+            frame(&ctx, &mut app, vec![], true);
+            click_at(&ctx, &mut app, Pos2::new(500., 400.));
+            app.selected = Some(id);
+            app.selection.select_component(id, false, false);
+            let document = app.session.document().clone();
+            let dirty = app.session.dirty();
+            frame(
+                &ctx,
+                &mut app,
+                vec![cancel, key(egui::Key::R, egui::Modifiers::NONE)],
+                true,
+            );
+            assert_eq!(app.session.document(), &document);
+            assert_eq!(app.session.dirty(), dirty);
+            app.session.undo().unwrap();
+            assert!(
+                app.session.document().components.is_empty(),
+                "cancel must not add a history entry"
+            );
+            app.session.redo().unwrap();
+            assert_eq!(app.session.document(), &document);
+            assert!(app.drag.is_none());
+            assert!(app.marquee.is_none());
+        }
+    }
+
+    #[test]
+    fn paste_draft_r_rotates_stationary_preview_geometry_and_commit_matches() {
         let fragment = digital_rust::formats::DigV2 {
             elements: vec![digital_rust::formats::DigElement {
                 name: "Not".into(),
-                x: 0,
-                y: 0,
-                label: None,
+                x: 100,
+                y: 100,
+                label: Some("preview".into()),
                 value: None,
                 rotation: 0,
                 mirror: false,
             }],
-            wires: vec![],
+            wires: vec![digital_rust::formats::DigWire {
+                p1: digital_rust::formats::DigPoint { x: 80, y: 100 },
+                p2: digital_rust::formats::DigPoint { x: 120, y: 100 },
+            }],
         };
-        let ctx = egui::Context::default();
-        let mut app = DigitalApp::default();
-        app.begin_fragment_draft(fragment, [0, 0], true).unwrap();
-        frame(&ctx, &mut app, vec![], true);
-        let anchor = app.fragment_draft.as_ref().unwrap().anchor;
-        let delta = app.fragment_draft.as_ref().unwrap().delta;
-        frame(
-            &ctx,
-            &mut app,
-            vec![key(egui::Key::R, egui::Modifiers::NONE)],
-            true,
-        );
-        assert_eq!(app.fragment_draft.as_ref().unwrap().anchor, anchor);
-        assert_eq!(app.fragment_draft.as_ref().unwrap().delta, delta);
-        assert_eq!(
-            app.fragment_draft.as_ref().unwrap().fragment.elements[0].rotation,
-            1
-        );
-        frame(
-            &ctx,
-            &mut app,
-            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
-            true,
-        );
-        assert_eq!(app.session.document().components[0].rotation, 1);
-        assert!(app.fragment_draft.is_none());
+        for commit_by_click in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = DigitalApp::default();
+            app.begin_fragment_draft(fragment.clone(), [0, 0], true)
+                .unwrap();
+            frame(&ctx, &mut app, vec![], true);
+            let pointer = app.canvas_rect.unwrap().center();
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerMoved(pointer)],
+                true,
+            );
+            let anchor = app.fragment_draft.as_ref().unwrap().anchor;
+            let delta = app.fragment_draft.as_ref().unwrap().delta;
+            assert_ne!(
+                delta,
+                [0, 0],
+                "preview must use the stationary canvas pointer"
+            );
+            frame(
+                &ctx,
+                &mut app,
+                vec![key(egui::Key::R, egui::Modifiers::NONE)],
+                true,
+            );
+            assert_eq!(app.fragment_draft.as_ref().unwrap().anchor, anchor);
+            assert_eq!(app.fragment_draft.as_ref().unwrap().delta, delta);
+            assert_eq!(
+                app.fragment_draft.as_ref().unwrap().fragment.elements[0].rotation,
+                1
+            );
+            let preview = {
+                let draft = app.fragment_draft.as_ref().unwrap();
+                fragment_preview_document(draft).unwrap()
+            };
+            assert_ne!(preview.components, app.session.document().components);
+            let preview_component = &preview.components[0];
+            let preview_layout = SymbolLayout::oriented_on(
+                app.style,
+                preview_component.kind,
+                [preview_component.position.x, preview_component.position.y],
+                crate::domain::Orientation {
+                    rotation: preview_component.rotation,
+                    mirror: preview_component.mirror,
+                },
+            )
+            .unwrap();
+            let preview_bounds = preview_layout.bounds();
+            let preview_pins: Vec<_> =
+                digital_rust::pin_geometry::all_pin_points(preview_component).unwrap();
+            let preview_wires = preview.wires.geometric().unwrap().to_vec();
+            if commit_by_click {
+                click_at(&ctx, &mut app, pointer);
+            } else {
+                frame(
+                    &ctx,
+                    &mut app,
+                    vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+                    true,
+                );
+            }
+            let committed_component = &app.session.document().components[0];
+            let committed_layout = SymbolLayout::oriented_on(
+                app.style,
+                committed_component.kind,
+                [
+                    committed_component.position.x,
+                    committed_component.position.y,
+                ],
+                crate::domain::Orientation {
+                    rotation: committed_component.rotation,
+                    mirror: committed_component.mirror,
+                },
+            )
+            .unwrap();
+            assert_eq!(committed_component.position, preview_component.position);
+            assert_eq!(
+                (committed_component.rotation, committed_component.mirror),
+                (preview_component.rotation, preview_component.mirror)
+            );
+            assert_eq!(committed_layout.bounds(), preview_bounds);
+            assert_eq!(
+                digital_rust::pin_geometry::all_pin_points(committed_component).unwrap(),
+                preview_pins
+            );
+            assert_eq!(
+                app.session
+                    .document()
+                    .wires
+                    .geometric()
+                    .unwrap()
+                    .iter()
+                    .map(|wire| (wire.a, wire.b))
+                    .collect::<Vec<_>>(),
+                preview_wires
+                    .iter()
+                    .map(|wire| (wire.a, wire.b))
+                    .collect::<Vec<_>>(),
+            );
+            assert!(app.fragment_draft.is_none());
+        }
     }
 }

@@ -4736,6 +4736,125 @@ mod tests {
     }
 
     #[test]
+    fn mixed_transform_has_literal_origins_and_moves_only_selected_endpoints() {
+        use crate::geometric_wiring::{Point as P, Segment};
+        let mut session = Session::default();
+        let and = session
+            .place(ComponentKind::And, Position { x: 100., y: 100. })
+            .unwrap();
+        let not = session
+            .place(ComponentKind::Not, Position { x: 200., y: 160. })
+            .unwrap();
+        session.document.wires = crate::domain::Wiring::GeometricSegments(vec![
+            Segment {
+                id: 7,
+                a: P::new(0, 0),
+                b: P::new(12, 13),
+            },
+            Segment {
+                id: 8,
+                a: P::new(230, 190),
+                b: P::new(240, 200),
+            },
+        ]);
+        session.next_segment_id = 9;
+        let history = session.undo.len();
+        let mut selection = crate::selection::Selection::default();
+        selection.components.extend([and, not]);
+        selection.wires.insert(7, crate::selection::EndpointMask::A);
+        selection.wires.insert(8, crate::selection::EndpointMask::B);
+        assert!(session.transform_selection(&selection, 1, false).unwrap());
+        assert_eq!(session.undo.len(), history + 1);
+        let transformed = session.document();
+        assert_eq!(
+            transformed.components[0].position,
+            Position { x: 120., y: 120. }
+        );
+        assert_eq!(
+            (
+                transformed.components[0].rotation,
+                transformed.components[0].mirror
+            ),
+            (1, false)
+        );
+        assert_eq!(
+            transformed.components[1].position,
+            Position { x: 180., y: 20. }
+        );
+        assert_eq!(
+            (
+                transformed.components[1].rotation,
+                transformed.components[1].mirror
+            ),
+            (1, false)
+        );
+        assert_eq!(
+            transformed.wires.geometric().unwrap(),
+            &[
+                Segment {
+                    id: 7,
+                    a: P::new(20, 220),
+                    b: P::new(12, 13)
+                },
+                Segment {
+                    id: 8,
+                    a: P::new(230, 190),
+                    b: P::new(220, -20)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transform_selection_overflow_is_atomic_and_simulation_lock_precedes_validation() {
+        use crate::geometric_wiring::{Point as P, Segment};
+        let mut session = Session::default();
+        let component = session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let mut component_selection = crate::selection::Selection::default();
+        component_selection.components.insert(component);
+        session.move_selection(&component_selection, 20, 0).unwrap();
+        session.undo().unwrap(); // Leave a redo branch that failure must preserve.
+        session.document.wires = crate::domain::Wiring::GeometricSegments(vec![Segment {
+            id: 42,
+            a: P::new(i32::MIN, 0),
+            b: P::new(i32::MAX, 0),
+        }]);
+        session.next_segment_id = 43;
+        let mut selection = crate::selection::Selection::default();
+        selection
+            .wires
+            .insert(42, crate::selection::EndpointMask::BOTH);
+        let document = session.document().clone();
+        let undo = session.undo.clone();
+        let redo = session.redo.clone();
+        let next_id = session.next_id;
+        let next_segment_id = session.next_segment_id;
+        assert_eq!(
+            session.transform_selection(&selection, 1, false),
+            Err(EditError::InvalidPosition)
+        );
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo, undo);
+        assert_eq!(session.redo, redo);
+        assert_eq!(session.next_id, next_id);
+        assert_eq!(session.next_segment_id, next_segment_id);
+
+        session.start_simulation().unwrap();
+        let before_locked = session.document().clone();
+        assert_eq!(
+            session.transform_selection(&crate::selection::Selection::default(), 4, false),
+            Err(EditError::SimulationActive)
+        );
+        assert_eq!(session.document(), &before_locked);
+        assert_eq!(session.undo, undo);
+        assert_eq!(session.redo, redo);
+        assert_eq!(session.next_id, next_id);
+        assert_eq!(session.next_segment_id, next_segment_id);
+    }
+
+    #[test]
     fn world_mirror_composes_orientation_and_keeps_single_origin_fixed() {
         let mut session = Session::default();
         let id = session

@@ -44,15 +44,16 @@ impl CanvasTransform {
         self.zoom
     }
     pub fn to_screen(self, world: Point) -> Pos2 {
+        self.to_screen_exact(f64::from(world[0]), f64::from(world[1]))
+    }
+    /// Projects canonical integer wire coordinates without first rounding them through f32.
+    pub fn to_screen_i32(self, x: i32, y: i32) -> Pos2 {
+        self.to_screen_exact(f64::from(x), f64::from(y))
+    }
+    fn to_screen_exact(self, x: f64, y: f64) -> Pos2 {
         Pos2::new(
-            project(
-                self.screen_anchor.x as f64
-                    + (world[0] as f64 - self.world_anchor[0]) * self.zoom as f64,
-            ),
-            project(
-                self.screen_anchor.y as f64
-                    + (world[1] as f64 - self.world_anchor[1]) * self.zoom as f64,
-            ),
+            project(self.screen_anchor.x as f64 + (x - self.world_anchor[0]) * self.zoom as f64),
+            project(self.screen_anchor.y as f64 + (y - self.world_anchor[1]) * self.zoom as f64),
         )
     }
     pub fn to_world(self, screen: Pos2) -> Point {
@@ -322,6 +323,20 @@ mod tests {
     fn view() -> Rect {
         Rect::from_min_max(Pos2::new(30., 20.), Pos2::new(630., 420.))
     }
+    #[test]
+    fn canonical_large_integer_wire_coordinates_are_not_rounded_through_f32() {
+        let transform =
+            CanvasTransform::anchored(Pos2::ZERO, [16_777_216.0, 16_777_216.0], 1.0).unwrap();
+        assert_eq!(
+            transform.to_screen_i32(16_777_217, 16_777_219),
+            Pos2::new(1.0, 3.0)
+        );
+        assert_eq!(
+            transform.to_screen([16_777_217.0, 16_777_219.0]),
+            Pos2::new(0.0, 4.0)
+        );
+    }
+
     #[test]
     fn transform_round_trip_and_relative_origin() {
         let t = CanvasTransform::new(Pos2::new(208., 8.), 2.5).unwrap();

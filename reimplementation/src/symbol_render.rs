@@ -66,6 +66,10 @@ impl Palette {
     }
 }
 
+/// Maximum absolute component center for which f32 artwork math retains sub-unit geometry.
+/// Canonical integer wires use f64 projection and are not constrained by this symbol limit.
+pub const MAX_EXACT_SYMBOL_CENTER: f32 = 1_048_576.0;
+
 /// An anchor in world units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacedAnchor {
@@ -99,6 +103,12 @@ impl SymbolLayout {
         orientation: crate::domain::Orientation,
     ) -> Option<Self> {
         let def = symbol(style, kind)?;
+        if center
+            .iter()
+            .any(|coordinate| !coordinate.is_finite() || coordinate.abs() > MAX_EXACT_SYMBOL_CENTER)
+        {
+            return None;
+        }
         let offset =
             crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)?;
         let (ox, oy) = orientation.transform_f32(offset[0], offset[1])?;
@@ -398,6 +408,28 @@ mod tests {
     }
 
     #[test]
+    fn large_symbol_centers_are_rejected_before_f32_artwork_can_drift_from_integer_pins() {
+        assert!(
+            SymbolLayout::oriented_on(
+                SymbolStyle::Rect,
+                ComponentKind::Not,
+                [MAX_EXACT_SYMBOL_CENTER, 0.],
+                crate::domain::Orientation::default(),
+            )
+            .is_some()
+        );
+        assert!(
+            SymbolLayout::oriented_on(
+                SymbolStyle::Rect,
+                ComponentKind::Not,
+                [MAX_EXACT_SYMBOL_CENTER + 1.0, 0.],
+                crate::domain::Orientation::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn gate_pins_of_both_styles_coincide_when_placed_alike() {
         for kind in [ComponentKind::And, ComponentKind::Or, ComponentKind::Not] {
             let pins = |style| -> Vec<Point> {
@@ -637,6 +669,43 @@ mod tests {
                 .all(|&i| (i as usize) < mesh.vertices.len())
         );
         assert_eq!(mesh.indices.len() % 3, 0);
+    }
+
+    #[test]
+    fn mirrored_quarter_turn_has_independent_literal_geometry_in_both_styles() {
+        // These values are deliberately independent of Orientation::transform and the
+        // pin-layout-derived geometry so a shared math regression cannot validate itself.
+        let orientation = crate::domain::Orientation {
+            rotation: 1,
+            mirror: true,
+        };
+        for style in STYLES {
+            let and =
+                SymbolLayout::oriented_on(style, ComponentKind::And, [500., 600.], orientation)
+                    .unwrap();
+            assert_eq!(and.bounds().min, [469.25, 569.25]);
+            assert_eq!(and.bounds().max, [530.75, 630.75]);
+            let and_pins: Vec<_> = and.anchors().map(|a| (a.name, a.position)).collect();
+            assert_eq!(
+                and_pins,
+                vec![
+                    ("pin-in-0", [520., 630.]),
+                    ("pin-in-1", [480., 630.]),
+                    ("pin-out-0", [500., 570.]),
+                ]
+            );
+
+            let not =
+                SymbolLayout::oriented_on(style, ComponentKind::Not, [500., 600.], orientation)
+                    .unwrap();
+            assert_eq!(not.bounds().min, [479.25, 579.25]);
+            assert_eq!(not.bounds().max, [520.75, 620.75]);
+            let not_pins: Vec<_> = not.anchors().map(|a| (a.name, a.position)).collect();
+            assert_eq!(
+                not_pins,
+                vec![("pin-in-0", [500., 620.]), ("pin-out-0", [500., 580.])]
+            );
+        }
     }
 
     #[test]
