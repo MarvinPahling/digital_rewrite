@@ -1015,23 +1015,83 @@ fn subprocess_geometric_fanout_crossings_junctions_and_pin_interior_contract() {
     assert!(failed.stdout.is_empty());
     assert_eq!(fs::read(dir.0.join("junction.dig")).unwrap(), junction);
 
-    // Raw T contact and receiver-pin-on-interior are not implicit connections. Splitting
-    // the stored segment at that exact pin coordinate makes it an explicit endpoint.
+    // A genuine two-segment T: the branch endpoint touches the unsplit trunk interior.
+    // Endpoint-only connectivity does not join these records, so the receiver remains floating.
     let raw_t = endpoint_fixture(
+        &[
+            (K::Input, (0, 0), "driver"),
+            (K::Output, (50, 50), "receiver"),
+        ],
+        &[((0, 0), (100, 0)), ((50, 0), (50, 50))],
+    );
+    fs::write(dir.0.join("raw-t.dig"), &raw_t).unwrap();
+    assert!(cli(&dir, &["open", "raw-t.dig"]).status.success());
+    let invalid = cli(&dir, &["validate", "raw-t.dig"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        diagnostic.contains("Receiver net has no driver"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("Output") && diagnostic.contains("input pin"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("segments #1"), "{diagnostic}");
+    let failed = cli(&dir, &["simulate", "raw-t.dig"]);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("segments #1"));
+    assert_eq!(fs::read(dir.0.join("raw-t.dig")).unwrap(), raw_t);
+
+    // Explicitly splitting the trunk at the same branch point makes this a connected
+    // three-segment net; verify both input values reach the receiver without a short.
+    let split_t = endpoint_fixture(
+        &[
+            (K::Input, (0, 0), "driver"),
+            (K::Output, (50, 50), "receiver"),
+        ],
+        &[((0, 0), (50, 0)), ((50, 0), (100, 0)), ((50, 0), (50, 50))],
+    );
+    fs::write(dir.0.join("split-t.dig"), &split_t).unwrap();
+    assert!(cli(&dir, &["open", "split-t.dig"]).status.success());
+    assert!(cli(&dir, &["validate", "split-t.dig"]).status.success());
+    for level in [0, 1] {
+        let simulated = cli(
+            &dir,
+            &["simulate", "split-t.dig", "--input", &format!("0={level}")],
+        );
+        assert!(
+            simulated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&simulated.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&simulated.stdout)
+                .contains(&format!("output id=1 label=\"receiver\" value={level}")),
+            "{}",
+            String::from_utf8_lossy(&simulated.stdout)
+        );
+    }
+    assert_eq!(fs::read(dir.0.join("split-t.dig")).unwrap(), split_t);
+
+    // Separate pin-on-interior case: the receiver pin itself is on the unsplit trunk.
+    let raw_pin_interior = endpoint_fixture(
         &[
             (K::Input, (0, 0), "driver"),
             (K::Output, (50, 0), "receiver"),
         ],
         &[((0, 0), (100, 0))],
     );
-    fs::write(dir.0.join("raw-t.dig"), &raw_t).unwrap();
-    let opened = cli(&dir, &["open", "raw-t.dig"]);
+    fs::write(dir.0.join("raw-pin-interior.dig"), &raw_pin_interior).unwrap();
+    let opened = cli(&dir, &["open", "raw-pin-interior.dig"]);
     assert!(
         opened.status.success(),
         "{}",
         String::from_utf8_lossy(&opened.stderr)
     );
-    let invalid = cli(&dir, &["validate", "raw-t.dig"]);
+    let invalid = cli(&dir, &["validate", "raw-pin-interior.dig"]);
     assert_eq!(invalid.status.code(), Some(1));
     assert!(invalid.stdout.is_empty());
     let diagnostic = String::from_utf8_lossy(&invalid.stderr);
@@ -1045,10 +1105,14 @@ fn subprocess_geometric_fanout_crossings_junctions_and_pin_interior_contract() {
             && diagnostic.contains("input pin"),
         "{diagnostic}"
     );
-    let failed = cli(&dir, &["simulate", "raw-t.dig"]);
+    let failed = cli(&dir, &["simulate", "raw-pin-interior.dig"]);
     assert_eq!(failed.status.code(), Some(1));
     assert!(failed.stdout.is_empty());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("input pin"));
+    assert_eq!(
+        fs::read(dir.0.join("raw-pin-interior.dig")).unwrap(),
+        raw_pin_interior
+    );
     let disconnected = endpoint_fixture(&[(K::Output, (300, 0), "isolated")], &[]);
     fs::write(dir.0.join("disconnected.dig"), &disconnected).unwrap();
     assert!(cli(&dir, &["open", "disconnected.dig"]).status.success());
@@ -1085,7 +1149,10 @@ fn subprocess_geometric_fanout_crossings_junctions_and_pin_interior_contract() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("output id=1 label=\"receiver\" value=1")
     );
-    assert_eq!(fs::read(dir.0.join("raw-t.dig")).unwrap(), raw_t);
+    assert_eq!(
+        fs::read(dir.0.join("raw-pin-interior.dig")).unwrap(),
+        raw_pin_interior
+    );
     assert_eq!(fs::read(dir.0.join("split-pin.dig")).unwrap(), split);
 }
 
