@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-// Icons are not wired into the UI yet; the module is only exercised by its tests.
+// App icon/splash exports remain intentionally unused by the native shell.
 #[allow(dead_code)]
 mod assets;
 mod canvas;
 use digital_rust::{components, domain, engine, file_session, runtime, selection, sim_text};
+mod preferences;
 mod symbol_render;
 #[cfg(test)]
 mod symbol_sheet;
@@ -22,6 +23,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Digital Rust",
         ui::native_options(),
-        Box::new(|_| Ok(Box::new(ui::DigitalApp::native()))),
+        Box::new(|cc| Ok(Box::new(ui::DigitalApp::native_with_storage(cc.storage)))),
     )
 }

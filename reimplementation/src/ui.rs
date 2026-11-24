@@ -9,6 +9,7 @@ use crate::{
     domain::{ComponentId, ComponentKind, Document, PinDirection, PinId, PinRef, Position},
     engine::{EditError, SaveError, Session, SimulationError},
     file_session::{DiscardIntent, FileIo, LocalFileIo, PublishOutcome, SaveAsIntent},
+    preferences::{PreferencesError, UiPreferences},
     runtime::{InputChange, Level, SettleOutcome, SimulationOptions},
     sim_text::{describe_latched_oscillation, describe_simulation_error, level_badge, level_text},
     symbol_render::{PaintState, Palette, SymbolLayout, SymbolRenderer},
@@ -71,6 +72,61 @@ fn unique_route_targets(
         .into_iter()
         .filter(|target| seen.insert(*target))
         .collect()
+}
+
+fn decode_tinted_icon_png(
+    bytes: &[u8],
+    px: u32,
+    tint: [u8; 3],
+) -> Result<egui::ColorImage, String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
+    let output_len = reader
+        .output_buffer_size()
+        .ok_or_else(|| "PNG decode size overflow".to_owned())?;
+    if output_len > (px * px * 4) as usize {
+        return Err("PNG decode exceeds the icon pixel bound".into());
+    }
+    let mut data = vec![0; output_len];
+    let info = reader
+        .next_frame(&mut data)
+        .map_err(|error| error.to_string())?;
+    if info.width != px || info.height != px {
+        return Err("PNG dimensions do not match icon size".into());
+    }
+    let source = &data[..info.buffer_size()];
+    let channels = info.color_type.samples() as usize;
+    let mut rgba = Vec::with_capacity((px * px * 4) as usize);
+    for pixel in source.chunks_exact(channels) {
+        let (alpha, coverage) = match info.color_type {
+            png::ColorType::Rgba => (
+                pixel[3],
+                255u8.saturating_sub(
+                    ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3) as u8,
+                ),
+            ),
+            png::ColorType::Rgb => (
+                255,
+                255u8.saturating_sub(
+                    ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3) as u8,
+                ),
+            ),
+            png::ColorType::GrayscaleAlpha => (pixel[1], 255),
+            png::ColorType::Grayscale => (255, 255),
+            _ => return Err("unsupported decoded PNG color type".into()),
+        };
+        rgba.extend_from_slice(&[
+            tint[0],
+            tint[1],
+            tint[2],
+            ((u16::from(alpha) * u16::from(coverage)) / 255) as u8,
+        ]);
+    }
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [px as usize, px as usize],
+        &rgba,
+    ))
 }
 
 fn route_target_description(target: crate::engine::RouteTarget) -> String {
@@ -250,6 +306,28 @@ enum ClipboardAction {
     Paste(Option<String>),
     Duplicate,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellAction {
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    Duplicate,
+    Delete,
+    SelectAll,
+    ZoomFit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActionAvailability {
+    enabled: bool,
+    reason: Option<&'static str>,
+}
 
 pub struct DigitalApp {
     session: Session,
@@ -302,6 +380,12 @@ pub struct DigitalApp {
     fit_view_pending: bool,
     view_action: Option<ViewAction>,
     canvas_rect: Option<Rect>,
+    preferences: UiPreferences,
+    preferences_error: Option<String>,
+    recent_remove: Option<std::path::PathBuf>,
+    icon_textures: std::collections::HashMap<(String, [u8; 3], u32), egui::TextureHandle>,
+    icon_errors: std::collections::HashMap<(String, u32), String>,
+    last_window_title: Option<String>,
 }
 #[derive(Clone, Debug)]
 struct LabelDraft {
@@ -405,14 +489,290 @@ impl DigitalApp {
             fit_view_pending: false,
             view_action: None,
             canvas_rect: None,
+            preferences: UiPreferences::default(),
+            preferences_error: None,
+            recent_remove: None,
+            icon_textures: std::collections::HashMap::new(),
+            icon_errors: std::collections::HashMap::new(),
+            last_window_title: None,
         }
+    }
+    fn with_storage_record(mut self, record: Option<String>) -> Self {
+        if let Some(record) = record {
+            if record.len() > 16 * 1024 {
+                self.preferences_error = Some(PreferencesError::Limit.to_string());
+            } else {
+                match UiPreferences::decode(&record) {
+                    Ok(preferences) => self.preferences = preferences,
+                    Err(error) => self.preferences_error = Some(error.to_string()),
+                }
+            }
+        }
+        self
     }
     pub fn with_clipboard(mut self, clipboard: Box<dyn TextClipboard>) -> Self {
         self.clipboard = clipboard;
         self
     }
-    pub fn native() -> Self {
-        let mut app = Self::default();
+    fn action_availability(&self, action: ShellAction) -> ActionAvailability {
+        let disabled = |reason| ActionAvailability {
+            enabled: false,
+            reason: Some(reason),
+        };
+        if self.modality_active() {
+            return disabled("Finish or cancel the open dialog first");
+        }
+        if self.session.simulation_active() {
+            return disabled("Stop the simulation before editing or changing files");
+        }
+        if self.fragment_draft.is_some() {
+            return disabled("Finish or cancel clipboard placement first");
+        }
+        let gesture = self.drag.is_some()
+            || self.marquee.is_some()
+            || self.pan_owner.is_some()
+            || self.wiring
+            || self.placing.is_some()
+            || self.geometric_route_start.is_some();
+        if gesture && !matches!(action, ShellAction::Open | ShellAction::SaveAs) {
+            return disabled("Finish or cancel the active canvas gesture first");
+        }
+        let selected_component = self.selection.components.iter().any(|id| {
+            self.session
+                .document()
+                .components
+                .iter()
+                .any(|c| c.id == *id)
+        });
+        let segments = self.session.document().wires.geometric().unwrap_or(&[]);
+        let full_wire = self
+            .selection
+            .wires
+            .iter()
+            .any(|(id, mask)| mask.is_both() && segments.iter().any(|s| s.id == *id));
+        let partial = self.selection.wires.values().any(|mask| !mask.is_both());
+        let has_export = selected_component || full_wire;
+        let effective_selection = selected_component
+            || self
+                .selection
+                .wires
+                .iter()
+                .any(|(id, _)| segments.iter().any(|s| s.id == *id))
+            || self.selected.is_some_and(|id| {
+                self.session
+                    .document()
+                    .components
+                    .iter()
+                    .any(|c| c.id == id)
+            })
+            || self
+                .selected_segment
+                .is_some_and(|id| segments.iter().any(|s| s.id == id));
+        let enabled = match action {
+            ShellAction::New => true,
+            ShellAction::Open | ShellAction::Save | ShellAction::SaveAs => self.file_io.is_some(),
+            ShellAction::Undo => self.session.can_undo(),
+            ShellAction::Redo => self.session.can_redo(),
+            ShellAction::Copy | ShellAction::Cut => has_export,
+            ShellAction::Paste => true,
+            ShellAction::Duplicate => has_export,
+            ShellAction::Delete => effective_selection,
+            ShellAction::SelectAll => {
+                !self.session.document().components.is_empty() || !segments.is_empty()
+            }
+            ShellAction::ZoomFit => true,
+        };
+        if enabled {
+            ActionAvailability {
+                enabled: true,
+                reason: (partial
+                    && has_export
+                    && matches!(action, ShellAction::Copy | ShellAction::Cut))
+                .then_some("Partial boundary wire(s) will be omitted"),
+            }
+        } else {
+            let reason = match action {
+                ShellAction::Save => "File access is unavailable",
+                ShellAction::Undo => "Nothing to undo",
+                ShellAction::Redo => "Nothing to redo",
+                ShellAction::Copy | ShellAction::Cut | ShellAction::Duplicate if partial => {
+                    "Only partial wire endpoints are selected; select a component or complete wire"
+                }
+                ShellAction::Copy | ShellAction::Cut | ShellAction::Duplicate => {
+                    "Select an exportable component or complete wire"
+                }
+                ShellAction::Delete => "Select a component or wire to delete",
+                ShellAction::SelectAll => "The circuit is empty",
+                _ => "Action unavailable",
+            };
+            disabled(reason)
+        }
+    }
+    fn run_shell_action(&mut self, action: ShellAction) {
+        self.run_shell_action_with_context(action, None, None);
+    }
+    fn run_shell_action_with_paste(&mut self, action: ShellAction, paste: Option<String>) {
+        self.run_shell_action_with_context(action, paste, None);
+    }
+    fn run_shell_action_with_open_path(&mut self, path: std::path::PathBuf) {
+        self.run_shell_action_with_context(ShellAction::Open, None, Some(path));
+    }
+    fn run_shell_action_with_context(
+        &mut self,
+        action: ShellAction,
+        paste: Option<String>,
+        open_path: Option<std::path::PathBuf>,
+    ) {
+        let availability = self.action_availability(action);
+        if !availability.enabled {
+            if let Some(reason) = availability.reason {
+                self.error = Some(reason.into());
+            }
+            return;
+        }
+        match action {
+            ShellAction::New => self.begin_pending(PendingAction::New),
+            ShellAction::Open => {
+                if let Some(path) = open_path {
+                    self.begin_pending(PendingAction::Open(path));
+                } else {
+                    self.open_path_dialog();
+                }
+            }
+            ShellAction::Save => self.begin_save(false),
+            ShellAction::SaveAs => self.save_path_dialog(false),
+            ShellAction::Copy => self.run_clipboard_action(ClipboardAction::Copy),
+            ShellAction::Cut => self.run_clipboard_action(ClipboardAction::Cut),
+            ShellAction::Paste => self.run_clipboard_action(ClipboardAction::Paste(paste)),
+            ShellAction::Duplicate => self.run_clipboard_action(ClipboardAction::Duplicate),
+            ShellAction::Undo => {
+                self.cancel_edit_gestures();
+                if self.session.undo().is_ok() {
+                    self.selection.clear();
+                    self.selected = None;
+                    self.selected_segment = None;
+                }
+            }
+            ShellAction::Redo => {
+                self.cancel_edit_gestures();
+                if self.session.redo().is_ok() {
+                    self.selection.clear();
+                    self.selected = None;
+                    self.selected_segment = None;
+                }
+            }
+            ShellAction::Delete => {
+                let result = if !self.selection.is_empty() {
+                    self.session.delete_selection(&self.selection)
+                } else if let Some(id) = self.selected {
+                    self.session.delete(id).map(|_| true)
+                } else if let Some(id) = self.selected_segment {
+                    self.session.delete_geometric_segment(id)
+                } else {
+                    Ok(false)
+                };
+                match result {
+                    Ok(_) => {
+                        self.selection.clear();
+                        self.selected = None;
+                        self.selected_segment = None;
+                        self.error = None;
+                    }
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            }
+            ShellAction::SelectAll => {
+                self.selection.components = self
+                    .session
+                    .document()
+                    .components
+                    .iter()
+                    .map(|c| c.id)
+                    .collect();
+                self.selection.wires = self
+                    .session
+                    .document()
+                    .wires
+                    .geometric()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|s| (s.id, crate::selection::EndpointMask::BOTH))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.selected = (self.selection.components.len() == 1
+                    && self.selection.wires.is_empty())
+                .then(|| self.selection.components.iter().next().copied())
+                .flatten();
+                self.selected_segment = None;
+            }
+            ShellAction::ZoomFit => self.view_action = Some(ViewAction::Fit),
+        }
+    }
+    fn toolbar_icon(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &str,
+        label: &str,
+        hint: &str,
+        action: ShellAction,
+    ) {
+        let status = self.action_availability(action);
+        let visuals = ui.visuals();
+        let rgb = [
+            visuals.text_color().r(),
+            visuals.text_color().g(),
+            visuals.text_color().b(),
+        ];
+        let scale = ui.ctx().pixels_per_point();
+        let px = if scale >= 1.5 { 48 } else { 24 };
+        let key = (id.to_owned(), rgb, px);
+        if !self.icon_textures.contains_key(&key)
+            && !self.icon_errors.contains_key(&(id.into(), px))
+        {
+            let decoded = crate::assets::icon_png(id, px)
+                .ok_or_else(|| "manifest icon missing".to_owned())
+                .and_then(|bytes| decode_tinted_icon_png(bytes, px, rgb));
+            match decoded {
+                Ok(image) => {
+                    let texture = ui.ctx().load_texture(
+                        format!("shell-icon-{id}-{rgb:?}-{px}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.icon_textures.insert(key.clone(), texture);
+                }
+                Err(error) => {
+                    self.icon_errors.insert((id.into(), px), error);
+                }
+            }
+        }
+        let mut button = egui::Button::new(egui::RichText::new(label).size(12.0));
+        if let Some(texture) = self.icon_textures.get(&key) {
+            button = egui::Button::image_and_text(
+                egui::Image::new((texture.id(), egui::vec2(16.0, 16.0))).alt_text(label),
+                label,
+            );
+        }
+        let response = ui
+            .add_enabled(status.enabled, button)
+            .on_hover_text(format!(
+                "{label} ({hint}){}",
+                status.reason.map(|r| format!(" — {r}")).unwrap_or_default()
+                    + &self
+                        .icon_errors
+                        .get(&(id.into(), px))
+                        .map(|error| format!(" — icon fallback: {error}"))
+                        .unwrap_or_default()
+            ));
+        if response.clicked() {
+            self.run_shell_action(action);
+        }
+    }
+    pub fn native_with_storage(storage: Option<&dyn eframe::Storage>) -> Self {
+        let record = storage.and_then(|storage| storage.get_string("digital-rust.ui-preferences"));
+        let mut app = Self::default().with_storage_record(record);
         let clipboard = NativeClipboard::new();
         app.clipboard_error = clipboard.init_error.clone();
         app.with_clipboard(Box::new(clipboard))
@@ -1015,27 +1375,33 @@ impl DigitalApp {
                 }
             },
             PendingAction::Open(path) => {
-                let result = self
-                    .file_io
-                    .as_mut()
-                    .ok_or_else(|| {
-                        self.file_io_error
-                            .clone()
-                            .unwrap_or_else(|| "File access unavailable".into())
-                    })
-                    .and_then(|io| {
-                        self.session
-                            .open_path(io.as_mut(), &path, DiscardIntent::DiscardDirty)
-                            .map_err(|e| e.to_string())
-                    });
+                let result = self.file_io.as_mut().map(|io| {
+                    self.session
+                        .open_path(io.as_mut(), &path, DiscardIntent::DiscardDirty)
+                });
                 match result {
-                    Ok(()) => {
+                    Some(Ok(())) => {
                         self.reset_document_ui();
                         self.fit_view_pending = true;
+                        self.remember_current_path();
                     }
-                    Err(error) => {
-                        self.error = Some(error);
-                        self.pending_action = Some(PendingAction::Open(path));
+                    Some(Err(error)) => {
+                        if let digital_rust::engine::SessionDigError::File(file) = &error
+                            && file.source.kind() == std::io::ErrorKind::NotFound
+                            && self.preferences.recent.contains(&path)
+                        {
+                            self.recent_remove = Some(path.clone());
+                        }
+                        self.error = Some(error.to_string());
+                        self.pending_action = None;
+                    }
+                    None => {
+                        self.error = Some(
+                            self.file_io_error
+                                .clone()
+                                .unwrap_or_else(|| "File access unavailable".into()),
+                        );
+                        self.pending_action = None;
                     }
                 }
             }
@@ -1137,7 +1503,17 @@ impl DigitalApp {
             Err(error) => self.error = Some(error.to_string()),
         }
     }
+    fn remember_current_path(&mut self) {
+        if let Some(path) = self.session.path()
+            && path.is_absolute()
+            && let Err(error) = self.preferences.promote(path.to_path_buf())
+        {
+            self.preferences_error =
+                Some(format!("Recent circuit path was not persisted: {error}"));
+        }
+    }
     fn after_save(&mut self, outcome: PublishOutcome, continuation: bool) {
+        self.remember_current_path();
         match outcome {
             PublishOutcome::Published => {
                 if continuation {
@@ -1152,9 +1528,158 @@ impl DigitalApp {
             }
         }
     }
+    fn top_shell(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("shell_toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let mut file = None;
+                let mut edit = None;
+                ui.menu_button("File", |ui| {
+                    for (label, action) in [
+                        ("New  Ctrl/Cmd+N", ShellAction::New),
+                        ("Open…  Ctrl/Cmd+O", ShellAction::Open),
+                        ("Save  Ctrl/Cmd+S", ShellAction::Save),
+                        ("Save As…  Shift+Ctrl/Cmd+S", ShellAction::SaveAs),
+                    ] {
+                        let a = self.action_availability(action);
+                        if ui
+                            .add_enabled(a.enabled, egui::Button::new(label))
+                            .on_hover_text(a.reason.unwrap_or("Create/open/save a circuit"))
+                            .clicked()
+                        {
+                            file = Some(action);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    let recent_status = self.action_availability(ShellAction::Open);
+                    ui.add_enabled_ui(recent_status.enabled, |ui| {
+                        ui.menu_button("Open Recent", |ui| {
+                            if self.preferences.recent.is_empty() {
+                                ui.label("No recent circuits");
+                            }
+                            for path in self.preferences.recent.clone() {
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                                ui.menu_button(name, |ui| {
+                                    if ui.button("Open").clicked() {
+                                        self.run_shell_action_with_open_path(path.clone());
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Remove from Recent").clicked() {
+                                        self.preferences.remove(&path);
+                                        ui.close_menu();
+                                    }
+                                    ui.small(path.to_string_lossy());
+                                });
+                            }
+                            if !self.preferences.recent.is_empty()
+                                && ui.button("Clear Recent").clicked()
+                            {
+                                self.preferences.recent.clear();
+                            }
+                        })
+                        .response
+                        .on_hover_text(recent_status.reason.unwrap_or("Open a recent circuit"));
+                    });
+                });
+                ui.menu_button("Edit", |ui| {
+                    for (label, action) in [
+                        ("Undo  Ctrl/Cmd+Z", ShellAction::Undo),
+                        ("Redo  Shift+Ctrl/Cmd+Z", ShellAction::Redo),
+                        ("Cut  Ctrl/Cmd+X", ShellAction::Cut),
+                        ("Copy  Ctrl/Cmd+C", ShellAction::Copy),
+                        ("Paste  Ctrl/Cmd+V", ShellAction::Paste),
+                        ("Duplicate  Ctrl/Cmd+D", ShellAction::Duplicate),
+                        ("Delete", ShellAction::Delete),
+                        ("Select All  Ctrl/Cmd+A", ShellAction::SelectAll),
+                    ] {
+                        let a = self.action_availability(action);
+                        if ui
+                            .add_enabled(a.enabled, egui::Button::new(label))
+                            .on_hover_text(a.reason.unwrap_or("Apply to the current circuit"))
+                            .clicked()
+                        {
+                            edit = Some(action);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.separator();
+                for (id, label, hint, action) in [
+                    ("file-new", "New", "Ctrl/Cmd+N", ShellAction::New),
+                    ("file-open", "Open", "Ctrl/Cmd+O", ShellAction::Open),
+                    ("file-save", "Save", "Ctrl/Cmd+S", ShellAction::Save),
+                    (
+                        "file-save-as",
+                        "Save As",
+                        "Shift+Ctrl/Cmd+S",
+                        ShellAction::SaveAs,
+                    ),
+                    ("edit-undo", "Undo", "Ctrl/Cmd+Z", ShellAction::Undo),
+                    ("edit-redo", "Redo", "Shift+Ctrl/Cmd+Z", ShellAction::Redo),
+                    ("edit-copy", "Copy", "Ctrl/Cmd+C", ShellAction::Copy),
+                    ("edit-delete", "Delete", "Delete", ShellAction::Delete),
+                    ("view-fit-window", "Fit", "F", ShellAction::ZoomFit),
+                ] {
+                    self.toolbar_icon(ui, id, label, hint, action);
+                }
+                for (label, hint, action) in [
+                    ("Cut", "Ctrl/Cmd+X", ShellAction::Cut),
+                    ("Paste", "Ctrl/Cmd+V", ShellAction::Paste),
+                    ("Duplicate", "Ctrl/Cmd+D", ShellAction::Duplicate),
+                    ("All", "Ctrl/Cmd+A", ShellAction::SelectAll),
+                ] {
+                    let availability = self.action_availability(action);
+                    if ui
+                        .add_enabled(availability.enabled, egui::Button::new(label))
+                        .on_hover_text(format!(
+                            "{label} ({hint}){}",
+                            availability
+                                .reason
+                                .map(|r| format!(" — {r}"))
+                                .unwrap_or_default()
+                        ))
+                        .clicked()
+                    {
+                        self.run_shell_action(action);
+                    }
+                }
+                if let Some(action) = file {
+                    self.run_shell_action(action);
+                }
+                if let Some(action) = edit {
+                    self.run_shell_action(action);
+                }
+            });
+        });
+    }
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let filename = self
+            .session
+            .path()
+            .and_then(std::path::Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        let title = format!(
+            "{}{} — Digital Rust",
+            filename,
+            if self.session.dirty() { "*" } else { "" }
+        );
+        if self.last_window_title.as_deref() != Some(&title) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = Some(title);
+        }
+    }
     fn file_actions(&mut self, ctx: &egui::Context) {
-        let locked = self.session.simulation_active() || self.modality_active();
+        let canvas_focused = self
+            .canvas_id
+            .is_some_and(|id| ctx.memory(|memory| memory.focused() == Some(id)));
         let shortcut = ctx.input_mut(|i| {
+            if !canvas_focused {
+                return None;
+            }
             let command = egui::Modifiers::COMMAND;
             let shift = egui::Modifiers {
                 shift: true,
@@ -1172,31 +1697,20 @@ impl DigitalApp {
                 None
             }
         });
-        if !locked && let Some(action) = shortcut {
-            match action {
-                0 => self.begin_pending(PendingAction::New),
-                1 => self.open_path_dialog(),
-                2 => self.begin_save(false),
-                _ => self.save_path_dialog(false),
-            }
+        if let Some(index) = shortcut {
+            let action = match index {
+                0 => ShellAction::New,
+                1 => ShellAction::Open,
+                2 => ShellAction::Save,
+                _ => ShellAction::SaveAs,
+            };
+            self.run_shell_action(action);
         }
     }
     fn file_modal_ui(&mut self, ctx: &egui::Context) {
         let Some(modal) = self.file_modal.clone() else {
             return;
         };
-        // Durability diagnostics are rendered in the palette panel so the complete list remains
-        // visible and the acknowledgement control is operable even for several warnings.
-        if matches!(
-            modal,
-            FileModal::PublishedWarning { .. }
-                | FileModal::OpenPath
-                | FileModal::SavePath { .. }
-                | FileModal::Unsaved
-                | FileModal::RunningClose
-        ) {
-            return;
-        }
         enum Choice {
             Cancel,
             Open(std::path::PathBuf),
@@ -1209,20 +1723,20 @@ impl DigitalApp {
             ContinueClose,
         }
         let mut choice = None;
-        egui::Modal::new(egui::Id::new("document_file_modal")).show(ctx, |ui| {
+        let modal_response=egui::Modal::new(egui::Id::new("document_file_modal")).show(ctx, |ui| {
             ui.set_min_width(360.);
             match &modal {
                 FileModal::OpenPath | FileModal::SavePath { .. } => {
                     let saving = matches!(modal, FileModal::SavePath { .. });
                     ui.heading(if saving { "Save As" } else { "Open document" });
-                    ui.label("Path (absolute or relative to the application's startup directory):");
+                    ui.label("Path relative to the application's startup directory, or an absolute path:");
                     ui.text_edit_singleline(&mut self.file_path_entry);
                     ui.horizontal(|ui| {
-                        if ui.button(if saving { "Save" } else { "Open" }).clicked() {
+                        if ui.button(if saving { "Save path" } else { "Open path" }).clicked() {
                             let path = std::path::PathBuf::from(self.file_path_entry.as_str());
                             if saving { choice = Some(Choice::Save(path)); } else { choice = Some(Choice::Open(path)); }
                         }
-                        if ui.button("Cancel").clicked() { choice = Some(Choice::Cancel); }
+                        if ui.button("Cancel path").clicked() { choice = Some(Choice::Cancel); }
                     });
                     if let Some(error) = &self.file_io_error { ui.colored_label(ui.visuals().error_fg_color, error); }
                 }
@@ -1265,7 +1779,11 @@ impl DigitalApp {
                 }
             }
         });
+        if !modal_response.is_top_modal {
+            ctx.request_repaint();
+        }
         if let Some(choice) = choice {
+            ctx.request_repaint();
             match choice {
                 Choice::Cancel => {
                     self.file_modal = None;
@@ -2003,11 +2521,6 @@ impl DigitalApp {
         });
     }
     fn palette_panel(&mut self, ctx: &egui::Context) {
-        let mut acknowledge_warning = None;
-        let mut path_choice: Option<(bool, std::path::PathBuf, bool)> = None;
-        let mut cancel_path = false;
-        let mut unsaved_choice = None;
-        let mut running_close_choice = None;
         egui::SidePanel::left("palette").show(ctx, |ui| {
             ui.heading("Components");
             let locked = self.session.simulation_active() || self.modality_active() || self.fragment_draft.is_some();
@@ -2116,153 +2629,18 @@ impl DigitalApp {
             if let Some(error) = &self.file_io_error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
-            if let Some(FileModal::PublishedWarning { diagnostics, continuation }) = self.file_modal.clone() {
-                ui.colored_label(ui.visuals().warn_fg_color, "Published; durability unconfirmed. Session is clean; review all diagnostics.");
-                egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
-                    for diagnostic in diagnostics { ui.label(diagnostic); }
-                });
-                if ui.button("Acknowledge and continue").clicked() { acknowledge_warning = Some(continuation); }
+            if let Some(error) = &self.preferences_error {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("Recent-file preferences were not loaded/saved: {error}"));
             }
-            if matches!(self.file_modal, Some(FileModal::RunningClose)) {
-                ui.separator();
-                ui.heading("Simulation is running");
-                ui.label("Closing will stop the simulation. Cancel preserves its current runtime state.");
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Stop and continue closing").clicked() { running_close_choice = Some(true); }
-                    if ui.button("Cancel").clicked() { running_close_choice = Some(false); }
-                });
-            }
-            if matches!(self.file_modal, Some(FileModal::Unsaved)) {
-                ui.separator();
-                ui.heading("Unsaved changes");
-                ui.label("Save changes before continuing?");
-                if self.session.simulation_active() {
-                    ui.colored_label(ui.visuals().warn_fg_color, "Stop simulation before saving. Cancel preserves the running simulation.");
+            if let Some(path) = self.recent_remove.clone() {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("Recent circuit is missing: {}", path.display()));
+                if ui.button("Remove missing circuit from Recent").clicked() {
+                    self.preferences.remove(&path);
+                    self.recent_remove = None;
                 }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(!self.session.simulation_active() && self.file_io.is_some(), egui::Button::new("Save")).clicked() { unsaved_choice = Some(0); }
-                    if ui.button("Discard").clicked() { unsaved_choice = Some(1); }
-                    if ui.button("Cancel").clicked() { unsaved_choice = Some(2); }
-                    if self.session.simulation_active() && ui.button("Stop simulation").clicked() { unsaved_choice = Some(3); }
-                });
-            }
-            match self.file_modal.clone() {
-                Some(FileModal::OpenPath) | Some(FileModal::SavePath { .. }) => {
-                    let saving = matches!(self.file_modal, Some(FileModal::SavePath { .. }));
-                    let continuation = matches!(self.file_modal, Some(FileModal::SavePath { continuation: true }));
-                    ui.separator();
-                    ui.heading(if saving { "Save As" } else { "Open document" });
-                    ui.label("Path relative to the application's startup directory, or an absolute path:");
-                    ui.text_edit_singleline(&mut self.file_path_entry);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button(if saving { "Save path" } else { "Open path" }).clicked() {
-                            path_choice = Some((saving, std::path::PathBuf::from(self.file_path_entry.as_str()), continuation));
-                        }
-                        if ui.button("Cancel path").clicked() { cancel_path = true; }
-                    });
-                }
-                _ => {}
             }
             ui.separator();
-            let document_name = self
-                .session
-                .path()
-                .and_then(std::path::Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".into());
-            ui.heading(format!(
-                "{}{}",
-                if self.session.dirty() { "• " } else { "" },
-                document_name
-            ));
-            let mut file_action = None;
-            let mut edit_action = None;
-            if !self.modality_active() {
-            ui.menu_button("File", |ui| {
-                for (label, enabled, action) in [("New  Ctrl/Cmd+N", !locked, 0), ("Open…  Ctrl/Cmd+O", !locked, 1), ("Save  Ctrl/Cmd+S", !locked, 2), ("Save As…  Shift+Ctrl/Cmd+S", !locked, 3)] {
-                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() { file_action = Some(action); ui.close_menu(); }
-                }
-            });
-            ui.menu_button("Edit", |ui| {
-                for (label, action) in [("Copy  Ctrl/Cmd+C", 0), ("Cut  Ctrl/Cmd+X", 1), ("Paste  Ctrl/Cmd+V", 2), ("Duplicate  Ctrl/Cmd+D", 3)] {
-                    if ui.add_enabled(!locked && self.fragment_draft.is_none(), egui::Button::new(label)).clicked() {
-                        edit_action = Some(action); ui.close_menu();
-                    }
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                for (label, action) in [("New", 0), ("Open", 1), ("Save", 2), ("Save As", 3)] {
-                    if ui.add_enabled(!locked, egui::Button::new(label)).clicked() { file_action = Some(action); }
-                }
-            });
-            if let Some(action) = edit_action {
-                self.run_clipboard_action(match action {
-                    0 => ClipboardAction::Copy, 1 => ClipboardAction::Cut,
-                    2 => ClipboardAction::Paste(None), _ => ClipboardAction::Duplicate,
-                });
-            }
-            if let Some(action) = file_action {
-                match action {
-                    0 => self.begin_pending(PendingAction::New),
-                    1 => self.open_path_dialog(),
-                    2 => self.begin_save(false),
-                    _ => self.save_path_dialog(false)
-                }
-            }
-            }
         });
-        if let Some(continuation) = acknowledge_warning {
-            self.file_modal = None;
-            if continuation {
-                self.complete_pending();
-            }
-        }
-        if cancel_path {
-            self.file_modal = None;
-            self.pending_action = None;
-        }
-        match unsaved_choice {
-            Some(0) => {
-                self.file_modal = None;
-                self.begin_save(true);
-            }
-            Some(1) => {
-                self.file_modal = None;
-                self.complete_pending();
-            }
-            Some(2) => {
-                self.file_modal = None;
-                self.pending_action = None;
-            }
-            Some(3) => {
-                let _ = self.session.stop_simulation();
-                self.settling = false;
-            }
-            _ => {}
-        }
-        if let Some(continue_close) = running_close_choice {
-            if continue_close {
-                let _ = self.session.stop_simulation();
-                self.settling = false;
-                self.file_modal = None;
-                if self.session.dirty() {
-                    self.file_modal = Some(FileModal::Unsaved);
-                } else {
-                    self.complete_pending();
-                }
-            } else {
-                self.file_modal = None;
-                self.pending_action = None;
-            }
-        }
-        if let Some((saving, path, continuation)) = path_choice {
-            self.file_modal = None;
-            if saving {
-                self.save_as_path(path, continuation, false);
-            } else {
-                self.begin_pending(PendingAction::Open(path));
-            }
-        }
     }
     fn show(&mut self, ctx: &egui::Context) {
         if self.session.oscillation_diagnostic().is_none()
@@ -2288,6 +2666,9 @@ impl DigitalApp {
         let modal_open = self.modality_active();
         if !modal_open {
             self.simulation_shortcuts(ctx);
+        }
+        if !self.modality_active() {
+            self.top_shell(ctx);
         }
         self.palette_panel(ctx);
         self.simulation_panel(ctx);
@@ -2984,7 +3365,13 @@ impl DigitalApp {
                     _ => None,
                 }));
                 if let Some(action) = platform_action.or(shortcut_action) {
-                    self.run_clipboard_action(action);
+                    let (shell, paste) = match action {
+                        ClipboardAction::Copy => (ShellAction::Copy, None),
+                        ClipboardAction::Cut => (ShellAction::Cut, None),
+                        ClipboardAction::Paste(text) => (ShellAction::Paste, text),
+                        ClipboardAction::Duplicate => (ShellAction::Duplicate, None),
+                    };
+                    self.run_shell_action_with_paste(shell, paste);
                 }
             }
             if owns_keyboard && self.fragment_draft.is_none() {
@@ -3000,12 +3387,7 @@ impl DigitalApp {
             }
             if owns_keyboard && !locked && self.fragment_draft.is_none() {
                 let select_all = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A) || i.consume_key(egui::Modifiers::CTRL, egui::Key::A));
-                if select_all {
-                    self.selection.components = self.session.document().components.iter().map(|c| c.id).collect();
-                    self.selection.wires = self.session.document().wires.geometric().map(|segments| segments.iter().map(|s| (s.id, crate::selection::EndpointMask::BOTH)).collect()).unwrap_or_default();
-                    self.selected = (self.selection.components.len()==1).then(|| self.selection.components.iter().next().copied()).flatten();
-                    self.selected_segment = None;
-                }
+                if select_all { self.run_shell_action(ShellAction::SelectAll); }
                 // Shift+arrows nudge the mixed selection; unmodified arrows remain camera pan.
                 let nudge = ctx.input(|i| i.events.iter().find_map(|event| match event {
                     egui::Event::Key { key, pressed: true, modifiers, .. }
@@ -3195,23 +3577,8 @@ impl DigitalApp {
                 }
             }
             if owns_keyboard
-                && !locked
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace))
-            {
-                let result = if let Some(id)=self.selected.filter(|id| !self.selection.components.contains(id)) {
-                    self.session.delete(id).map(|_| true)
-                } else if !self.selection.is_empty() {
-                    self.session.delete_selection(&self.selection)
-                } else if let Some(id)=self.selected_segment {
-                    self.session.delete_geometric_segment(id)
-                } else if let Some(id)=self.selected {
-                    self.session.delete(id).map(|_| true)
-                } else { Ok(false) };
-                match result {
-                    Ok(_) => { self.selection.clear(); self.selected=None; self.selected_segment=None; self.drag=None; self.error=None; }
-                    Err(e) => self.error = Some(e.to_string()),
-                }
-            }
+            { self.run_shell_action(ShellAction::Delete); }
             let (undo, redo) = if owns_keyboard && !locked && self.fragment_draft.is_none() {
                 ctx.input_mut(|i| {
                     let command = egui::Modifiers::COMMAND;
@@ -3229,41 +3596,34 @@ impl DigitalApp {
             } else {
                 (false, false)
             };
-            if undo {
-                self.focused_pin = None;
-                self.focused_route_target = None;
-                self.geometric_route_start = None;
-                if self.session.undo().is_ok() {
-                    self.selected = None;
-                    self.selected_segment = None;
-                    self.selection.clear();
-                    self.drag = None;
-                }
-            }
-            if redo {
-                self.focused_pin = None;
-                self.focused_route_target = None;
-                self.geometric_route_start = None;
-                if self.session.redo().is_ok() {
-                    self.selected = None;
-                    self.selected_segment = None;
-                    self.selection.clear();
-                    self.drag = None;
-                }
-            }
+            if undo { self.focused_pin = None; self.focused_route_target = None; self.geometric_route_start = None; self.run_shell_action(ShellAction::Undo); }
+            if redo { self.focused_pin = None; self.focused_route_target = None; self.geometric_route_start = None; self.run_shell_action(ShellAction::Redo); }
         });
         if !modal_open {
             self.advance_simulation(ctx);
         }
         self.file_modal_ui(ctx);
         self.label_modal_ui(ctx);
+        self.sync_window_title(ctx);
     }
 }
 impl eframe::App for DigitalApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.show(ctx);
     }
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        match self.preferences.encode() {
+            Ok(record) => {
+                storage.set_string("digital-rust.ui-preferences", record);
+                storage.flush();
+                self.preferences_error = None;
+            }
+            Err(error) => self.preferences_error = Some(error.to_string()),
+        }
+    }
 }
+#[cfg(test)]
+mod shell_polish_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4611,7 +4971,20 @@ mod tests {
             events,
             ..Default::default()
         };
-        ctx.run(input, |ctx| app.show(ctx))
+        let had_file_modal = app.file_modal.is_some();
+        let output = ctx.run(input, |ctx| app.show(ctx));
+        if had_file_modal || app.file_modal.is_some() {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| app.show(ctx),
+            )
+        } else {
+            output
+        }
     }
     fn has_line(output: &egui::FullOutput, from: Pos2, to: Pos2, width: f32) -> bool {
         output.shapes.iter().any(|shape| matches!(&shape.shape,
@@ -4876,8 +5249,9 @@ mod tests {
             .connect([pin(a, PinDirection::Output), pin(b, PinDirection::Input)])
             .unwrap();
         frame(&ctx, &mut app, vec![], true);
-        let start = Pos2::new(308., 108.);
-        let end = Pos2::new(358., 158.);
+        let transform = app.view.transform(app.canvas_rect.unwrap()).unwrap();
+        let start = transform.to_screen([100., 100.]);
+        let end = transform.to_screen([150., 150.]);
         frame(
             &ctx,
             &mut app,
@@ -4903,7 +5277,10 @@ mod tests {
                 .unwrap()
                 .pin_position(pin)
                 .unwrap();
-            Pos2::new(p[0] + 208., p[1] + 8.)
+            app.view
+                .transform(app.canvas_rect.unwrap())
+                .unwrap()
+                .to_screen(p)
         };
         let moved = anchor(ComponentKind::Input, [150., 150.], input_pin);
         let old = anchor(ComponentKind::Input, [100., 100.], input_pin);
@@ -5334,7 +5711,10 @@ mod tests {
         app.pending_action = Some(PendingAction::Open(dir.join("missing.dig")));
         app.complete_pending();
         assert_eq!(app.view, view, "failed Open preserves the camera");
-        assert!(app.pending_action.is_some());
+        assert!(
+            app.pending_action.is_none(),
+            "failed Open must clear its pending action"
+        );
         app.pending_action = None;
         app.open_path_dialog();
         type_file_path(&ctx, &mut app, "cancelled.dig");
@@ -5585,7 +5965,11 @@ mod tests {
             .place(ComponentKind::Input, Position { x: 100., y: 100. })
             .unwrap();
         frame(&ctx, &mut app, vec![], true);
-        let p = Pos2::new(308., 108.);
+        let p = app
+            .view
+            .transform(app.canvas_rect.unwrap())
+            .unwrap()
+            .to_screen([100., 100.]);
         frame(
             &ctx,
             &mut app,
@@ -5628,10 +6012,21 @@ mod tests {
             vec![key(egui::Key::Delete, egui::Modifiers::NONE)],
             true,
         );
+        assert_eq!(
+            app.session.document().components.len(),
+            1,
+            "Delete is locked during the live drag"
+        );
         frame(
             &ctx,
             &mut app,
             vec![button(p + Vec2::new(30., 0.), false)],
+            true,
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Delete, egui::Modifiers::NONE)],
             true,
         );
         assert!(app.session.document().components.is_empty());
@@ -5673,16 +6068,14 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = DigitalApp::default();
         frame(&ctx, &mut app, vec![], true);
-        let palette = Pos2::new(30., 29.);
-        frame(
-            &ctx,
-            &mut app,
-            vec![egui::Event::PointerMoved(palette), button(palette, true)],
-            true,
-        );
-        frame(&ctx, &mut app, vec![button(palette, false)], true);
+        click_text(&ctx, &mut app, "Input");
         assert_eq!(app.placing, Some(ComponentKind::Input));
-        let p = Pos2::new(308., 108.);
+        let palette = Pos2::new(30., 50.);
+        let p = app
+            .view
+            .transform(app.canvas_rect.unwrap())
+            .unwrap()
+            .to_screen([100., 100.]);
         frame(
             &ctx,
             &mut app,
@@ -5850,13 +6243,12 @@ mod tests {
             vec![key(egui::Key::Delete, egui::Modifiers::NONE)],
             true,
         );
-        assert_eq!(app.error.as_deref(), Some("Unknown component"));
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
-            ..Default::default()
-        };
-        let output = ctx.run(input, |ctx| app.show(ctx));
-        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("Unknown component"))));
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Select a component or wire to delete")
+        );
+        let output = frame(&ctx, &mut app, vec![], true);
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("Select a component or wire to delete"))));
     }
     #[test]
     fn edge_drag_and_noop_preserve_redo() {
@@ -6223,7 +6615,11 @@ mod tests {
         // the position, beyond the much smaller input symbol.
         assert!(bounds.max[0] < 100. + 35.);
         let click = |ctx: &egui::Context, app: &mut DigitalApp, world: [f32; 2]| {
-            let p = Pos2::new(208. + world[0], 8. + world[1]);
+            let p = app
+                .view
+                .transform(app.canvas_rect.unwrap())
+                .unwrap()
+                .to_screen(world);
             frame(
                 ctx,
                 app,
@@ -6250,7 +6646,11 @@ mod tests {
         let bounds = SymbolLayout::centered_on(SymbolStyle::Ieee, ComponentKind::Or, [100., 100.])
             .unwrap()
             .bounds();
-        let p = Pos2::new(208. + bounds.min[0] + 1., 8. + 100.);
+        let p = app
+            .view
+            .transform(app.canvas_rect.unwrap())
+            .unwrap()
+            .to_screen([bounds.min[0] + 1., 100.]);
         frame(
             &ctx,
             &mut app,
@@ -6468,6 +6868,9 @@ mod tests {
     }
     /// Clicks the widget whose text is exactly `label`, as found in a freshly painted frame.
     fn click_text(ctx: &egui::Context, app: &mut DigitalApp, label: &str) {
+        if app.file_modal.is_some() {
+            let _ = frame(ctx, app, vec![], true);
+        }
         let output = frame(ctx, app, vec![], true);
         let pos = output
             .shapes
@@ -6480,6 +6883,9 @@ mod tests {
         click_at(ctx, app, pos + Vec2::new(4., 4.));
     }
     fn type_file_path(ctx: &egui::Context, app: &mut DigitalApp, path: &str) {
+        if app.file_modal.is_some() {
+            let _ = frame(ctx, app, vec![], true);
+        }
         let output = frame(ctx, app, vec![], true);
         let label = output
             .shapes
@@ -6497,7 +6903,7 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("path field label is missing: {:?}", texts(&output)));
-        click_at(ctx, app, label + Vec2::new(40., 47.));
+        click_at(ctx, app, label + Vec2::new(40., 28.));
         frame(
             ctx,
             app,
@@ -6819,8 +7225,12 @@ mod tests {
         assert!(app.session.simulation_active());
         let before = app.session.document().clone();
         let history_probe = before.wires.len();
-        // Drag the NOT gate (canvas origin is at 208, 8).
-        let start = Pos2::new(308. + 100., 108.);
+        // Drag the NOT gate using the live canvas transform.
+        let start = app
+            .view
+            .transform(app.canvas_rect.unwrap())
+            .unwrap()
+            .to_screen([200., 100.]);
         let end = start + Vec2::new(50., 50.);
         frame(
             &ctx,
@@ -6859,7 +7269,12 @@ mod tests {
         let shown = frame(&ctx, &mut app, vec![], true);
         assert!(has_text(&shown, "Editing is locked"));
         // A click on an Input component toggles it instead of selecting for a drag.
-        click_at(&ctx, &mut app, Pos2::new(308., 108.));
+        let input_screen = app
+            .view
+            .transform(app.canvas_rect.unwrap())
+            .unwrap()
+            .to_screen([100., 100.]);
+        click_at(&ctx, &mut app, input_screen);
         frame(&ctx, &mut app, vec![], true);
         assert_eq!(output_level(&app, output), Some(Level::Low));
         assert_eq!(*app.session.document(), before);
@@ -6992,6 +7407,10 @@ mod tests {
             .session
             .place(ComponentKind::Input, Position { x: 0., y: 0. })
             .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let canvas = app.canvas_id.unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(canvas));
+        frame(&ctx, &mut app, vec![], true);
         press(&ctx, &mut app, egui::Key::N, egui::Modifiers::COMMAND);
         assert!(matches!(app.file_modal, Some(FileModal::Unsaved)));
         assert_eq!(app.session.document().components[0].id, original);
@@ -7035,7 +7454,7 @@ mod tests {
         assert!(!app.session.dirty());
         assert!(!app.wiring);
         if let Some(rect) = app.canvas_rect {
-            click_at(&ctx, &mut app, rect.center());
+            click_at(&ctx, &mut app, rect.right_bottom() - Vec2::splat(20.));
         }
         let output = frame(
             &ctx,
@@ -7052,6 +7471,8 @@ mod tests {
             has_line(&output, a, b, 2.0) || has_line(&output, b, a, 2.0),
             "the exact geometric segment must be drawn"
         );
+        press(&ctx, &mut app, egui::Key::W, egui::Modifiers::NONE);
+        assert!(!app.wiring);
         click_at(&ctx, &mut app, transform.to_screen([5.5, 5.5]));
         assert_eq!(app.selected_segment, Some(0));
         frame(
@@ -7870,10 +8291,11 @@ mod tests {
             })
         ));
         let warning_frame = frame(&ctx, &mut app, vec![], true);
-        assert!(has_text(
-            &warning_frame,
-            "Published; durability unconfirmed"
-        ));
+        assert!(
+            has_text(&warning_frame, "File published; durability unconfirmed"),
+            "{:?}",
+            texts(&warning_frame)
+        );
         let close_input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
             focused: true,
