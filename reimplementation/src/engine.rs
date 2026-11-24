@@ -836,14 +836,36 @@ impl Session {
         self.edit(next);
         Ok(())
     }
-    fn commit_geometric(&mut self, segments: Vec<crate::geometric_wiring::Segment>) -> bool {
+    /// Publish geometry and its monotonic ID high-water mark as one transaction.
+    fn commit_geometric(
+        &mut self,
+        segments: Vec<crate::geometric_wiring::Segment>,
+    ) -> Result<bool, EditError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for segment in &segments {
+            if !ids.insert(segment.id) {
+                return Err(EditError::Geometry(
+                    crate::geometric_wiring::GeometryError::DuplicateId(segment.id),
+                ));
+            }
+        }
+        let next_segment_id = match segments.iter().map(|segment| segment.id).max() {
+            Some(max_id) => {
+                self.next_segment_id
+                    .max(max_id.checked_add(1).ok_or(EditError::Geometry(
+                        crate::geometric_wiring::GeometryError::IdExhausted,
+                    ))?)
+            }
+            None => self.next_segment_id,
+        };
         let mut next = self.document.clone();
         next.wires = crate::domain::Wiring::GeometricSegments(segments);
         if next == self.document {
-            return false;
+            return Ok(false);
         }
         self.edit(next);
-        true
+        self.next_segment_id = next_segment_id;
+        Ok(true)
     }
     pub fn add_geometric_segments(
         &mut self,
@@ -858,6 +880,9 @@ impl Session {
             .wires
             .geometric()
             .map_err(EditError::Geometry)?;
+        if segments.is_empty() {
+            return Ok(false);
+        }
         let mut all = existing.to_vec();
         let mut next_id = self.next_segment_id;
         for &(a, b) in segments {
@@ -872,16 +897,12 @@ impl Session {
             ))?;
         }
         let normalized =
-            crate::geometric_wiring::normalize_with_high_water(&all, next_id.saturating_sub(1))
+            crate::geometric_wiring::normalize_with_high_water(&all, self.next_segment_id)
                 .map_err(EditError::Geometry)?;
         if normalized == existing {
             return Ok(false);
         }
-        let changed = self.commit_geometric(normalized);
-        if changed {
-            self.next_segment_id = next_id;
-        }
-        Ok(changed)
+        self.commit_geometric(normalized)
     }
     pub fn delete_geometric_segment(&mut self, id: u64) -> Result<bool, EditError> {
         self.ensure_editable()?;
@@ -896,12 +917,10 @@ impl Session {
         if segments.len() == count {
             return Ok(false);
         }
-        let normalized = crate::geometric_wiring::normalize_with_high_water(
-            &segments,
-            self.next_segment_id.saturating_sub(1),
-        )
-        .map_err(EditError::Geometry)?;
-        Ok(self.commit_geometric(normalized))
+        let normalized =
+            crate::geometric_wiring::normalize_with_high_water(&segments, self.next_segment_id)
+                .map_err(EditError::Geometry)?;
+        self.commit_geometric(normalized)
     }
     pub fn move_geometric_segment(&mut self, id: u64, dx: i32, dy: i32) -> Result<bool, EditError> {
         self.ensure_editable()?;
@@ -914,6 +933,9 @@ impl Session {
         let Some(segment) = segments.iter_mut().find(|segment| segment.id == id) else {
             return Ok(false);
         };
+        if dx == 0 && dy == 0 {
+            return Ok(false);
+        }
         let shift = |point: crate::geometric_wiring::Point| {
             Some(crate::geometric_wiring::Point::new(
                 point.x.checked_add(dx)?,
@@ -926,12 +948,10 @@ impl Session {
         segment.b = shift(segment.b).ok_or(EditError::Geometry(
             crate::geometric_wiring::GeometryError::InvalidMigration("coordinate overflow"),
         ))?;
-        let normalized = crate::geometric_wiring::normalize_with_high_water(
-            &segments,
-            self.next_segment_id.saturating_sub(1),
-        )
-        .map_err(EditError::Geometry)?;
-        Ok(self.commit_geometric(normalized))
+        let normalized =
+            crate::geometric_wiring::normalize_with_high_water(&segments, self.next_segment_id)
+                .map_err(EditError::Geometry)?;
+        self.commit_geometric(normalized)
     }
     pub fn move_geometric_endpoint(
         &mut self,
@@ -955,16 +975,20 @@ impl Session {
             return Ok(false);
         };
         if endpoint == 0 {
+            if segment.a == point {
+                return Ok(false);
+            }
             segment.a = point;
         } else {
+            if segment.b == point {
+                return Ok(false);
+            }
             segment.b = point;
         }
-        let normalized = crate::geometric_wiring::normalize_with_high_water(
-            &segments,
-            self.next_segment_id.saturating_sub(1),
-        )
-        .map_err(EditError::Geometry)?;
-        Ok(self.commit_geometric(normalized))
+        let normalized =
+            crate::geometric_wiring::normalize_with_high_water(&segments, self.next_segment_id)
+                .map_err(EditError::Geometry)?;
+        self.commit_geometric(normalized)
     }
     pub fn split_geometric_segment(
         &mut self,
@@ -998,20 +1022,13 @@ impl Session {
             ));
         }
         let segment_id = self.next_segment_id;
-        let next_id = segment_id.checked_add(1).ok_or(EditError::Geometry(
-            crate::geometric_wiring::GeometryError::IdExhausted,
-        ))?;
         segments[index].b = point;
         segments.push(crate::geometric_wiring::Segment {
             id: segment_id,
             a: point,
             b: original.b,
         });
-        let changed = self.commit_geometric(segments);
-        if changed {
-            self.next_segment_id = next_id;
-        }
-        Ok(changed)
+        self.commit_geometric(segments)
     }
     pub fn merge_geometric_segments(&mut self) -> Result<bool, EditError> {
         self.ensure_editable()?;
@@ -1020,10 +1037,10 @@ impl Session {
                 .wires
                 .geometric()
                 .map_err(EditError::Geometry)?,
-            self.next_segment_id.saturating_sub(1),
+            self.next_segment_id,
         )
         .map_err(EditError::Geometry)?;
-        Ok(self.commit_geometric(normalized))
+        self.commit_geometric(normalized)
     }
     /// Canonical, transactional legacy-route conversion. The codec's shared pin metrics/router
     /// create route points and its import checker proves the same pin partition is recovered.
@@ -1070,36 +1087,29 @@ impl Session {
                 "canonical routing changes pin connectivity",
             ));
         }
-        let segments: Vec<crate::geometric_wiring::Segment> = dig
-            .wires
-            .iter()
-            .enumerate()
-            .map(|(id, wire)| crate::geometric_wiring::Segment {
-                id: id as u64,
-                a: crate::geometric_wiring::Point::new(wire.p1.x, wire.p1.y),
-                b: crate::geometric_wiring::Point::new(wire.p2.x, wire.p2.y),
-            })
-            .collect();
-        let normalized = crate::geometric_wiring::normalize(&segments).map_err(|_| {
-            SessionDigError::GeometryMigration("canonical routes cannot be normalized")
-        })?;
         if matches!(
             self.document.wires,
             crate::domain::Wiring::GeometricSegments(_)
         ) {
             return Err(SessionDigError::GeometricMode);
         }
-        let mut next = self.document.clone();
-        next.wires = crate::domain::Wiring::GeometricSegments(normalized.clone());
-        self.next_segment_id = normalized
+        let segments: Vec<crate::geometric_wiring::Segment> = dig
+            .wires
             .iter()
-            .map(|segment| segment.id)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(SessionDigError::GeometryMigration("segment ID exhausted"))?;
-        self.edit(next);
-        Ok(true)
+            .enumerate()
+            .map(|(index, wire)| crate::geometric_wiring::Segment {
+                id: self.next_segment_id.saturating_add(index as u64),
+                a: crate::geometric_wiring::Point::new(wire.p1.x, wire.p1.y),
+                b: crate::geometric_wiring::Point::new(wire.p2.x, wire.p2.y),
+            })
+            .collect();
+        let normalized =
+            crate::geometric_wiring::normalize_with_high_water(&segments, self.next_segment_id)
+                .map_err(|_| {
+                    SessionDigError::GeometryMigration("canonical routes cannot be normalized")
+                })?;
+        self.commit_geometric(normalized)
+            .map_err(|_| SessionDigError::GeometryMigration("segment ID exhausted"))
     }
     pub fn undo(&mut self) -> Result<(), EditError> {
         self.ensure_editable()?;
@@ -1153,6 +1163,162 @@ mod tests {
             .unwrap();
         session
     }
+    #[test]
+    fn geometric_session_keeps_allocated_ids_unique_and_migration_high_water_monotonic() {
+        let mut session = Session::default();
+        session.migrate_to_geometric_wiring().unwrap();
+        session
+            .add_geometric_segments(&[(Point::new(0, 0), Point::new(10, 0))])
+            .unwrap();
+        let original = session.document().wires.geometric().unwrap()[0].id;
+        assert!(
+            session
+                .split_geometric_segment(original, Point::new(5, 0))
+                .unwrap()
+        );
+        session
+            .add_geometric_segments(&[(Point::new(5, 0), Point::new(5, 5))])
+            .unwrap();
+        let ids = session
+            .document()
+            .wires
+            .geometric()
+            .unwrap()
+            .iter()
+            .map(|segment| segment.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ids.len(),
+            session.document().wires.geometric().unwrap().len()
+        );
+        let issued = *ids.iter().max().unwrap();
+        assert!(session.next_segment_id > issued);
+        session
+            .add_geometric_segments(&[(Point::new(20, 0), Point::new(30, 0))])
+            .unwrap();
+        let ids = session
+            .document()
+            .wires
+            .geometric()
+            .unwrap()
+            .iter()
+            .map(|segment| segment.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ids.len(),
+            session.document().wires.geometric().unwrap().len()
+        );
+
+        let mut empty_migration = Session::default();
+        empty_migration.migrate_to_geometric_wiring().unwrap();
+        empty_migration
+            .add_geometric_segments(&[(Point::new(0, 0), Point::new(10, 0))])
+            .unwrap();
+        let issued = empty_migration.document().wires.geometric().unwrap()[0].id;
+        empty_migration.undo().unwrap();
+        empty_migration.undo().unwrap();
+        empty_migration.migrate_to_geometric_wiring().unwrap();
+        empty_migration
+            .add_geometric_segments(&[(Point::new(20, 0), Point::new(30, 0))])
+            .unwrap();
+        let reissued = empty_migration.document().wires.geometric().unwrap()[0].id;
+        assert!(reissued > issued);
+
+        let mut migrated = simple_legacy_session();
+        migrated.migrate_to_geometric_wiring().unwrap();
+        let prior_max = migrated
+            .document()
+            .wires
+            .geometric()
+            .unwrap()
+            .iter()
+            .map(|segment| segment.id)
+            .max()
+            .unwrap();
+        migrated.undo().unwrap();
+        migrated.migrate_to_geometric_wiring().unwrap();
+        let remigrated_min = migrated
+            .document()
+            .wires
+            .geometric()
+            .unwrap()
+            .iter()
+            .map(|segment| segment.id)
+            .min()
+            .unwrap();
+        assert!(remigrated_min > prior_max);
+    }
+
+    #[test]
+    fn split_rejects_duplicate_ids_transactionally() {
+        let mut session = Session::default();
+        session.migrate_to_geometric_wiring().unwrap();
+        session
+            .add_geometric_segments(&[(Point::new(0, 0), Point::new(10, 0))])
+            .unwrap();
+        let id = session.document().wires.geometric().unwrap()[0].id;
+        session.next_segment_id = id;
+        let document = session.document().clone();
+        let undo = session.undo.clone();
+        let redo = session.redo.clone();
+        assert!(matches!(
+            session.split_geometric_segment(id, Point::new(5, 0)),
+            Err(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::DuplicateId(duplicate)
+            )) if duplicate == id
+        ));
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo, undo);
+        assert_eq!(session.redo, redo);
+        assert_eq!(session.next_segment_id, id);
+    }
+
+    #[test]
+    fn geometric_session_noops_preserve_split_geometry_history_and_ids() {
+        let mut session = Session::default();
+        session
+            .start_simulation_with_trace(SimulationOptions::default(), 8)
+            .unwrap();
+        session.settle_simulation(10).unwrap();
+        session.stop_simulation().unwrap();
+        session.migrate_to_geometric_wiring().unwrap();
+        session
+            .add_geometric_segments(&[(Point::new(0, 0), Point::new(10, 0))])
+            .unwrap();
+        let id = session.document().wires.geometric().unwrap()[0].id;
+        session
+            .split_geometric_segment(id, Point::new(5, 0))
+            .unwrap();
+        session
+            .add_geometric_segments(&[(Point::new(20, 0), Point::new(30, 0))])
+            .unwrap();
+        session.undo().unwrap();
+        assert_eq!(session.redo.len(), 1);
+        let document = session.document().clone();
+        let undo = session.undo.clone();
+        let redo = session.redo.clone();
+        let next_id = session.next_segment_id;
+        let trace_state = |trace: &TraceLog| {
+            (
+                trace.header,
+                trace.records().collect::<Vec<_>>(),
+                trace.dropped(),
+                trace.has_unrecorded_stop(),
+            )
+        };
+        let trace = session.trace.as_ref().map(trace_state);
+        assert!(!session.add_geometric_segments(&[]).unwrap());
+        assert!(!session.move_geometric_segment(id, 0, 0).unwrap());
+        let endpoint = session.document().wires.geometric().unwrap()[0].a;
+        assert!(!session.move_geometric_endpoint(id, 0, endpoint).unwrap());
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo, undo);
+        assert_eq!(session.redo, redo);
+        assert_eq!(session.next_segment_id, next_id);
+        assert_eq!(session.trace.as_ref().map(trace_state), trace);
+        assert_eq!(session.document().wires.geometric().unwrap().len(), 2);
+    }
+
     #[test]
     fn session_owns_geometric_batches_history_noops_failures_and_lock() {
         let mut session = Session::default();
