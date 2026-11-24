@@ -15,14 +15,59 @@ fn app_for(dir: &std::path::Path) -> DigitalApp {
     DigitalApp::with_file_io(Some(Box::new(LocalFileIo::new(dir))), None)
 }
 fn frame(ctx: &egui::Context, app: &mut DigitalApp) -> egui::FullOutput {
+    frame_with_events(ctx, app, vec![])
+}
+fn frame_with_events(
+    ctx: &egui::Context,
+    app: &mut DigitalApp,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
     ctx.run(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900., 650.))),
             focused: true,
+            events,
             ..Default::default()
         },
         |ctx| app.show(ctx),
     )
+}
+fn click_at(ctx: &egui::Context, app: &mut DigitalApp, position: Pos2) {
+    frame_with_events(
+        ctx,
+        app,
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    frame_with_events(
+        ctx,
+        app,
+        vec![egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+}
+fn click_text(ctx: &egui::Context, app: &mut DigitalApp, label: &str) {
+    let output = frame(ctx, app);
+    let position = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => Some(text.pos),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no text {label:?}"));
+    click_at(ctx, app, position + Vec2::new(4.0, 4.0));
 }
 fn title(ctx: &egui::Context, app: &mut DigitalApp) -> String {
     let previous = app.last_window_title.clone();
@@ -394,6 +439,48 @@ fn menu_icons_follow_light_dark_theme_and_decode_failures_keep_text_fallback() {
         app.icon_errors
             .contains_key(&("missing-test-icon".into(), 24))
     );
+}
+
+#[test]
+fn clear_recent_menu_removes_missing_warning_without_mutating_document_or_history() {
+    let dir = test_dir();
+    let mut app = app_for(&dir);
+    let target = dir.join("missing.dig");
+    app.preferences.promote(target.clone()).unwrap();
+    app.recent_remove = Some(target);
+    app.session
+        .place(ComponentKind::Output, Position { x: 100.0, y: 80.0 })
+        .unwrap();
+    app.session
+        .set_label(app.session.document().components[0].id, "draft")
+        .unwrap();
+    app.session.undo().unwrap();
+
+    let document = app.session.document().clone();
+    let path = app.session.path().map(std::path::Path::to_path_buf);
+    let dirty = app.session.dirty();
+    let can_undo = app.session.can_undo();
+    let can_redo = app.session.can_redo();
+    assert!(dirty && can_undo && can_redo);
+
+    let ctx = egui::Context::default();
+    click_text(&ctx, &mut app, "File");
+    click_text(&ctx, &mut app, "Open Recent");
+    click_text(&ctx, &mut app, "Clear Recent");
+
+    assert!(app.preferences.recent.is_empty());
+    assert!(app.recent_remove.is_none());
+    assert_eq!(app.session.document(), &document);
+    assert_eq!(app.session.path().map(std::path::Path::to_path_buf), path);
+    assert_eq!(app.session.dirty(), dirty);
+    assert_eq!(app.session.can_undo(), can_undo);
+    assert_eq!(app.session.can_redo(), can_redo);
+    let output = frame(&ctx, &mut app);
+    assert!(!output.shapes.iter().any(|shape| match &shape.shape {
+        egui::Shape::Text(text) => text.galley.job.text.contains("Recent circuit is missing:"),
+        _ => false,
+    }));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

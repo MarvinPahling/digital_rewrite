@@ -1560,6 +1560,10 @@ impl DigitalApp {
             Err(error) => self.error = Some(error.to_string()),
         }
     }
+    fn clear_recent(&mut self) {
+        self.preferences.recent.clear();
+        self.recent_remove = None;
+    }
     fn remember_current_path(&mut self) {
         if let Some(path) = self.session.path()
             && path.is_absolute()
@@ -1660,7 +1664,7 @@ impl DigitalApp {
                             if !self.preferences.recent.is_empty()
                                 && ui.button("Clear Recent").clicked()
                             {
-                                self.preferences.recent.clear();
+                                self.clear_recent();
                             }
                         })
                         .response
