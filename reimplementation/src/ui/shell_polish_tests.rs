@@ -102,6 +102,47 @@ fn viewport_title_reflects_session_path_dirty_baseline_undo_new_open_and_failure
 }
 
 #[test]
+fn keyboard_undo_refusal_during_simulation_preserves_geometric_route_gesture() {
+    let mut app = DigitalApp::default();
+    let id = app
+        .session
+        .place(ComponentKind::Input, Position { x: 80., y: 80. })
+        .unwrap();
+    app.wiring = true;
+    let start = crate::engine::RouteTarget::Pin(PinRef {
+        component: id,
+        pin: crate::domain::PinId {
+            direction: crate::domain::PinDirection::Output,
+            index: 0,
+        },
+    });
+    app.geometric_route_start = Some(start);
+    assert_eq!(
+        app.action_availability(ShellAction::Undo).reason,
+        Some("Finish or cancel the active canvas gesture first")
+    );
+    app.run_shell_action(ShellAction::Undo);
+    assert_eq!(app.geometric_route_start, Some(start));
+    app.wiring = false;
+    app.session.start_simulation().unwrap();
+    let reason = app.action_availability(ShellAction::Undo).reason;
+    assert_eq!(
+        reason,
+        Some("Stop the simulation before editing or changing files")
+    );
+    app.run_shell_action(ShellAction::Undo);
+    assert_eq!(app.geometric_route_start, Some(start));
+    assert!(app.session.simulation_active());
+    assert_eq!(
+        app.action_availability(ShellAction::Redo).reason,
+        Some("Stop the simulation before editing or changing files")
+    );
+    app.run_shell_action(ShellAction::Redo);
+    assert_eq!(app.geometric_route_start, Some(start));
+    app.session.stop_simulation().unwrap();
+}
+
+#[test]
 fn preferences_are_versioned_bounded_lossless_and_outside_document_history() {
     let mut prefs = UiPreferences::default();
     let path = std::path::PathBuf::from("/tmp/a/../odd circuit.dig");
@@ -144,10 +185,7 @@ fn preferences_are_versioned_bounded_lossless_and_outside_document_history() {
     let mut storage = Storage::default();
     <DigitalApp as eframe::App>::save(&mut app, &mut storage);
     assert_eq!(storage.flushes, 1);
-    let restarted = DigitalApp::default().with_storage_record(eframe::Storage::get_string(
-        &storage,
-        "digital-rust.ui-preferences",
-    ));
+    let restarted = DigitalApp::native_with_storage(Some(&storage));
     assert_eq!(restarted.preferences, prefs);
     assert_eq!(restarted.session.document(), &Document::default());
     assert_eq!(app.session.document(), &document);
@@ -327,6 +365,38 @@ fn toolbar_icon_assets_decode_to_theme_mask_at_both_resolutions_and_cache() {
 }
 
 #[test]
+fn menu_icons_follow_light_dark_theme_and_decode_failures_keep_text_fallback() {
+    let ctx = egui::Context::default();
+    let mut app = DigitalApp::default();
+    for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+        ctx.set_visuals(visuals.clone());
+        let expected = [
+            visuals.text_color().r(),
+            visuals.text_color().g(),
+            visuals.text_color().b(),
+        ];
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.menu_icon_button(ui, "file-open", "Open", true);
+            });
+        });
+        assert!(
+            app.icon_textures
+                .contains_key(&("file-open".into(), expected, 24))
+        );
+    }
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            app.menu_icon_button(ui, "missing-test-icon", "Fallback label", true);
+        });
+    });
+    assert!(
+        app.icon_errors
+            .contains_key(&("missing-test-icon".into(), 24))
+    );
+}
+
+#[test]
 fn missing_recent_path_reports_not_found_and_can_be_removed_without_replacing_document() {
     let dir = test_dir();
     let mut app = app_for(&dir);
@@ -351,6 +421,19 @@ fn missing_recent_path_reports_not_found_and_can_be_removed_without_replacing_do
     app.preferences.remove(&target);
     app.recent_remove = None;
     assert!(!app.preferences.recent.contains(&target));
+    let xml = digital_rust::formats::serialize_v2(
+        &digital_rust::formats::from_domain(&Document::default()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&target, xml).unwrap();
+    app.preferences.promote(target.clone()).unwrap();
+    app.recent_remove = Some(target.clone());
+    app.begin_pending(PendingAction::Open(target.clone()));
+    assert!(app.session.path().is_some_and(|path| path == target));
+    assert_eq!(
+        app.recent_remove, None,
+        "successful reopen clears stale missing marker"
+    );
     assert!(
         app.preferences
             .recent

@@ -646,16 +646,16 @@ impl DigitalApp {
             ShellAction::Paste => self.run_clipboard_action(ClipboardAction::Paste(paste)),
             ShellAction::Duplicate => self.run_clipboard_action(ClipboardAction::Duplicate),
             ShellAction::Undo => {
-                self.cancel_edit_gestures();
                 if self.session.undo().is_ok() {
+                    self.cancel_edit_gestures();
                     self.selection.clear();
                     self.selected = None;
                     self.selected_segment = None;
                 }
             }
             ShellAction::Redo => {
-                self.cancel_edit_gestures();
                 if self.session.redo().is_ok() {
+                    self.cancel_edit_gestures();
                     self.selection.clear();
                     self.selected = None;
                     self.selected_segment = None;
@@ -710,6 +710,60 @@ impl DigitalApp {
             ShellAction::ZoomFit => self.view_action = Some(ViewAction::Fit),
         }
     }
+    fn menu_icon_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &str,
+        label: &str,
+        enabled: bool,
+    ) -> egui::Response {
+        let visuals = ui.visuals();
+        let tint = [
+            visuals.text_color().r(),
+            visuals.text_color().g(),
+            visuals.text_color().b(),
+        ];
+        let px = if ui.ctx().pixels_per_point() >= 1.5 {
+            48
+        } else {
+            24
+        };
+        let key = (id.to_owned(), tint, px);
+        if !self.icon_textures.contains_key(&key)
+            && !self.icon_errors.contains_key(&(id.into(), px))
+        {
+            match crate::assets::icon_png(id, px)
+                .ok_or_else(|| "manifest icon missing".to_owned())
+                .and_then(|bytes| decode_tinted_icon_png(bytes, px, tint))
+            {
+                Ok(image) => {
+                    let texture = ui.ctx().load_texture(
+                        format!("shell-icon-{id}-{tint:?}-{px}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.icon_textures.insert(key.clone(), texture);
+                }
+                Err(error) => {
+                    self.icon_errors.insert((id.into(), px), error);
+                }
+            }
+        }
+        let mut button = egui::Button::new(label);
+        if let Some(texture) = self.icon_textures.get(&key) {
+            button = egui::Button::image_and_text(
+                egui::Image::new((texture.id(), egui::vec2(16.0, 16.0))).alt_text(label),
+                label,
+            );
+        }
+        ui.add_enabled(enabled, button).on_hover_text(format!(
+            "{label}{}",
+            self.icon_errors
+                .get(&(id.into(), px))
+                .map(|error| format!(" — icon fallback: {error}"))
+                .unwrap_or_default()
+        ))
+    }
     fn toolbar_icon(
         &mut self,
         ui: &mut egui::Ui,
@@ -755,17 +809,19 @@ impl DigitalApp {
                 label,
             );
         }
+        let tooltip = format!(
+            "{label} ({hint}){}",
+            status.reason.map(|r| format!(" — {r}")).unwrap_or_default()
+                + &self
+                    .icon_errors
+                    .get(&(id.into(), px))
+                    .map(|error| format!(" — icon fallback: {error}"))
+                    .unwrap_or_default()
+        );
         let response = ui
             .add_enabled(status.enabled, button)
-            .on_hover_text(format!(
-                "{label} ({hint}){}",
-                status.reason.map(|r| format!(" — {r}")).unwrap_or_default()
-                    + &self
-                        .icon_errors
-                        .get(&(id.into(), px))
-                        .map(|error| format!(" — icon fallback: {error}"))
-                        .unwrap_or_default()
-            ));
+            .on_hover_text(tooltip.clone())
+            .on_disabled_hover_text(tooltip);
         if response.clicked() {
             self.run_shell_action(action);
         }
@@ -1383,6 +1439,7 @@ impl DigitalApp {
                     Some(Ok(())) => {
                         self.reset_document_ui();
                         self.fit_view_pending = true;
+                        self.recent_remove = None;
                         self.remember_current_path();
                     }
                     Some(Err(error)) => {
@@ -1506,10 +1563,19 @@ impl DigitalApp {
     fn remember_current_path(&mut self) {
         if let Some(path) = self.session.path()
             && path.is_absolute()
-            && let Err(error) = self.preferences.promote(path.to_path_buf())
         {
-            self.preferences_error =
-                Some(format!("Recent circuit path was not persisted: {error}"));
+            let path = path.to_path_buf();
+            if self
+                .recent_remove
+                .as_ref()
+                .is_some_and(|missing| missing == &path)
+            {
+                self.recent_remove = None;
+            }
+            if let Err(error) = self.preferences.promote(path) {
+                self.preferences_error =
+                    Some(format!("Recent circuit path was not persisted: {error}"));
+            }
         }
     }
     fn after_save(&mut self, outcome: PublishOutcome, continuation: bool) {
@@ -1541,9 +1607,23 @@ impl DigitalApp {
                         ("Save As…  Shift+Ctrl/Cmd+S", ShellAction::SaveAs),
                     ] {
                         let a = self.action_availability(action);
-                        if ui
-                            .add_enabled(a.enabled, egui::Button::new(label))
+                        let icon = match action {
+                            ShellAction::New => Some("file-new"),
+                            ShellAction::Open => Some("file-open"),
+                            ShellAction::Save => Some("file-save"),
+                            ShellAction::SaveAs => Some("file-save-as"),
+                            _ => None,
+                        };
+                        let response = if let Some(icon) = icon {
+                            self.menu_icon_button(ui, icon, label, a.enabled)
+                        } else {
+                            ui.add_enabled(a.enabled, egui::Button::new(label))
+                        };
+                        if response
                             .on_hover_text(a.reason.unwrap_or("Create/open/save a circuit"))
+                            .on_disabled_hover_text(
+                                a.reason.unwrap_or("Create/open/save a circuit"),
+                            )
                             .clicked()
                         {
                             file = Some(action);
@@ -1569,6 +1649,9 @@ impl DigitalApp {
                                     }
                                     if ui.button("Remove from Recent").clicked() {
                                         self.preferences.remove(&path);
+                                        if self.recent_remove.as_ref() == Some(&path) {
+                                            self.recent_remove = None;
+                                        }
                                         ui.close_menu();
                                     }
                                     ui.small(path.to_string_lossy());
@@ -1581,7 +1664,10 @@ impl DigitalApp {
                             }
                         })
                         .response
-                        .on_hover_text(recent_status.reason.unwrap_or("Open a recent circuit"));
+                        .on_hover_text(recent_status.reason.unwrap_or("Open a recent circuit"))
+                        .on_disabled_hover_text(
+                            recent_status.reason.unwrap_or("Open a recent circuit"),
+                        );
                     });
                 });
                 ui.menu_button("Edit", |ui| {
@@ -1596,9 +1682,23 @@ impl DigitalApp {
                         ("Select All  Ctrl/Cmd+A", ShellAction::SelectAll),
                     ] {
                         let a = self.action_availability(action);
-                        if ui
-                            .add_enabled(a.enabled, egui::Button::new(label))
+                        let icon = match action {
+                            ShellAction::Undo => Some("edit-undo"),
+                            ShellAction::Redo => Some("edit-redo"),
+                            ShellAction::Copy => Some("edit-copy"),
+                            ShellAction::Delete => Some("edit-delete"),
+                            _ => None,
+                        };
+                        let response = if let Some(icon) = icon {
+                            self.menu_icon_button(ui, icon, label, a.enabled)
+                        } else {
+                            ui.add_enabled(a.enabled, egui::Button::new(label))
+                        };
+                        if response
                             .on_hover_text(a.reason.unwrap_or("Apply to the current circuit"))
+                            .on_disabled_hover_text(
+                                a.reason.unwrap_or("Apply to the current circuit"),
+                            )
                             .clicked()
                         {
                             edit = Some(action);
@@ -1635,6 +1735,13 @@ impl DigitalApp {
                     if ui
                         .add_enabled(availability.enabled, egui::Button::new(label))
                         .on_hover_text(format!(
+                            "{label} ({hint}){}",
+                            availability
+                                .reason
+                                .map(|r| format!(" — {r}"))
+                                .unwrap_or_default()
+                        ))
+                        .on_disabled_hover_text(format!(
                             "{label} ({hint}){}",
                             availability
                                 .reason
@@ -3596,8 +3703,12 @@ impl DigitalApp {
             } else {
                 (false, false)
             };
-            if undo { self.focused_pin = None; self.focused_route_target = None; self.geometric_route_start = None; self.run_shell_action(ShellAction::Undo); }
-            if redo { self.focused_pin = None; self.focused_route_target = None; self.geometric_route_start = None; self.run_shell_action(ShellAction::Redo); }
+            if undo {
+                self.run_shell_action(ShellAction::Undo);
+            }
+            if redo {
+                self.run_shell_action(ShellAction::Redo);
+            }
         });
         if !modal_open {
             self.advance_simulation(ctx);
@@ -4944,6 +5055,8 @@ mod tests {
             true,
         );
         assert_eq!(app.focused_pin.unwrap().component, visible);
+        // Undo is intentionally refused while a wiring gesture owns the canvas.
+        app.wiring = false;
         frame(
             &ctx,
             &mut app,
