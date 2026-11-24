@@ -105,7 +105,7 @@ pub fn logical_pin_partitions(document: &Document) -> Result<Vec<Vec<PinRef>>, C
             }
         }
     }
-    let result = match &document.wires {
+    let mut result = match &document.wires {
         Wiring::LegacyPinPairs(wires) => {
             let mut parent: Vec<_> = (0..pins.len()).collect();
             let mut ids = HashSet::new();
@@ -168,6 +168,13 @@ pub fn logical_pin_partitions(document: &Document) -> Result<Vec<Vec<PinRef>>, C
             })?
         }
     };
+    // Partition enumeration differs by adapter: legacy union-find exposes roots in wire
+    // insertion order, while geometric resolution emits nets in geometric order. Canonicalize
+    // both the pins and the partition list so connectivity comparisons are representation-neutral.
+    for partition in &mut result {
+        partition.sort_unstable();
+    }
+    result.sort_unstable();
     Ok(result)
 }
 

@@ -1480,6 +1480,72 @@ mod tests {
     }
 
     #[test]
+    fn public_migration_accepts_canonical_partitions_with_unused_pins_and_wire_order_variance() {
+        use crate::domain::{PinDirection, PinId};
+
+        fn make_session(reverse: bool) -> Session {
+            let mut session = Session::default();
+            let source_a = session
+                .place(ComponentKind::Input, Position { x: 18.0, y: 0.0 })
+                .unwrap();
+            // This unconnected source sorts between the two connected nets geometrically.
+            session
+                .place(ComponentKind::Input, Position { x: 18.0, y: 200.0 })
+                .unwrap();
+            let output_c = session
+                .place(ComponentKind::Output, Position { x: 78.0, y: 0.0 })
+                .unwrap();
+            let source_d = session
+                .place(ComponentKind::Input, Position { x: 18.0, y: 80.0 })
+                .unwrap();
+            let output_e = session
+                .place(ComponentKind::Output, Position { x: 78.0, y: 80.0 })
+                .unwrap();
+            let output_pin = |component| PinRef {
+                component,
+                pin: PinId {
+                    direction: PinDirection::Output,
+                    index: 0,
+                },
+            };
+            let input_pin = |component| PinRef {
+                component,
+                pin: PinId {
+                    direction: PinDirection::Input,
+                    index: 0,
+                },
+            };
+            let first = [output_pin(source_a), input_pin(output_c)];
+            let second = [output_pin(source_d), input_pin(output_e)];
+            if reverse {
+                session.connect([second[1], second[0]]).unwrap();
+                session.connect([first[1], first[0]]).unwrap();
+            } else {
+                session.connect(first).unwrap();
+                session.connect(second).unwrap();
+            }
+            session
+        }
+
+        let mut first_order = make_session(false);
+        let mut reverse_order = make_session(true);
+        assert!(first_order.migrate_to_geometric_wiring().unwrap());
+        assert!(reverse_order.migrate_to_geometric_wiring().unwrap());
+        assert!(matches!(
+            first_order.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
+        assert!(matches!(
+            reverse_order.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
+        assert_eq!(
+            crate::simulation::logical_pin_partitions(first_order.document()).unwrap(),
+            crate::simulation::logical_pin_partitions(reverse_order.document()).unwrap()
+        );
+    }
+
+    #[test]
     fn migration_compares_connectivity_without_requiring_electrical_completeness() {
         let mut session = Session::default();
         session
