@@ -9,6 +9,7 @@ pub mod geometric_wiring;
 pub mod pin_geometry;
 pub mod runtime;
 pub mod selection;
+pub mod signal;
 pub mod sim_text;
 pub mod simulation;
 pub mod symbol_render;
