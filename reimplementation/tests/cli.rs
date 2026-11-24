@@ -237,6 +237,8 @@ fn set_component_at(
         },
         label: label.into(),
         constant_value: true,
+        rotation: 0,
+        mirror: false,
     });
 }
 fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
@@ -302,6 +304,8 @@ fn cli_reports_real_feedback_startup_oscillation_without_success_rows() {
         position: Position { x: 0., y: 0. },
         label: "ring".into(),
         constant_value: true,
+        rotation: 0,
+        mirror: false,
     }];
     let document = Document {
         wires: routed_wires(&components, &[(output, input)]),
@@ -743,6 +747,8 @@ fn feedback_startup_exhaustion_is_an_error_with_replay_seed_and_no_rows() {
         position: Position { x: 0., y: 0. },
         label: "loop".into(),
         constant_value: true,
+        rotation: 0,
+        mirror: false,
     }];
     let doc = Document {
         wires: routed_wires(&components, &[(output, input)]),
@@ -819,6 +825,8 @@ fn trace_terminal_failure_reports_diagnostic_rows_without_settled_success() {
             position: Position { x: 0., y: 0. },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         },
         Component {
             id: ComponentId(2),
@@ -826,6 +834,8 @@ fn trace_terminal_failure_reports_diagnostic_rows_without_settled_success() {
             position: Position { x: 100., y: 0. },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         },
     ];
     let document = Document {
@@ -878,6 +888,8 @@ fn endpoint_fixture(
             y: *y,
             label: Some((*label).into()),
             value: None,
+            rotation: 0,
+            mirror: false,
         })
         .collect();
     let wires = wires

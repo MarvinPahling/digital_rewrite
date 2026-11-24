@@ -31,6 +31,8 @@ pub struct DigElement {
     pub label: Option<String>,
     /// Explicit Digital Const value; None distinguishes an omitted default from explicit HIGH.
     pub value: Option<bool>,
+    pub rotation: u8,
+    pub mirror: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,11 +171,22 @@ pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
         "visualElements",
     )?;
     for (index, element) in document.elements.iter().enumerate() {
+        if element.rotation > 3 {
+            return Err(write_error(
+                DigWriteErrorKind::UnsupportedValue,
+                format!("elements[{index}].rotation"),
+                "rotation must be a quarter-turn value from 0 through 3",
+            ));
+        }
         let context = format!("elements[{index}]");
         write_bytes(&mut output, b"<visualElement><elementName>", &context)?;
         write_text(&mut output, &element.name, &format!("{context}.name"))?;
         write_bytes(&mut output, b"</elementName><elementAttributes", &context)?;
-        if element.label.is_none() && element.value.is_none() {
+        if element.label.is_none()
+            && element.value.is_none()
+            && element.rotation == 0
+            && !element.mirror
+        {
             write_bytes(&mut output, b"/>", &context)?;
         } else {
             write_bytes(&mut output, b">", &context)?;
@@ -194,6 +207,26 @@ pub fn serialize_v2(document: &DigV2) -> Result<Vec<u8>, DigWriteError> {
                 )?;
                 write_bytes(&mut output, if value { b"1" } else { b"0" }, &context)?;
                 write_bytes(&mut output, b"</long></entry>", &context)?;
+            }
+            if element.rotation != 0 {
+                write_bytes(
+                    &mut output,
+                    b"<entry><string>rotation</string><rotation rotation=\"",
+                    &context,
+                )?;
+                write_bytes(
+                    &mut output,
+                    element.rotation.to_string().as_bytes(),
+                    &context,
+                )?;
+                write_bytes(&mut output, b"\"/></entry>", &context)?;
+            }
+            if element.mirror {
+                write_bytes(
+                    &mut output,
+                    b"<entry><string>mirror</string><boolean>true</boolean></entry>",
+                    &context,
+                )?;
             }
             write_bytes(&mut output, b"</elementAttributes>", &context)?;
         }
@@ -425,10 +458,21 @@ fn write_clipboard_element(
             "Value is supported only for Const",
         ));
     }
+    if element.rotation > 3 {
+        return Err(write_error(
+            DigWriteErrorKind::UnsupportedValue,
+            "rotation",
+            "rotation must be between 0 and 3 quarter-turns",
+        ));
+    }
     write_bytes(output, b"<visualElement><elementName>", "element")?;
     write_text(output, &element.name, "elementName")?;
     write_bytes(output, b"</elementName><elementAttributes", "element")?;
-    if element.label.is_none() && element.value.is_none() {
+    if element.label.is_none()
+        && element.value.is_none()
+        && element.rotation == 0
+        && !element.mirror
+    {
         write_bytes(output, b"/><pos x=\"", "element")?;
     } else {
         write_bytes(output, b">", "element")?;
@@ -441,6 +485,22 @@ fn write_clipboard_element(
             write_bytes(output, b"<entry><string>Value</string><long>", "Value")?;
             write_bytes(output, if value { b"1" } else { b"0" }, "Value")?;
             write_bytes(output, b"</long></entry>", "Value")?;
+        }
+        if element.rotation != 0 {
+            write_bytes(
+                output,
+                b"<entry><string>rotation</string><rotation rotation=\"",
+                "rotation",
+            )?;
+            write_bytes(output, element.rotation.to_string().as_bytes(), "rotation")?;
+            write_bytes(output, b"\"/></entry>", "rotation")?;
+        }
+        if element.mirror {
+            write_bytes(
+                output,
+                b"<entry><string>mirror</string><boolean>true</boolean></entry>",
+                "mirror",
+            )?;
         }
         write_bytes(output, b"</elementAttributes><pos x=\"", "element")?;
     }
@@ -678,6 +738,10 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
     whitespace_text(attr_node, "elementAttributes")?;
     let mut label = None;
     let mut value = None;
+    let mut rotation = 0_u8;
+    let mut rotation_seen = false;
+    let mut mirror = false;
+    let mut mirror_seen = false;
     let mut value_offset = None;
     for entry in &attr_node.children {
         if entry.name != "entry" {
@@ -700,9 +764,80 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
         }
         let key = leaf(&entry.children[0], "attribute key")?;
         let payload = &entry.children[1];
-        let raw = leaf(payload, "attribute value")?;
         match key {
+            "rotation" => {
+                if rotation_seen {
+                    return Err(error(
+                        DigReadErrorKind::DuplicateField,
+                        entry.offset,
+                        "rotation",
+                        "rotation occurs more than once",
+                    ));
+                }
+                rotation_seen = true;
+                if payload.name != "rotation"
+                    || !payload.children.is_empty()
+                    || !payload.text.is_empty()
+                {
+                    return Err(error(
+                        DigReadErrorKind::Unsupported,
+                        payload.offset,
+                        "rotation",
+                        "rotation requires a rotation payload",
+                    ));
+                }
+                if payload.attributes.len() != 1 || payload.attributes[0].0 != "rotation" {
+                    return Err(error(
+                        DigReadErrorKind::Unsupported,
+                        payload.offset,
+                        "rotation",
+                        "expected exactly one rotation attribute",
+                    ));
+                }
+                let raw = &payload.attributes[0].1;
+                rotation = raw.parse::<u8>().ok().filter(|n| *n <= 3).ok_or_else(|| {
+                    error(
+                        DigReadErrorKind::InvalidValue,
+                        payload.offset,
+                        "rotation",
+                        "expected quarter-turn value 0 through 3",
+                    )
+                })?;
+            }
+            "mirror" => {
+                if mirror_seen {
+                    return Err(error(
+                        DigReadErrorKind::DuplicateField,
+                        entry.offset,
+                        "mirror",
+                        "mirror occurs more than once",
+                    ));
+                }
+                mirror_seen = true;
+                let raw = leaf(payload, "mirror")?;
+                if payload.name != "boolean" {
+                    return Err(error(
+                        DigReadErrorKind::Unsupported,
+                        payload.offset,
+                        "mirror",
+                        "mirror requires a boolean value",
+                    ));
+                }
+                mirror = match trim_xml_space(raw) {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(error(
+                            DigReadErrorKind::InvalidValue,
+                            payload.offset,
+                            "mirror",
+                            "expected true or false",
+                        ));
+                    }
+                };
+            }
             "Label" => {
+                let raw = leaf(payload, "Label")?;
                 if payload.name != "string" {
                     return Err(error(
                         DigReadErrorKind::Unsupported,
@@ -731,6 +866,7 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
                 label = Some(raw.to_owned());
             }
             "Value" => {
+                let raw = leaf(payload, "Value")?;
                 if value.is_some() {
                     return Err(error(
                         DigReadErrorKind::DuplicateField,
@@ -817,6 +953,8 @@ fn parse_element(node: &Node) -> Result<DigElement, DigReadError> {
         y: point.y,
         label,
         value,
+        rotation,
+        mirror,
     })
 }
 
@@ -1629,46 +1767,8 @@ fn name_from_kind(kind: ComponentKind) -> &'static str {
 // Domain editor positions denote the artwork bounds center. Digital stores its logical origin;
 // share the renderer's toolkit-neutral placement metrics to keep pins aligned with the artwork.
 fn center_offset(kind: ComponentKind) -> Result<(i32, i32), DomainCodecError> {
-    let offset = crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)
-        .ok_or_else(|| invalid("component kind has no default symbol"))?;
-    Ok((
-        exact_i32(offset[0], "symbol center x offset")?,
-        exact_i32(offset[1], "symbol center y offset")?,
-    ))
-}
-fn pin_offsets(kind: ComponentKind, pin: PinId) -> Option<Coord> {
-    match (kind, pin.direction, pin.index) {
-        (ComponentKind::Const, PinDirection::Output, 0) => Some((0, 0)),
-        (ComponentKind::And | ComponentKind::Or | ComponentKind::XOr, PinDirection::Input, 0) => {
-            Some((0, 0))
-        }
-        (ComponentKind::And | ComponentKind::Or | ComponentKind::XOr, PinDirection::Input, 1) => {
-            Some((0, 40))
-        }
-        (ComponentKind::And | ComponentKind::Or | ComponentKind::XOr, PinDirection::Output, 0) => {
-            Some((60, 20))
-        }
-        (
-            ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr,
-            PinDirection::Input,
-            0,
-        ) => Some((0, 0)),
-        (
-            ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr,
-            PinDirection::Input,
-            1,
-        ) => Some((0, 40)),
-        (
-            ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XNOr,
-            PinDirection::Output,
-            0,
-        ) => Some((80, 20)),
-        (ComponentKind::Not, PinDirection::Input, 0) => Some((0, 0)),
-        (ComponentKind::Not, PinDirection::Output, 0) => Some((40, 0)),
-        (ComponentKind::Input, PinDirection::Output, 0)
-        | (ComponentKind::Output, PinDirection::Input, 0) => Some((0, 0)),
-        _ => None,
-    }
+    crate::pin_geometry::origin_to_center_offset(kind)
+        .map_err(|_| invalid("component kind has no exact canonical center offset"))
 }
 fn exact_i32(value: f32, what: &str) -> Result<i32, DomainCodecError> {
     if !value.is_finite()
@@ -1685,18 +1785,9 @@ fn exact_i32(value: f32, what: &str) -> Result<i32, DomainCodecError> {
     Ok(integer)
 }
 fn pin_coord(component: &Component, pin: PinId) -> Result<Coord, DomainCodecError> {
-    let x = exact_i32(component.position.x, "component x")?;
-    let y = exact_i32(component.position.y, "component y")?;
-    let offset = center_offset(component.kind)?;
-    let pin = pin_offsets(component.kind, pin).ok_or_else(|| invalid("invalid pin reference"))?;
-    Ok((
-        x.checked_sub(offset.0)
-            .and_then(|n| n.checked_add(pin.0))
-            .ok_or_else(|| invalid("pin x overflow"))?,
-        y.checked_sub(offset.1)
-            .and_then(|n| n.checked_add(pin.1))
-            .ok_or_else(|| invalid("pin y overflow"))?,
-    ))
+    let point = crate::pin_geometry::pin_point(component, pin)
+        .map_err(|_| invalid("pin placement is not exactly representable"))?;
+    Ok((point.x, point.y))
 }
 fn domain_pin_coord(component: &Component, pin: PinId) -> Result<Coord, DomainCodecError> {
     pin_coord(component, pin)
@@ -1711,7 +1802,15 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
     for (index, element) in dig.elements.iter().enumerate() {
         let kind = kind_from_name(&element.name)
             .ok_or_else(|| invalid(format!("unsupported component {:?}", element.name)))?;
-        let (dx, dy) = center_offset(kind)?;
+        if element.rotation > 3 {
+            return Err(invalid("rotation must be between 0 and 3 quarter-turns"));
+        }
+        let (dx, dy) = crate::domain::Orientation {
+            rotation: element.rotation,
+            mirror: element.mirror,
+        }
+        .transform(center_offset(kind)?.0, center_offset(kind)?.1)
+        .ok_or_else(|| invalid("invalid orientation"))?;
         let x = element
             .x
             .checked_add(dx)
@@ -1743,6 +1842,8 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
             position,
             label: element.label.clone().unwrap_or_default(),
             constant_value: element.value.unwrap_or(true),
+            rotation: element.rotation,
+            mirror: element.mirror,
         });
     }
     // Validate every supported pin's exact integer placement without requiring valid or
@@ -1962,7 +2063,15 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
         }
         let x = exact_i32(c.position.x, "component center x")?;
         let y = exact_i32(c.position.y, "component center y")?;
-        let (dx, dy) = center_offset(c.kind)?;
+        if c.rotation > 3 {
+            return Err(invalid("rotation must be between 0 and 3 quarter-turns"));
+        }
+        let (dx, dy) = crate::domain::Orientation {
+            rotation: c.rotation,
+            mirror: c.mirror,
+        }
+        .transform(center_offset(c.kind)?.0, center_offset(c.kind)?.1)
+        .ok_or_else(|| invalid("invalid orientation"))?;
         let ox = x
             .checked_sub(dx)
             .ok_or_else(|| invalid("component origin x overflow"))?;
@@ -1983,6 +2092,8 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
             } else {
                 None
             },
+            rotation: c.rotation,
+            mirror: c.mirror,
         });
     }
     all_pins(doc)?;
@@ -2034,6 +2145,8 @@ mod tests {
                     y: -80,
                     label: Some(format!("λ {} & <raw>", kind.name())),
                     value: (*kind == ComponentKind::Const).then_some(false),
+                    rotation: 0,
+                    mirror: false,
                 })
                 .collect(),
             wires: vec![
@@ -2118,6 +2231,8 @@ mod tests {
                     y: -12,
                     label: Some("λ input".into()),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "Out".into(),
@@ -2125,6 +2240,8 @@ mod tests {
                     y: -2,
                     label: Some(String::new()),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "And".into(),
@@ -2132,6 +2249,8 @@ mod tests {
                     y: 40,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "Or".into(),
@@ -2139,6 +2258,8 @@ mod tests {
                     y: 7,
                     label: Some("OR".into()),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "NAnd".into(),
@@ -2146,6 +2267,8 @@ mod tests {
                     y: -40,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "NOr".into(),
@@ -2153,6 +2276,8 @@ mod tests {
                     y: -80,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "XOr".into(),
@@ -2160,6 +2285,8 @@ mod tests {
                     y: -120,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "XNOr".into(),
@@ -2167,6 +2294,8 @@ mod tests {
                     y: -160,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "Not".into(),
@@ -2174,6 +2303,8 @@ mod tests {
                     y: -4,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
             ],
             wires: vec![],
@@ -2234,6 +2365,8 @@ mod tests {
                 },
                 label: String::new(),
                 constant_value: true,
+                rotation: 0,
+                mirror: false,
             };
             let layout =
                 SymbolLayout::centered_on(SymbolStyle::Rect, kind, [dx as f32, dy as f32]).unwrap();
@@ -2272,6 +2405,8 @@ mod tests {
             position: Position { x: 0., y: 0. },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         };
         let output = Component {
             id: ComponentId(2),
@@ -2279,6 +2414,8 @@ mod tests {
             position: Position { x: 100., y: 0. },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         };
         let components = vec![input.clone(), output.clone()];
         let doc = Document {
@@ -2359,6 +2496,8 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "Out".into(),
@@ -2366,6 +2505,8 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "Out".into(),
@@ -2373,6 +2514,8 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
             ],
             wires: vec![
@@ -2416,6 +2559,8 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "Out".into(),
@@ -2423,6 +2568,8 @@ mod tests {
                     y: 100,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
             ],
             wires: vec![
@@ -2471,6 +2618,8 @@ mod tests {
                         y,
                         label: None,
                         value: None,
+                        rotation: 0,
+                        mirror: false,
                     })
                     .collect(),
                 wires: wires.clone(),
@@ -2618,6 +2767,8 @@ mod tests {
                 position: Position { x: 0., y: 0. },
                 label: String::new(),
                 constant_value: true,
+                rotation: 0,
+                mirror: false,
             },
             Component {
                 id: ComponentId(2),
@@ -2625,6 +2776,8 @@ mod tests {
                 position: Position { x: 100., y: 80. },
                 label: String::new(),
                 constant_value: true,
+                rotation: 0,
+                mirror: false,
             },
         ];
         let start = crate::pin_geometry::pin_point(
@@ -2676,6 +2829,8 @@ mod tests {
                 position: Position { x: 0.5, y: 0.0 },
                 label: String::new(),
                 constant_value: true,
+                rotation: 0,
+                mirror: false,
             }],
             wires: crate::domain::Wiring::GeometricSegments(vec![]),
         };
@@ -2690,6 +2845,8 @@ mod tests {
                 },
                 label: String::new(),
                 constant_value: true,
+                rotation: 0,
+                mirror: false,
             }],
             wires: crate::domain::Wiring::GeometricSegments(vec![]),
         };
@@ -2727,6 +2884,8 @@ mod tests {
                 y: 7,
                 label: Some("R & D <λ> 💡".into()),
                 value: None,
+                rotation: 0,
+                mirror: false,
             }
         );
         assert_eq!(parsed.elements[1].name, "In");
@@ -3128,6 +3287,8 @@ mod tests {
                     y: i32::MAX,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "second".into(),
@@ -3135,6 +3296,8 @@ mod tests {
                     y: 8,
                     label: Some(String::new()),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 DigElement {
                     name: "third".into(),
@@ -3142,6 +3305,8 @@ mod tests {
                     y: -10,
                     label: Some("ordered".into()),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
             ],
             wires: vec![
@@ -3183,6 +3348,8 @@ mod tests {
                 y: 1,
                 label: Some(value.into()),
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3200,6 +3367,8 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 }],
                 wires: vec![],
             };
@@ -3214,6 +3383,8 @@ mod tests {
                     y: 0,
                     label: Some(invalid.into()),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 }],
                 wires: vec![],
             };
@@ -3232,6 +3403,8 @@ mod tests {
             y: 0,
             label: None,
             value: None,
+            rotation: 0,
+            mirror: false,
         };
         let wire = DigWire {
             p1: DigPoint { x: 0, y: 0 },
@@ -3296,6 +3469,8 @@ mod tests {
                 elements: vec![DigElement {
                     label: Some("a".repeat(MAX_STRING_BYTES)),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                     ..element.clone()
                 }],
                 wires: vec![]
@@ -3307,6 +3482,8 @@ mod tests {
                 elements: vec![DigElement {
                     label: Some("a".repeat(MAX_STRING_BYTES + 1)),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                     ..element.clone()
                 }],
                 wires: vec![]
@@ -3319,6 +3496,8 @@ mod tests {
         let empty_suffix = DigElement {
             label: Some(String::new()),
             value: None,
+            rotation: 0,
+            mirror: false,
             ..element.clone()
         };
         let base_empty = serialize_v2(&DigV2 {
@@ -3332,6 +3511,8 @@ mod tests {
                 DigElement {
                     label: Some("x".repeat(MAX_STRING_BYTES)),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                     ..element.clone()
                 },
                 empty_suffix.clone(),
@@ -3346,6 +3527,8 @@ mod tests {
             DigElement {
                 label: Some("x".repeat(MAX_STRING_BYTES)),
                 value: None,
+                rotation: 0,
+                mirror: false,
                 ..element.clone()
             };
             full_labels
@@ -3378,6 +3561,8 @@ mod tests {
                     y: 0,
                     label: Some("&".repeat(MAX_STRING_BYTES)),
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 };
                 MAX_ELEMENTS
             ],
@@ -3434,6 +3619,8 @@ mod tests {
                         position: Position { x, y },
                         label: String::new(),
                         constant_value: true,
+                        rotation: 0,
+                        mirror: false,
                     }],
                     wires: crate::domain::Wiring::GeometricSegments(Vec::new()),
                 };
@@ -3546,6 +3733,8 @@ mod tests {
                 y: 0,
                 label: None,
                 value: Some(true),
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3570,6 +3759,8 @@ mod tests {
                 position: Position { x: 0.0, y: 0.0 },
                 label: String::new(),
                 constant_value: false,
+                rotation: 0,
+                mirror: false,
             }],
             wires: crate::domain::Wiring::GeometricSegments(vec![]),
         };
@@ -3634,6 +3825,8 @@ mod tests {
                 y: 5,
                 label: Some(" source ".into()),
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
         );
         let document = to_domain(&source).unwrap();
@@ -3690,6 +3883,8 @@ mod tests {
                 y: 0,
                 label: None,
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3702,6 +3897,8 @@ mod tests {
                 y: 0,
                 label: None,
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3729,6 +3926,8 @@ mod tests {
                 y: 0,
                 label: None,
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3770,5 +3969,51 @@ mod tests {
                 .to_string()
                 .contains("index 0")
         );
+    }
+
+    #[test]
+    fn orientations_roundtrip_v2_and_clipboard_payloads() {
+        let dig = DigV2 {
+            elements: vec![DigElement {
+                name: "And".into(),
+                x: -40,
+                y: 20,
+                label: Some("rotated".into()),
+                value: None,
+                rotation: 1,
+                mirror: true,
+            }],
+            wires: vec![],
+        };
+        let bytes = serialize_v2(&dig).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("<rotation rotation=\"1\"/>"));
+        assert!(
+            String::from_utf8_lossy(&bytes)
+                .contains("<string>mirror</string><boolean>true</boolean>")
+        );
+        assert_eq!(parse_v2(&bytes).unwrap(), dig);
+        assert_eq!(
+            parse_clipboard_list(&serialize_clipboard_list(&dig).unwrap()).unwrap(),
+            dig
+        );
+        let document = to_domain(&dig).unwrap();
+        let exported = from_domain(&document).unwrap();
+        assert_eq!(exported.elements, dig.elements);
+    }
+
+    #[test]
+    fn orientation_codec_rejects_degrees_wrong_payloads_and_duplicate_entries() {
+        let base = "<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes>{}</elementAttributes><pos x=\"0\" y=\"0\"/></visualElement></visualElements><wires/></circuit>";
+        for attrs in [
+            "<entry><string>rotation</string><rotation rotation=\"90\"/></entry>",
+            "<entry><string>rotation</string><int>1</int></entry>",
+            "<entry><string>rotation</string><rotation rotation=\"1\"/></entry><entry><string>rotation</string><rotation rotation=\"2\"/></entry>",
+            "<entry><string>mirror</string><string>true</string></entry>",
+        ] {
+            assert!(
+                parse_v2(base.replace("{}", attrs).as_bytes()).is_err(),
+                "{attrs}"
+            );
+        }
     }
 }

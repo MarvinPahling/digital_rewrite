@@ -638,6 +638,8 @@ mod tests {
             position: Position { x: 0., y: 0. },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         };
         let output = Component {
             id: ComponentId(2),
@@ -645,6 +647,8 @@ mod tests {
             position: Position { x: 100., y: 0. },
             label: "oscillating output".into(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         };
         let pin = |component, direction| PinRef {
             component: ComponentId(component),

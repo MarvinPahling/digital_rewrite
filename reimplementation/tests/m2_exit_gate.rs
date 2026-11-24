@@ -26,6 +26,8 @@ fn component(id: u64, kind: K, value: bool) -> Component {
         },
         label: String::new(),
         constant_value: value,
+        rotation: 0,
+        mirror: false,
     }
 }
 fn circuit(parts: &[(u64, K, bool)], wires: &[(u64, D, u8, u64, D, u8)]) -> Document {
@@ -410,6 +412,8 @@ fn public_geometric_connectivity_membership_diagnostics_and_resource_bounds() {
             },
             label: format!("c{id}"),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         }
     };
     let segment = |id, a: (i32, i32), b: (i32, i32)| Segment {

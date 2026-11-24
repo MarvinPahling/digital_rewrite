@@ -231,6 +231,18 @@ fn validate_component_pin_geometry(component: &Component) -> Result<(), EditErro
         })
 }
 
+fn exact_position(value: f32) -> Result<i32, EditError> {
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || (value as f64) < i32::MIN as f64
+        || (value as f64) > i32::MAX as f64
+        || value as i32 as f32 != value
+    {
+        return Err(EditError::InvalidPosition);
+    }
+    Ok(value as i32)
+}
+
 fn valid_geometric_position(position: Position) -> bool {
     position.valid()
         && [position.x, position.y].into_iter().all(|coordinate| {
@@ -1024,6 +1036,8 @@ impl Session {
             position,
             label: kind.name().into(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         };
         validate_component_pin_geometry(&component)?;
         next.components.push(component);
@@ -1113,6 +1127,310 @@ impl Session {
         self.edit(next);
         Ok(())
     }
+    /// Change one component's local orientation while preserving its logical origin.
+    pub fn set_component_orientation(
+        &mut self,
+        id: ComponentId,
+        rotation: u8,
+        mirror: bool,
+    ) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        if rotation > 3 {
+            return Err(EditError::InvalidPosition);
+        }
+        let mut next = self.document.clone();
+        let component = next
+            .components
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(EditError::UnknownComponent)?;
+        if component.rotation == rotation && component.mirror == mirror {
+            return Ok(false);
+        }
+        let center = crate::pin_geometry::origin_to_center_offset(component.kind)
+            .map_err(|_| EditError::WrongComponentKind)?;
+        let offset = |c: &Component| -> Result<(i32, i32), EditError> {
+            let d = crate::pin_geometry::origin_to_center_offset(c.kind)
+                .map_err(|_| EditError::WrongComponentKind)?;
+            crate::domain::Orientation {
+                rotation: c.rotation,
+                mirror: c.mirror,
+            }
+            .transform(d.0, d.1)
+            .ok_or(EditError::InvalidPosition)
+        };
+        let old = offset(component)?;
+        let ox = exact_position(component.position.x)?
+            .checked_sub(old.0)
+            .ok_or(EditError::InvalidPosition)?;
+        let oy = exact_position(component.position.y)?
+            .checked_sub(old.1)
+            .ok_or(EditError::InvalidPosition)?;
+        let new_orientation = crate::domain::Orientation { rotation, mirror };
+        let new_offset = new_orientation
+            .transform(center.0, center.1)
+            .ok_or(EditError::InvalidPosition)?;
+        let x = ox
+            .checked_add(new_offset.0)
+            .ok_or(EditError::InvalidPosition)?;
+        let y = oy
+            .checked_add(new_offset.1)
+            .ok_or(EditError::InvalidPosition)?;
+        let px = x as f32;
+        let py = y as f32;
+        if f64::from(px) != f64::from(x) || f64::from(py) != f64::from(y) {
+            return Err(EditError::InvalidPosition);
+        }
+        component.position = Position { x: px, y: py };
+        component.rotation = rotation;
+        component.mirror = mirror;
+        validate_component_pin_geometry(component)?;
+        self.edit(next);
+        Ok(true)
+    }
+
+    /// Apply quarter-turns or a world-space vertical mirror to selected objects atomically.
+    /// Wire endpoints remain independent; no connectivity-based movement or normalization occurs.
+    pub fn transform_selection(
+        &mut self,
+        selection: &crate::selection::Selection,
+        turns: u8,
+        world_mirror: bool,
+    ) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        if turns > 3 {
+            return Err(EditError::InvalidPosition);
+        }
+        if selection.is_empty() || (turns == 0 && !world_mirror) {
+            return Ok(false);
+        }
+        let mut next = self.document.clone();
+        let mut points: Vec<(i32, i32)> = Vec::new();
+        let mut indices = Vec::new();
+        for id in &selection.components {
+            let i = next
+                .components
+                .iter()
+                .position(|c| c.id == *id)
+                .ok_or(EditError::UnknownComponent)?;
+            indices.push(i);
+            let c = &next.components[i];
+            let offset = crate::pin_geometry::origin_to_center_offset(c.kind)
+                .map_err(|_| EditError::WrongComponentKind)?;
+            let old = crate::domain::Orientation {
+                rotation: c.rotation,
+                mirror: c.mirror,
+            }
+            .transform(offset.0, offset.1)
+            .ok_or(EditError::InvalidPosition)?;
+            let origin = (
+                exact_position(c.position.x)?
+                    .checked_sub(old.0)
+                    .ok_or(EditError::InvalidPosition)?,
+                exact_position(c.position.y)?
+                    .checked_sub(old.1)
+                    .ok_or(EditError::InvalidPosition)?,
+            );
+            let def = crate::symbols::symbol(crate::symbols::DEFAULT_STYLE, c.kind)
+                .ok_or(EditError::WrongComponentKind)?;
+            let orientation = crate::domain::Orientation {
+                rotation: c.rotation,
+                mirror: c.mirror,
+            };
+            let corners = [
+                [def.bounds.min[0], def.bounds.min[1]],
+                [def.bounds.min[0], def.bounds.max[1]],
+                [def.bounds.max[0], def.bounds.min[1]],
+                [def.bounds.max[0], def.bounds.max[1]],
+            ];
+            let mut min = [f64::INFINITY; 2];
+            let mut max = [f64::NEG_INFINITY; 2];
+            for corner in corners {
+                let p = orientation
+                    .transform_f32(corner[0], corner[1])
+                    .ok_or(EditError::InvalidPosition)?;
+                min[0] = min[0].min(f64::from(origin.0) + f64::from(p.0));
+                min[1] = min[1].min(f64::from(origin.1) + f64::from(p.1));
+                max[0] = max[0].max(f64::from(origin.0) + f64::from(p.0));
+                max[1] = max[1].max(f64::from(origin.1) + f64::from(p.1));
+            }
+            let floor = |v: f64| {
+                if v.floor() < i32::MIN as f64 || v.floor() > i32::MAX as f64 {
+                    Err(EditError::InvalidPosition)
+                } else {
+                    Ok(v.floor() as i32)
+                }
+            };
+            let ceil = |v: f64| {
+                if v.ceil() < i32::MIN as f64 || v.ceil() > i32::MAX as f64 {
+                    Err(EditError::InvalidPosition)
+                } else {
+                    Ok(v.ceil() as i32)
+                }
+            };
+            points.push((floor(min[0])?, floor(min[1])?));
+            points.push((ceil(max[0])?, ceil(max[1])?));
+            if selection.components.len() == 1 && selection.wires.is_empty() {
+                points.clear();
+                points.push(origin);
+            }
+        }
+        let mut known = std::collections::BTreeSet::new();
+        for s in next.wires.geometric().map_err(EditError::Geometry)? {
+            if let Some(mask) = selection.wires.get(&s.id) {
+                if mask.is_empty() {
+                    return Err(EditError::InvalidSelection);
+                }
+                known.insert(s.id);
+                if mask.contains_a() {
+                    points.push((s.a.x, s.a.y));
+                }
+                if mask.contains_b() {
+                    points.push((s.b.x, s.b.y));
+                }
+            }
+        }
+        if known.len() != selection.wires.len() {
+            return Err(EditError::InvalidSelection);
+        }
+        if points.is_empty() {
+            return Ok(false);
+        }
+        let minx = points
+            .iter()
+            .map(|p| p.0)
+            .min()
+            .ok_or(EditError::InvalidSelection)?;
+        let maxx = points
+            .iter()
+            .map(|p| p.0)
+            .max()
+            .ok_or(EditError::InvalidSelection)?;
+        let miny = points
+            .iter()
+            .map(|p| p.1)
+            .min()
+            .ok_or(EditError::InvalidSelection)?;
+        let maxy = points
+            .iter()
+            .map(|p| p.1)
+            .max()
+            .ok_or(EditError::InvalidSelection)?;
+        let snap = |n: i64| -> Result<i32, EditError> {
+            let q = (n as f64 / 40.0).round() as i64 * 20;
+            i32::try_from(q).map_err(|_| EditError::InvalidPosition)
+        };
+        let pivot = if selection.components.len() == 1 && selection.wires.is_empty() {
+            let c = next
+                .components
+                .iter()
+                .find(|c| selection.components.contains(&c.id))
+                .ok_or(EditError::UnknownComponent)?;
+            let offset = crate::pin_geometry::origin_to_center_offset(c.kind)
+                .map_err(|_| EditError::WrongComponentKind)?;
+            let old = crate::domain::Orientation {
+                rotation: c.rotation,
+                mirror: c.mirror,
+            }
+            .transform(offset.0, offset.1)
+            .ok_or(EditError::InvalidPosition)?;
+            (
+                exact_position(c.position.x)?
+                    .checked_sub(old.0)
+                    .ok_or(EditError::InvalidPosition)?,
+                exact_position(c.position.y)?
+                    .checked_sub(old.1)
+                    .ok_or(EditError::InvalidPosition)?,
+            )
+        } else {
+            (
+                snap(i64::from(minx) + i64::from(maxx))?,
+                snap(i64::from(miny) + i64::from(maxy))?,
+            )
+        };
+        let transform_point = |x: i32, y: i32| -> Result<(i32, i32), EditError> {
+            let dx = x.checked_sub(pivot.0).ok_or(EditError::InvalidPosition)?;
+            let dy = y.checked_sub(pivot.1).ok_or(EditError::InvalidPosition)?;
+            let (mut tx, mut ty) = if world_mirror {
+                (dx, dy.checked_neg().ok_or(EditError::InvalidPosition)?)
+            } else {
+                (dx, dy)
+            };
+            for _ in 0..turns {
+                (tx, ty) = (ty, tx.checked_neg().ok_or(EditError::InvalidPosition)?);
+            }
+            Ok((
+                pivot.0.checked_add(tx).ok_or(EditError::InvalidPosition)?,
+                pivot.1.checked_add(ty).ok_or(EditError::InvalidPosition)?,
+            ))
+        };
+        for i in indices {
+            let c = &mut next.components[i];
+            let offset = crate::pin_geometry::origin_to_center_offset(c.kind)
+                .map_err(|_| EditError::WrongComponentKind)?;
+            let old = crate::domain::Orientation {
+                rotation: c.rotation,
+                mirror: c.mirror,
+            }
+            .transform(offset.0, offset.1)
+            .ok_or(EditError::InvalidPosition)?;
+            let origin = (
+                exact_position(c.position.x)?
+                    .checked_sub(old.0)
+                    .ok_or(EditError::InvalidPosition)?,
+                exact_position(c.position.y)?
+                    .checked_sub(old.1)
+                    .ok_or(EditError::InvalidPosition)?,
+            );
+            let origin = transform_point(origin.0, origin.1)?;
+            if world_mirror {
+                c.rotation = (4 - c.rotation) % 4;
+                c.mirror = !c.mirror;
+            }
+            c.rotation = (c.rotation + turns) % 4;
+            let new = crate::domain::Orientation {
+                rotation: c.rotation,
+                mirror: c.mirror,
+            }
+            .transform(offset.0, offset.1)
+            .ok_or(EditError::InvalidPosition)?;
+            let x = origin
+                .0
+                .checked_add(new.0)
+                .ok_or(EditError::InvalidPosition)?;
+            let y = origin
+                .1
+                .checked_add(new.1)
+                .ok_or(EditError::InvalidPosition)?;
+            let px = x as f32;
+            let py = y as f32;
+            if f64::from(px) != f64::from(x) || f64::from(py) != f64::from(y) {
+                return Err(EditError::InvalidPosition);
+            }
+            c.position = Position { x: px, y: py };
+            validate_component_pin_geometry(c)?;
+        }
+        let segments = next.wires.geometric_mut().map_err(EditError::Geometry)?;
+        for segment in segments.iter_mut() {
+            if let Some(mask) = selection.wires.get(&segment.id) {
+                if mask.contains_a() {
+                    let p = transform_point(segment.a.x, segment.a.y)?;
+                    segment.a = crate::geometric_wiring::Point::new(p.0, p.1);
+                }
+                if mask.contains_b() {
+                    let p = transform_point(segment.b.x, segment.b.y)?;
+                    segment.b = crate::geometric_wiring::Point::new(p.0, p.1);
+                }
+            }
+        }
+        segments.retain(|s| !selection.wires.contains_key(&s.id) || s.a != s.b);
+        if next == self.document {
+            return Ok(false);
+        }
+        self.edit(next);
+        Ok(true)
+    }
+
     /// Atomically translate a mixed transient selection by an integral world-space delta.
     /// Segment endpoints are independent; unselected endpoint coordinates are preserved.
     pub fn move_selection(
@@ -2873,6 +3191,8 @@ mod tests {
                 y: origin.1 + offset[1] as i32,
                 label: None,
                 value: None,
+                rotation: 0,
+                mirror: false,
             });
             id
         };
@@ -3659,6 +3979,8 @@ mod tests {
             position: Position { x: 0., y: 0. },
             label: "NOT".into(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         }];
         let document = Document {
             wires: crate::test_support::routed_wires(&components, &[(output, pin)]),
@@ -3700,6 +4022,8 @@ mod tests {
                 },
                 label: format!("N{id}"),
                 constant_value: true,
+                rotation: 0,
+                mirror: false,
             })
             .collect::<Vec<_>>();
         let pairs = (0..3)
@@ -4278,5 +4602,169 @@ mod tests {
         assert_eq!(session.redo.len(), redo_count);
         session.redo().unwrap();
         assert_eq!(session.document().components[0].position.x, 20.);
+    }
+
+    #[test]
+    fn orientation_edits_preserve_origin_history_and_transform_selected_endpoints() {
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::And, Position { x: 100., y: 100. })
+            .unwrap();
+        let component = session.document().components[0].clone();
+        let offset = crate::symbols::center_from_origin_offset(
+            crate::symbols::DEFAULT_STYLE,
+            component.kind,
+        )
+        .unwrap();
+        let origin = (
+            component.position.x as i32 - offset[0] as i32,
+            component.position.y as i32 - offset[1] as i32,
+        );
+        assert!(session.set_component_orientation(id, 1, true).unwrap());
+        let c = &session.document().components[0];
+        let oriented = crate::domain::Orientation {
+            rotation: c.rotation,
+            mirror: c.mirror,
+        }
+        .transform(offset[0] as i32, offset[1] as i32)
+        .unwrap();
+        assert_eq!(
+            (
+                c.position.x as i32 - oriented.0,
+                c.position.y as i32 - oriented.1
+            ),
+            origin
+        );
+        assert!(!session.set_component_orientation(id, 1, true).unwrap());
+        session.undo().unwrap();
+        assert_eq!(session.document().components[0], component);
+        let redo_len = session.redo.len();
+        assert!(!session.set_component_orientation(id, 0, false).unwrap());
+        assert_eq!(session.redo.len(), redo_len);
+        session.redo().unwrap();
+        let wire = crate::geometric_wiring::Segment {
+            id: 0,
+            a: crate::geometric_wiring::Point::new(0, 0),
+            b: crate::geometric_wiring::Point::new(40, 0),
+        };
+        session.document.wires = crate::domain::Wiring::GeometricSegments(vec![wire]);
+        session.next_segment_id = 1;
+        let mut selection = crate::selection::Selection::default();
+        selection.components.insert(id);
+        selection.wires.insert(0, crate::selection::EndpointMask::A);
+        let before_b = session.document().wires.geometric().unwrap()[0].b;
+        assert!(session.transform_selection(&selection, 1, false).unwrap());
+        assert_eq!(session.document().wires.geometric().unwrap()[0].b, before_b);
+        let after = session.document().clone();
+        session.undo().unwrap();
+        assert_ne!(session.document(), &after);
+    }
+
+    #[test]
+    fn orientation_rejections_and_simulation_lock_are_transactional() {
+        let mut session = Session::default();
+        let id = session
+            .place(
+                ComponentKind::Input,
+                Position {
+                    x: i32::MAX as f32,
+                    y: 0.,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(id, EditError::InvalidPosition);
+        let id = session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let before = session.document().clone();
+        assert_eq!(
+            session.set_component_orientation(id, 4, false),
+            Err(EditError::InvalidPosition)
+        );
+        assert_eq!(session.document(), &before);
+        session.start_simulation().unwrap();
+        assert_eq!(
+            session.set_component_orientation(id, 1, false),
+            Err(EditError::SimulationActive)
+        );
+        assert_eq!(session.document(), &before);
+    }
+
+    #[test]
+    fn rotated_and_mirrored_pins_compile_through_explicit_geometric_routes() {
+        let mut session = Session::default();
+        let input = session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let output = session
+            .place(ComponentKind::Output, Position { x: 200., y: 100. })
+            .unwrap();
+        session.set_component_orientation(input, 1, true).unwrap();
+        session.set_component_orientation(output, 3, true).unwrap();
+        session
+            .connect([
+                PinRef {
+                    component: input,
+                    pin: crate::domain::PinId {
+                        direction: crate::domain::PinDirection::Output,
+                        index: 0,
+                    },
+                },
+                PinRef {
+                    component: output,
+                    pin: crate::domain::PinId {
+                        direction: crate::domain::PinDirection::Input,
+                        index: 0,
+                    },
+                },
+            ])
+            .unwrap();
+        session.start_simulation().unwrap();
+        assert!(matches!(
+            session.settle_simulation(10_000).unwrap(),
+            SettleOutcome::Settled { .. }
+        ));
+        assert_eq!(
+            session.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::Low)
+        );
+        session.toggle_input(input).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::High)
+        );
+    }
+
+    #[test]
+    fn world_mirror_composes_orientation_and_keeps_single_origin_fixed() {
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::Not, Position { x: 100., y: 100. })
+            .unwrap();
+        session.set_component_orientation(id, 1, false).unwrap();
+        let c = session.document().components[0].clone();
+        let offset = crate::pin_geometry::origin_to_center_offset(c.kind).unwrap();
+        let old = crate::domain::Orientation {
+            rotation: c.rotation,
+            mirror: c.mirror,
+        }
+        .transform(offset.0, offset.1)
+        .unwrap();
+        let origin = (c.position.x as i32 - old.0, c.position.y as i32 - old.1);
+        let mut selection = crate::selection::Selection::default();
+        selection.components.insert(id);
+        assert!(session.transform_selection(&selection, 0, true).unwrap());
+        let c = &session.document().components[0];
+        assert_eq!((c.rotation, c.mirror), (3, true));
+        let new = crate::domain::Orientation {
+            rotation: c.rotation,
+            mirror: c.mirror,
+        }
+        .transform(offset.0, offset.1)
+        .unwrap();
+        assert_eq!(
+            (c.position.x as i32 - new.0, c.position.y as i32 - new.1),
+            origin
+        );
     }
 }

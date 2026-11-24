@@ -241,6 +241,8 @@ mod tests {
             position: Position { x: 0., y: 0. },
             label: label.into(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         };
         Document {
             components: vec![

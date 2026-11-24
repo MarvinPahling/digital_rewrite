@@ -281,6 +281,7 @@ static XNOR_IEEE: SymbolDef = text_gate(
 
 /// Origin offset from the editor's component position, which denotes the artwork-bounds center.
 /// Kept toolkit-neutral so drawing and document-format adapters place pins identically.
+#[cfg(test)]
 pub fn origin_from_center(style: SymbolStyle, kind: ComponentKind, center: Point) -> Option<Point> {
     let bounds = symbol(style, kind)?.bounds;
     Some([

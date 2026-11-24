@@ -21,9 +21,7 @@ use crate::domain::{ComponentKind, PinDirection, PinId};
 use crate::{
     canvas::CanvasTransform,
     symbol_tessellate::{PathLayer, TessellateError, tessellate_path},
-    symbols::{
-        Point, PortDirection, SymbolBounds, SymbolDef, SymbolStyle, origin_from_center, symbol,
-    },
+    symbols::{Point, PortDirection, SymbolBounds, SymbolDef, SymbolStyle, symbol},
 };
 use eframe::egui::{
     Color32, Mesh, Painter, Shape, Visuals,
@@ -82,18 +80,41 @@ pub struct SymbolLayout {
     def: &'static SymbolDef,
     /// World position of the symbol's logical origin.
     origin: Point,
+    orientation: crate::domain::Orientation,
 }
 
 impl SymbolLayout {
     /// Places the symbol so that the center of its bounds is at `center`. This is how the
     /// editor interprets a component position, preserving the earlier meaning of the position
     /// as the center of the drawn component. Returns `None` if no symbol is drawn for the pair.
+    #[cfg(test)]
     pub fn centered_on(style: SymbolStyle, kind: ComponentKind, center: Point) -> Option<Self> {
+        Self::oriented_on(style, kind, center, crate::domain::Orientation::default())
+    }
+
+    pub fn oriented_on(
+        style: SymbolStyle,
+        kind: ComponentKind,
+        center: Point,
+        orientation: crate::domain::Orientation,
+    ) -> Option<Self> {
         let def = symbol(style, kind)?;
+        let offset =
+            crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)?;
+        let (ox, oy) = orientation.transform_f32(offset[0], offset[1])?;
         Some(Self {
             def,
-            origin: origin_from_center(style, kind, center)?,
+            origin: [center[0] - ox, center[1] - oy],
+            orientation,
         })
+    }
+
+    fn transform_local(&self, point: Point) -> Point {
+        let (x, y) = self
+            .orientation
+            .transform_f32(point[0], point[1])
+            .unwrap_or((0.0, 0.0));
+        [x, y]
     }
 
     #[cfg(test)]
@@ -109,10 +130,10 @@ impl SymbolLayout {
     pub fn anchors(&self) -> impl Iterator<Item = PlacedAnchor> + '_ {
         self.def.anchors.iter().map(|a| PlacedAnchor {
             name: a.name,
-            position: [
-                self.origin[0] + a.position[0],
-                self.origin[1] + a.position[1],
-            ],
+            position: {
+                let p = self.transform_local(a.position);
+                [self.origin[0] + p[0], self.origin[1] + p[1]]
+            },
             direction: a.direction,
         })
     }
@@ -134,10 +155,30 @@ impl SymbolLayout {
     /// Extent of the drawn symbol including strokes, in world units.
     pub fn bounds(&self) -> SymbolBounds {
         let b = self.def.bounds;
-        SymbolBounds {
-            min: [self.origin[0] + b.min[0], self.origin[1] + b.min[1]],
-            max: [self.origin[0] + b.max[0], self.origin[1] + b.max[1]],
-        }
+        let corners = [
+            [b.min[0], b.min[1]],
+            [b.min[0], b.max[1]],
+            [b.max[0], b.min[1]],
+            [b.max[0], b.max[1]],
+        ]
+        .map(|p| self.transform_local(p));
+        let min = [
+            corners.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min) + self.origin[0],
+            corners.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min) + self.origin[1],
+        ];
+        let max = [
+            corners
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::NEG_INFINITY, f32::max)
+                + self.origin[0],
+            corners
+                .iter()
+                .map(|p| p[1])
+                .fold(f32::NEG_INFINITY, f32::max)
+                + self.origin[1],
+        ];
+        SymbolBounds { min, max }
     }
 
     /// Whether `world` lies within the symbol bounds grown by `tolerance` world units.
@@ -242,8 +283,10 @@ impl SymbolRenderer {
             let base = mesh.vertices.len() as u32;
             mesh.vertices
                 .extend(layer.mesh.vertices.iter().map(|v| Vertex {
-                    pos:
-                        transform.to_screen([origin[0] + v.position[0], origin[1] + v.position[1]]),
+                    pos: {
+                        let p = layout.transform_local(v.position);
+                        transform.to_screen([origin[0] + p[0], origin[1] + p[1]])
+                    },
                     uv: WHITE_UV,
                     color: color.gamma_multiply(v.coverage),
                 }));
@@ -594,5 +637,47 @@ mod tests {
                 .all(|&i| (i as usize) < mesh.vertices.len())
         );
         assert_eq!(mesh.indices.len() % 3, 0);
+    }
+
+    #[test]
+    fn oriented_bounds_and_pin_anchors_follow_signed_permutation_in_both_styles() {
+        for style in STYLES {
+            for kind in KINDS {
+                for rotation in 0..4 {
+                    for mirror in [false, true] {
+                        let orientation = crate::domain::Orientation { rotation, mirror };
+                        let canonical = layout(style, kind, [0., 0.]);
+                        let offset =
+                            crate::symbols::center_from_origin_offset(style, kind).unwrap();
+                        let center_offset =
+                            orientation.transform_f32(offset[0], offset[1]).unwrap();
+                        let oriented = SymbolLayout::oriented_on(
+                            style,
+                            kind,
+                            [center_offset.0, center_offset.1],
+                            orientation,
+                        )
+                        .unwrap();
+                        let origin = canonical.origin();
+                        for anchor in canonical.anchors() {
+                            let local = [
+                                anchor.position[0] - origin[0],
+                                anchor.position[1] - origin[1],
+                            ];
+                            let local = orientation.transform_f32(local[0], local[1]).unwrap();
+                            assert!(
+                                oriented
+                                    .anchors()
+                                    .any(|p| p.name == anchor.name
+                                        && p.position == [local.0, local.1]),
+                                "{style:?} {kind:?} {rotation} {mirror}"
+                            );
+                        }
+                        let bounds = oriented.bounds();
+                        assert!(bounds.min[0] <= bounds.max[0] && bounds.min[1] <= bounds.max[1]);
+                    }
+                }
+            }
+        }
     }
 }

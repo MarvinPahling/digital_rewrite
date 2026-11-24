@@ -1359,6 +1359,8 @@ mod tests {
             },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         }
     }
     fn out(id: u64) -> PinRef {

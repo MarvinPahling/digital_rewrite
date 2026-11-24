@@ -22,14 +22,26 @@ const PICK_TOLERANCE: f32 = 2.0;
 /// Positions are artwork-bounds centers, but Digital places on the logical origin grid. Convert
 /// through each symbol's shared bounds offset before snapping so asymmetric artwork stays aligned.
 fn snap_component_center(style: SymbolStyle, kind: ComponentKind, x: f32, y: f32) -> Position {
-    let offset = crate::symbols::center_from_origin_offset(style, kind).unwrap_or([0.0, 0.0]);
-    let snap_origin = |coordinate: f32, center_offset: f32| {
+    snap_component_center_oriented(style, kind, crate::domain::Orientation::default(), x, y)
+}
+fn snap_component_center_oriented(
+    _style: SymbolStyle,
+    kind: ComponentKind,
+    orientation: crate::domain::Orientation,
+    x: f32,
+    y: f32,
+) -> Position {
+    let offset = crate::symbols::center_from_origin_offset(crate::symbols::DEFAULT_STYLE, kind)
+        .and_then(|d| orientation.transform_f32(d[0], d[1]))
+        .map(|p| [p.0, p.1])
+        .unwrap_or([0.0, 0.0]);
+    let snap = |coordinate: f32, center_offset: f32| {
         let origin = coordinate - center_offset;
         (origin / GRID_UNIT).round() * GRID_UNIT + center_offset
     };
     Position {
-        x: snap_origin(x, offset[0]),
-        y: snap_origin(y, offset[1]),
+        x: snap(x, offset[0]),
+        y: snap(y, offset[1]),
     }
 }
 /// Gap between a symbol's bounds and its selection frame, in world units.
@@ -347,10 +359,14 @@ impl DigitalApp {
             digital_rust::formats::to_domain(&fragment).map_err(|error| error.to_string())?;
         let mut max = [f64::NEG_INFINITY; 2];
         for component in &document.components {
-            let layout = SymbolLayout::centered_on(
+            let layout = SymbolLayout::oriented_on(
                 self.style,
                 component.kind,
                 [component.position.x, component.position.y],
+                crate::domain::Orientation {
+                    rotation: component.rotation,
+                    mirror: component.mirror,
+                },
             )
             .ok_or_else(|| format!("No geometry for {}", component.kind.name()))?;
             let bounds = layout.bounds();
@@ -375,9 +391,13 @@ impl DigitalApp {
         self.marquee = None;
         self.geometric_route_start = None;
         self.pan_owner = None;
+        let anchor = [
+            (max[0] / f64::from(GRID_UNIT)).round() * f64::from(GRID_UNIT),
+            (max[1] / f64::from(GRID_UNIT)).round() * f64::from(GRID_UNIT),
+        ];
         self.fragment_draft = Some(FragmentDraft {
             fragment,
-            anchor: max,
+            anchor,
             delta: initial_delta,
             center_fallback,
             keyboard_adjusted: false,
@@ -511,6 +531,55 @@ impl DigitalApp {
         }
     }
 
+    fn rotate_fragment_draft(&mut self) {
+        let Some(draft) = &mut self.fragment_draft else {
+            return;
+        };
+        let pivot = [draft.anchor[0] as i64, draft.anchor[1] as i64];
+        let mut candidate = draft.fragment.clone();
+        let rotate = |x: i32, y: i32| -> Option<(i32, i32)> {
+            let dx = i64::from(x).checked_sub(pivot[0])?;
+            let dy = i64::from(y).checked_sub(pivot[1])?;
+            let nx = pivot[0].checked_add(dy)?;
+            let ny = pivot[1].checked_sub(dx)?;
+            Some((i32::try_from(nx).ok()?, i32::try_from(ny).ok()?))
+        };
+        for element in &mut candidate.elements {
+            let Some((x, y)) = rotate(element.x, element.y) else {
+                self.clipboard_error =
+                    Some("Clipboard rotation exceeds supported coordinates".into());
+                return;
+            };
+            element.x = x;
+            element.y = y;
+            element.rotation = (element.rotation + 1) % 4;
+        }
+        for wire in &mut candidate.wires {
+            let Some((x1, y1)) = rotate(wire.p1.x, wire.p1.y) else {
+                self.clipboard_error =
+                    Some("Clipboard rotation exceeds supported coordinates".into());
+                return;
+            };
+            let Some((x2, y2)) = rotate(wire.p2.x, wire.p2.y) else {
+                self.clipboard_error =
+                    Some("Clipboard rotation exceeds supported coordinates".into());
+                return;
+            };
+            wire.p1.x = x1;
+            wire.p1.y = y1;
+            wire.p2.x = x2;
+            wire.p2.y = y2;
+        }
+        if digital_rust::formats::to_domain(&candidate).is_err() {
+            self.clipboard_error =
+                Some("Clipboard rotation produces invalid component geometry".into());
+            return;
+        }
+        draft.fragment = candidate;
+        draft.keyboard_adjusted = true;
+        self.clipboard_error = None;
+    }
+
     fn adjust_fragment_draft(&mut self, dx: i32, dy: i32) {
         let Some(draft) = &mut self.fragment_draft else {
             return;
@@ -570,8 +639,15 @@ fn document_view_bounds(
         true
     };
     for c in &doc.components {
-        let Some(layout) = SymbolLayout::centered_on(style, c.kind, [c.position.x, c.position.y])
-        else {
+        let Some(layout) = SymbolLayout::oriented_on(
+            style,
+            c.kind,
+            [c.position.x, c.position.y],
+            crate::domain::Orientation {
+                rotation: c.rotation,
+                mirror: c.mirror,
+            },
+        ) else {
             return Err(format!(
                 "Cannot fit: missing symbol geometry for {}",
                 c.kind.name()
@@ -1799,6 +1875,15 @@ impl DigitalApp {
                 if ui.add_enabled(nav_enabled, egui::Button::new("+ Zoom in")).on_hover_text("Zoom in (+)").clicked() { self.view_action = Some(ViewAction::ZoomIn); }
                 if ui.add_enabled(nav_enabled, egui::Button::new("Fit")).on_hover_text("Fit circuit (F)").clicked() { self.view_action = Some(ViewAction::Fit); }
                 if ui.add_enabled(nav_enabled, egui::Button::new("Reset")).on_hover_text("Reset view (0)").clicked() { self.view_action = Some(ViewAction::Reset); }
+                let can_rotate = !self.session.simulation_active() && !self.modality_active()
+                    && self.drag.is_none() && self.marquee.is_none() && self.pan_owner.is_none()
+                    && !self.wiring && self.placing.is_none() && self.fragment_draft.is_none()
+                    && (!self.selection.is_empty() || self.selected.is_some());
+                if ui.add_enabled(can_rotate, egui::Button::new("Rotate selection ↶")).on_hover_text("Rotate selected components and wire endpoints counterclockwise (R)").clicked() {
+                    let mut selection = self.selection.clone();
+                    if selection.is_empty() && let Some(id)=self.selected { selection.select_component(id,false,false); }
+                    match self.session.transform_selection(&selection,1,false) { Ok(_) => self.reconcile_selection(), Err(error) => self.error=Some(error.to_string()) }
+                }
             });
             ui.label(format!("{:.0}% · Middle/Alt-drag pan · wheel zoom · +/- zoom · F fit · 0 reset · arrows pan", self.view.zoom() * 100.));
             if locked {
@@ -2120,7 +2205,7 @@ impl DigitalApp {
                     let _ = self.view.zoom_at(rect, pointer, factor);
                 }
             }
-            if !modal_open && !pan_sequence && self.drag.is_none() && self.fragment_draft.is_none() && response.has_focus() {
+            if !modal_open && !pan_sequence && self.drag.is_none() && self.fragment_draft.is_none() && self.marquee.is_none() && !self.wiring && self.placing.is_none() && response.has_focus() {
                 // Ctrl+Tab is a documented route to the seed editor that does not steal
                 // plain Tab from keyboard pin navigation; Escape returns focus here.
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
@@ -2128,6 +2213,11 @@ impl DigitalApp {
                     if let Some(seed_id) = self.seed_field_id {
                         ctx.memory_mut(|memory| memory.request_focus(seed_id));
                     }
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
+                    let mut selection = self.selection.clone();
+                    if selection.is_empty() && let Some(id)=self.selected { selection.select_component(id,false,false); }
+                    match self.session.transform_selection(&selection,1,false) { Ok(_) => self.reconcile_selection(), Err(error) => self.error=Some(error.to_string()) }
                 }
                 let nav = ctx.input_mut(|i| {
                     if i.consume_key(egui::Modifiers::NONE, egui::Key::Plus)
@@ -2187,7 +2277,7 @@ impl DigitalApp {
                 .iter()
                 .flat_map(|c| {
                     let layout =
-                        SymbolLayout::centered_on(style, c.kind, [c.position.x, c.position.y]);
+                        SymbolLayout::oriented_on(style, c.kind, [c.position.x, c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror });
                     [PinDirection::Input, PinDirection::Output]
                         .into_iter()
                         .flat_map(move |direction| {
@@ -2239,7 +2329,7 @@ impl DigitalApp {
                         .iter()
                         .rev()
                         .find(|c| {
-                            SymbolLayout::centered_on(style, c.kind, [c.position.x, c.position.y])
+                            SymbolLayout::oriented_on(style, c.kind, [c.position.x, c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror })
                                 .is_some_and(|layout| layout.hit(world, tolerance))
                         })
                         .map(|c| (c.id, c.position));
@@ -2338,8 +2428,8 @@ impl DigitalApp {
                 // component snap origin for asymmetric artwork placements.
                 let (snapped_dx, snapped_dy) = if self.selection.components.len()==1 && self.selection.wires.is_empty() {
                     let id=self.selection.components.iter().next().copied();
-                    let kind=id.and_then(|id| self.session.document().components.iter().find(|c| c.id==id).map(|c| c.kind));
-                    kind.map(|kind| { let snapped=snap_component_center(style,kind,start.x+dx,start.y+dy); ((snapped.x-start.x) as i32,(snapped.y-start.y) as i32) }).unwrap_or(((dx/20.).round() as i32*20,(dy/20.).round() as i32*20))
+                    let component=id.and_then(|id| self.session.document().components.iter().find(|c| c.id==id));
+                    component.map(|component| { let snapped=snap_component_center_oriented(style,component.kind,crate::domain::Orientation{rotation:component.rotation,mirror:component.mirror},start.x+dx,start.y+dy); ((snapped.x-start.x) as i32,(snapped.y-start.y) as i32) }).unwrap_or(((dx/20.).round() as i32*20,(dy/20.).round() as i32*20))
                 } else { ((dx/20.).round() as i32*20,(dy/20.).round() as i32*20) };
                 match self.session.move_selection(&self.selection, snapped_dx, snapped_dy) {
                     Ok(_) => {
@@ -2361,7 +2451,7 @@ impl DigitalApp {
                 let world_rect = crate::selection::Rect::normalized(transform.to_world(start), transform.to_world(end));
                 let doc = self.session.document();
                 let components = doc.components.iter().filter_map(|c| {
-                    SymbolLayout::centered_on(style, c.kind, [c.position.x,c.position.y]).map(|layout| { let b=layout.bounds(); (c.id,b.min,b.max) })
+                    SymbolLayout::oriented_on(style, c.kind, [c.position.x,c.position.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }).map(|layout| { let b=layout.bounds(); (c.id,b.min,b.max) })
                 }).collect::<Vec<_>>();
                 let wires = doc.wires.geometric().map(|s| s.to_vec()).unwrap_or_default();
                 self.selection.apply_marquee(crate::selection::marquee(components,&wires,world_rect), modifiers.shift, modifiers.command || modifiers.ctrl);
@@ -2378,8 +2468,8 @@ impl DigitalApp {
             let gesture_delta = if let (Some((drag_id,start,origin)),Some(p))=(self.drag,pointer) {
                 let [dx,dy]=transform.delta_to_world(p-origin);
                 if self.selection.components.len()==1 && self.selection.wires.is_empty() && drag_id != ComponentId(u64::MAX) {
-                    let kind=self.selection.components.iter().next().and_then(|id| self.session.document().components.iter().find(|c| c.id==*id).map(|c| c.kind));
-                    kind.map(|kind| { let snapped=snap_component_center(style,kind,start.x+dx,start.y+dy); [snapped.x-start.x,snapped.y-start.y] }).unwrap_or([((dx/20.).round()*20.),((dy/20.).round()*20.)])
+                    let component=self.selection.components.iter().next().and_then(|id| self.session.document().components.iter().find(|c| c.id==*id));
+                    component.map(|component| { let snapped=snap_component_center_oriented(style,component.kind,crate::domain::Orientation{rotation:component.rotation,mirror:component.mirror},start.x+dx,start.y+dy); [snapped.x-start.x,snapped.y-start.y] }).unwrap_or([((dx/20.).round()*20.),((dy/20.).round()*20.)])
                 } else { [((dx/20.).round()*20.),((dy/20.).round()*20.)] }
             } else {[0.,0.]};
             // Use a single snapped preview delta for every selected symbol and endpoint.
@@ -2487,7 +2577,7 @@ impl DigitalApp {
                 }
                 let affected = self.session.oscillation_diagnostic().is_some_and(|diagnostic| diagnostic.components.iter().any(|component| component.id == c.id));
                 let state = if affected { PaintState::Error } else if self.selection.components.contains(&c.id) || self.selected == Some(c.id) { PaintState::Selection } else { PaintState::Ink };
-                let Some(layout) = SymbolLayout::centered_on(style, c.kind, [pos.x, pos.y]) else {
+                let Some(layout) = SymbolLayout::oriented_on(style, c.kind, [pos.x, pos.y], crate::domain::Orientation { rotation: c.rotation, mirror: c.mirror }) else {
                     self.error = Some(format!("No symbol is drawn for {}", c.kind.name()));
                     continue;
                 };
@@ -2610,7 +2700,7 @@ impl DigitalApp {
                         let x = f64::from(component.position.x) + f64::from(draft.delta[0]);
                         let y = f64::from(component.position.y) + f64::from(draft.delta[1]);
                         if !x.is_finite() || !y.is_finite() || x.abs() > f32::MAX as f64 || y.abs() > f32::MAX as f64 { continue; }
-                        if let Some(layout) = SymbolLayout::centered_on(style, component.kind, [x as f32, y as f32]) {
+                        if let Some(layout) = SymbolLayout::oriented_on(style, component.kind, [x as f32, y as f32], crate::domain::Orientation { rotation: component.rotation, mirror: component.mirror }) {
                             if matches!(component.kind, ComponentKind::Const | ComponentKind::NAnd | ComponentKind::NOr | ComponentKind::XOr | ComponentKind::XNOr) {
                                 let bounds = layout.bounds();
                                 let screen = Rect::from_min_max(transform.to_screen(bounds.min), transform.to_screen(bounds.max));
@@ -2656,7 +2746,7 @@ impl DigitalApp {
                 let key = ctx.input(|input| input.events.iter().find_map(|event| match event {
                     egui::Event::Key { key, pressed: true, modifiers, .. }
                         if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
-                            && matches!(key, egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Enter) => Some(*key),
+                            && matches!(key, egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Enter | egui::Key::R) => Some(*key),
                     _ => None,
                 }));
                 match key {
@@ -2665,6 +2755,7 @@ impl DigitalApp {
                     Some(egui::Key::ArrowUp) => self.adjust_fragment_draft(0, -20),
                     Some(egui::Key::ArrowDown) => self.adjust_fragment_draft(0, 20),
                     Some(egui::Key::Enter) => self.commit_fragment_draft(),
+                    Some(egui::Key::R) => self.rotate_fragment_draft(),
                     _ => {}
                 }
             }
@@ -3176,6 +3267,8 @@ mod tests {
                 y: 0,
                 label: None,
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3258,6 +3351,8 @@ mod tests {
                 y: 0,
                 label: Some("Hover paste".into()),
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3343,6 +3438,8 @@ mod tests {
                 y: 0,
                 label: Some("Must not insert".into()),
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3397,6 +3494,8 @@ mod tests {
                 y: 0,
                 label: Some("Must not insert".into()),
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -3493,6 +3592,8 @@ mod tests {
                 y: 0,
                 label: Some("Paste λ".into()),
                 value: None,
+                rotation: 0,
+                mirror: false,
             }],
             wires: vec![],
         };
@@ -7040,6 +7141,8 @@ mod tests {
                     y: 0,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
                 digital_rust::formats::DigElement {
                     name: "Out".into(),
@@ -7047,6 +7150,8 @@ mod tests {
                     y: 80,
                     label: None,
                     value: None,
+                    rotation: 0,
+                    mirror: false,
                 },
             ],
             wires: vec![],
@@ -8120,5 +8225,65 @@ mod tests {
             !wants_immediate_repaint(&idle),
             "an idle editor must not spin repaints"
         );
+    }
+
+    #[test]
+    fn canvas_r_rotates_selected_component_through_the_session_command() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let id = app
+            .session
+            .place(ComponentKind::And, Position { x: 100., y: 100. })
+            .unwrap();
+        app.selected = Some(id);
+        frame(&ctx, &mut app, vec![], true);
+        click_at(&ctx, &mut app, Pos2::new(500., 400.));
+        app.selected = Some(id);
+        press(&ctx, &mut app, egui::Key::R, egui::Modifiers::NONE);
+        assert_eq!(app.session.document().components[0].rotation, 1);
+        assert_eq!(app.session.undo(), Ok(()));
+        assert_eq!(app.session.document().components[0].rotation, 0);
+    }
+
+    #[test]
+    fn paste_draft_r_rotates_preview_without_moving_placement_pivot_and_commit_matches() {
+        let fragment = digital_rust::formats::DigV2 {
+            elements: vec![digital_rust::formats::DigElement {
+                name: "Not".into(),
+                x: 0,
+                y: 0,
+                label: None,
+                value: None,
+                rotation: 0,
+                mirror: false,
+            }],
+            wires: vec![],
+        };
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        app.begin_fragment_draft(fragment, [0, 0], true).unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let anchor = app.fragment_draft.as_ref().unwrap().anchor;
+        let delta = app.fragment_draft.as_ref().unwrap().delta;
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::R, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(app.fragment_draft.as_ref().unwrap().anchor, anchor);
+        assert_eq!(app.fragment_draft.as_ref().unwrap().delta, delta);
+        assert_eq!(
+            app.fragment_draft.as_ref().unwrap().fragment.elements[0].rotation,
+            1
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(app.session.document().components[0].rotation, 1);
+        assert!(app.fragment_draft.is_none());
     }
 }

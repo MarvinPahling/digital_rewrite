@@ -102,14 +102,55 @@ impl Position {
         self.x.is_finite() && self.y.is_finite()
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Orientation {
+    /// Quarter-turn count, counterclockwise in screen coordinates. Only 0..=3 is valid.
+    pub rotation: u8,
+    pub mirror: bool,
+}
+
+impl Orientation {
+    /// Mirror local Y first, then rotate counterclockwise in screen coordinates.
+    pub fn transform_f32(self, x: f32, y: f32) -> Option<(f32, f32)> {
+        if self.rotation > 3 {
+            return None;
+        }
+        let y = if self.mirror { -y } else { y };
+        Some(match self.rotation {
+            0 => (x, y),
+            1 => (y, -x),
+            2 => (-x, -y),
+            3 => (-y, x),
+            _ => return None,
+        })
+    }
+
+    pub fn transform(self, x: i32, y: i32) -> Option<(i32, i32)> {
+        if self.rotation > 3 {
+            return None;
+        }
+        let y = if self.mirror { y.checked_neg()? } else { y };
+        Some(match self.rotation {
+            0 => (x, y),
+            1 => (y, x.checked_neg()?),
+            2 => (x.checked_neg()?, y.checked_neg()?),
+            3 => (y.checked_neg()?, x),
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Component {
     pub id: ComponentId,
     pub kind: ComponentKind,
+    /// Artwork bounds center in world coordinates (the historical document position).
     pub position: Position,
     pub label: String,
     /// Configured one-bit constant output; meaningful only for `Const`, defaults HIGH.
     pub constant_value: bool,
+    pub rotation: u8,
+    pub mirror: bool,
 }
 /// Geometric wire segments are the sole authoritative connectivity representation.
 #[derive(Clone, Debug, PartialEq, Eq)]

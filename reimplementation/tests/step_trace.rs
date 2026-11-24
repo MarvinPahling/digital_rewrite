@@ -29,6 +29,8 @@ fn doc() -> Document {
             },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         })
         .collect::<Vec<_>>();
     let pairs = [
@@ -374,6 +376,8 @@ fn pending_inspection_is_pure_sorted_and_distinguishes_partial_batch() {
             },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         });
     }
     let wires = [

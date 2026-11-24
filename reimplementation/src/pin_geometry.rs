@@ -28,6 +28,13 @@ fn integral(value: f32, kind: ComponentKind) -> Result<i32, PinGeometryError> {
     Ok(wide as i32)
 }
 
+/// Canonical local artwork-center offset, used by origin-preserving orientation edits and codecs.
+pub fn origin_to_center_offset(kind: ComponentKind) -> Result<(i32, i32), PinGeometryError> {
+    let offset = symbols::center_from_origin_offset(SymbolStyle::Rect, kind)
+        .ok_or(PinGeometryError::Unsupported(kind))?;
+    Ok((integral(offset[0], kind)?, integral(offset[1], kind)?))
+}
+
 /// Resolve a pin using the integral bounds-center offset and Digital's origin-relative pin offsets.
 pub fn pin_point(component: &Component, pin: PinId) -> Result<Point, PinGeometryError> {
     if !component.kind.has_pin(pin) {
@@ -35,10 +42,14 @@ pub fn pin_point(component: &Component, pin: PinId) -> Result<Point, PinGeometry
     }
     let cx = integral(component.position.x, component.kind)?;
     let cy = integral(component.position.y, component.kind)?;
-    let center_offset = symbols::center_from_origin_offset(SymbolStyle::Rect, component.kind)
-        .ok_or(PinGeometryError::Unsupported(component.kind))?;
-    let ox = integral(center_offset[0], component.kind)?;
-    let oy = integral(center_offset[1], component.kind)?;
+    let (ox, oy) = origin_to_center_offset(component.kind)?;
+    let orientation = crate::domain::Orientation {
+        rotation: component.rotation,
+        mirror: component.mirror,
+    };
+    let (ox, oy) = orientation
+        .transform(ox, oy)
+        .ok_or(PinGeometryError::OutOfRange(component.kind))?;
     let (px, py) = match (component.kind, pin.direction, pin.index) {
         (ComponentKind::Input | ComponentKind::Output | ComponentKind::Const, _, 0) => (0, 0),
         (ComponentKind::Not, crate::domain::PinDirection::Input, 0) => (0, 0),
@@ -75,6 +86,9 @@ pub fn pin_point(component: &Component, pin: PinId) -> Result<Point, PinGeometry
         ) => (80, 20),
         _ => return Err(PinGeometryError::Unsupported(component.kind)),
     };
+    let (px, py) = orientation
+        .transform(px, py)
+        .ok_or(PinGeometryError::OutOfRange(component.kind))?;
     let x = cx
         .checked_sub(ox)
         .and_then(|n| n.checked_add(px))
@@ -119,6 +133,8 @@ mod tests {
             position: crate::domain::Position { x, y },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         }
     }
     fn p(dir: crate::domain::PinDirection, index: u8) -> PinId {
@@ -201,5 +217,61 @@ mod tests {
                 .x,
             16_777_234
         );
+    }
+
+    #[test]
+    fn every_pin_transform_preserves_origin_and_applies_mirror_then_rotation() {
+        assert_eq!(
+            crate::domain::Orientation {
+                rotation: 1,
+                mirror: false
+            }
+            .transform(7, 3),
+            Some((3, -7))
+        );
+        assert_eq!(
+            crate::domain::Orientation {
+                rotation: 0,
+                mirror: true
+            }
+            .transform(7, 3),
+            Some((7, -3))
+        );
+        for kind in crate::components::KINDS {
+            let offset =
+                crate::symbols::center_from_origin_offset(SymbolStyle::Rect, kind).unwrap();
+            let origin = Point::new(200, 300);
+            for rotation in 0..4 {
+                for mirror in [false, true] {
+                    let orientation = crate::domain::Orientation { rotation, mirror };
+                    let center = orientation
+                        .transform(offset[0] as i32, offset[1] as i32)
+                        .unwrap();
+                    let component = c(
+                        kind,
+                        (origin.x + center.0) as f32,
+                        (origin.y + center.1) as f32,
+                    );
+                    let base = c(
+                        kind,
+                        (origin.x + offset[0] as i32) as f32,
+                        (origin.y + offset[1] as i32) as f32,
+                    );
+                    let mut component = component;
+                    component.rotation = rotation;
+                    component.mirror = mirror;
+                    for (pin, point) in all_pin_points(&component).unwrap() {
+                        let base_point = pin_point(&base, pin.pin).unwrap();
+                        let local = (base_point.x - origin.x, base_point.y - origin.y);
+                        let expected = orientation.transform(local.0, local.1).unwrap();
+                        assert_eq!(
+                            point,
+                            Point::new(origin.x + expected.0, origin.y + expected.1),
+                            "{kind:?} {pin:?} {rotation} {mirror}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

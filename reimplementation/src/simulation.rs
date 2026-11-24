@@ -243,6 +243,8 @@ mod tests {
             },
             label: String::new(),
             constant_value: true,
+            rotation: 0,
+            mirror: false,
         }
     }
     fn pin(id: u64, direction: PinDirection, index: u8) -> PinRef {
@@ -501,6 +503,8 @@ mod tests {
                 },
                 label: String::new(),
                 constant_value: true,
+                rotation: 0,
+                mirror: false,
             }
         };
         let source = PinRef {
