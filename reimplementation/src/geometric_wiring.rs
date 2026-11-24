@@ -28,6 +28,33 @@ pub struct Segment {
 
 pub use crate::domain::Wiring;
 
+/// Explicit, stable wire-routing orientation. The planner is toolkit independent and emits an
+/// orthogonal L (or a single segment when either coordinate already matches).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteOrientation {
+    HorizontalFirst,
+    VerticalFirst,
+}
+
+pub fn plan_orthogonal_route(
+    start: Point,
+    end: Point,
+    orientation: RouteOrientation,
+) -> Vec<Point> {
+    if start == end {
+        return vec![start];
+    }
+    let corner = match orientation {
+        RouteOrientation::HorizontalFirst => Point::new(end.x, start.y),
+        RouteOrientation::VerticalFirst => Point::new(start.x, end.y),
+    };
+    if corner == start || corner == end {
+        vec![start, end]
+    } else {
+        vec![start, corner, end]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GeometryError {
     WrongMode,
@@ -304,6 +331,28 @@ mod tests {
             b: Point::new(b.0, b.1),
         }
     }
+    #[test]
+    fn orthogonal_planner_has_both_orientations_and_no_redundant_corner() {
+        let a = Point::new(1, 2);
+        let b = Point::new(8, 9);
+        assert_eq!(
+            plan_orthogonal_route(a, b, RouteOrientation::HorizontalFirst),
+            vec![a, Point::new(8, 2), b]
+        );
+        assert_eq!(
+            plan_orthogonal_route(a, b, RouteOrientation::VerticalFirst),
+            vec![a, Point::new(1, 9), b]
+        );
+        assert_eq!(
+            plan_orthogonal_route(a, Point::new(8, 2), RouteOrientation::VerticalFirst),
+            vec![a, Point::new(8, 2)]
+        );
+        assert_eq!(
+            plan_orthogonal_route(a, a, RouteOrientation::VerticalFirst),
+            vec![a]
+        );
+    }
+
     #[test]
     fn normalization_splits_endpoint_contacts_but_not_proper_crossings() {
         let t = normalize(&[segment(1, (0, 0), (10, 0)), segment(2, (5, 0), (5, 5))]).unwrap();

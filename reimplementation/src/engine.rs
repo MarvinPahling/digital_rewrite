@@ -36,6 +36,18 @@ pub struct Session {
     simulation_generation: u64,
     path: Option<PathBuf>,
 }
+/// A wire-routing endpoint chosen by the user. Interior targets name the exact segment to split,
+/// so a click at a crossing never implicitly joins both wires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteTarget {
+    Pin(PinRef),
+    ExistingEndpoint(crate::geometric_wiring::Point),
+    SegmentInterior {
+        segment_id: u64,
+        point: crate::geometric_wiring::Point,
+    },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditError {
     /// Editing is locked while a simulation is active; stop it first.
@@ -52,6 +64,7 @@ pub enum EditError {
     WireIdExhausted,
     GeometricMode,
     Geometry(crate::geometric_wiring::GeometryError),
+    InvalidRouteTarget,
 }
 impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -69,6 +82,7 @@ impl std::fmt::Display for EditError {
             Self::WireIdExhausted => "No wire IDs remaining",
             Self::GeometricMode => "Operation requires legacy pin-pair wiring",
             Self::Geometry(error) => return write!(f, "Geometric wire edit rejected: {error}"),
+            Self::InvalidRouteTarget => "Wire route target is stale or invalid",
         })
     }
 }
@@ -865,6 +879,117 @@ impl Session {
         self.edit(next);
         self.next_segment_id = next_segment_id;
         Ok(true)
+    }
+    /// Insert a checked pin/endpoint-to-pin/endpoint orthogonal route in one history snapshot.
+    /// Existing crossing wires are not joined; an interior target must identify the exact segment.
+    pub fn route_geometric(
+        &mut self,
+        start: RouteTarget,
+        end: RouteTarget,
+        orientation: crate::geometric_wiring::RouteOrientation,
+    ) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        let existing = self
+            .document
+            .wires
+            .geometric()
+            .map_err(EditError::Geometry)?;
+        let resolve = |target: RouteTarget,
+                       segments: &[crate::geometric_wiring::Segment],
+                       document: &Document|
+         -> Result<crate::geometric_wiring::Point, EditError> {
+            match target {
+                RouteTarget::Pin(pin) => {
+                    let component = document
+                        .components
+                        .iter()
+                        .find(|c| c.id == pin.component)
+                        .ok_or(EditError::InvalidRouteTarget)?;
+                    crate::pin_geometry::pin_point(component, pin.pin)
+                        .map_err(|_| EditError::InvalidRouteTarget)
+                }
+                RouteTarget::ExistingEndpoint(point)
+                    if segments.iter().any(|s| s.a == point || s.b == point) =>
+                {
+                    Ok(point)
+                }
+                RouteTarget::SegmentInterior { segment_id, point } => {
+                    let segment = segments
+                        .iter()
+                        .find(|s| s.id == segment_id)
+                        .ok_or(EditError::InvalidRouteTarget)?;
+                    if point == segment.a
+                        || point == segment.b
+                        || !integer_point_on_segment(point, segment.a, segment.b)
+                    {
+                        Err(EditError::InvalidRouteTarget)
+                    } else {
+                        Ok(point)
+                    }
+                }
+                RouteTarget::ExistingEndpoint(_) => Err(EditError::InvalidRouteTarget),
+            }
+        };
+        let a = resolve(start, existing, &self.document)?;
+        let b = resolve(end, existing, &self.document)?;
+        if a == b {
+            return Ok(false);
+        }
+        let points = crate::geometric_wiring::plan_orthogonal_route(a, b, orientation);
+        let splits = [start, end]
+            .into_iter()
+            .filter_map(|target| match target {
+                RouteTarget::SegmentInterior { segment_id, point } => Some((segment_id, point)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if existing
+            .len()
+            .saturating_add(points.len().saturating_sub(1))
+            .saturating_add(splits.len())
+            > crate::geometric_wiring::MAX_SEGMENTS
+        {
+            return Err(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::SegmentLimit,
+            ));
+        }
+        let mut segments = existing.to_vec();
+        let mut next_id = self.next_segment_id;
+        for (segment_id, point) in splits {
+            let index = segments
+                .iter()
+                .position(|s| s.id == segment_id)
+                .ok_or(EditError::InvalidRouteTarget)?;
+            let old = segments[index];
+            segments[index].b = point;
+            segments.push(crate::geometric_wiring::Segment {
+                id: next_id,
+                a: point,
+                b: old.b,
+            });
+            next_id = next_id.checked_add(1).ok_or(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::IdExhausted,
+            ))?;
+        }
+        for pair in points.windows(2) {
+            if pair[0] == pair[1] {
+                continue;
+            }
+            segments.push(crate::geometric_wiring::Segment {
+                id: next_id,
+                a: pair[0],
+                b: pair[1],
+            });
+            next_id = next_id.checked_add(1).ok_or(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::IdExhausted,
+            ))?;
+        }
+        if segments.len() > crate::geometric_wiring::MAX_SEGMENTS {
+            return Err(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::SegmentLimit,
+            ));
+        }
+        self.commit_geometric(segments)
     }
     pub fn add_geometric_segments(
         &mut self,
@@ -3353,5 +3478,86 @@ mod tests {
         let before_undo = session.document().clone();
         session.undo().unwrap();
         assert_ne!(session.document(), &before_undo);
+    }
+
+    #[test]
+    fn geometric_route_splits_only_named_segment_and_is_one_undoable_edit() {
+        use crate::geometric_wiring::{Point as P, RouteOrientation, Segment};
+        let mut session = Session::default();
+        session.document.wires = crate::domain::Wiring::GeometricSegments(vec![
+            Segment {
+                id: 4,
+                a: P::new(0, 0),
+                b: P::new(20, 0),
+            },
+            Segment {
+                id: 5,
+                a: P::new(10, -10),
+                b: P::new(10, 10),
+            },
+        ]);
+        session.next_segment_id = 6;
+        assert!(
+            session
+                .route_geometric(
+                    RouteTarget::ExistingEndpoint(P::new(0, 0)),
+                    RouteTarget::SegmentInterior {
+                        segment_id: 4,
+                        point: P::new(10, 0)
+                    },
+                    RouteOrientation::VerticalFirst,
+                )
+                .unwrap()
+        );
+        let segments = session.document.wires.geometric().unwrap();
+        assert!(
+            segments
+                .iter()
+                .any(|s| s.id == 5 && s.a == P::new(10, -10) && s.b == P::new(10, 10))
+        );
+        assert!(
+            segments
+                .iter()
+                .any(|s| s.a == P::new(0, 0) && s.b == P::new(10, 0))
+        );
+        assert!(
+            segments
+                .iter()
+                .any(|s| s.a == P::new(10, 0) && s.b == P::new(20, 0))
+        );
+        assert_eq!(session.undo.len(), 1);
+        session.undo().unwrap();
+        assert_eq!(session.document.wires.geometric().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn geometric_route_rejects_stale_targets_and_same_point_is_history_noop() {
+        use crate::geometric_wiring::{Point as P, RouteOrientation, Segment};
+        let mut session = Session::default();
+        session.document.wires = crate::domain::Wiring::GeometricSegments(vec![Segment {
+            id: 2,
+            a: P::new(0, 0),
+            b: P::new(10, 0),
+        }]);
+        session.next_segment_id = 3;
+        assert!(
+            !session
+                .route_geometric(
+                    RouteTarget::ExistingEndpoint(P::new(0, 0)),
+                    RouteTarget::ExistingEndpoint(P::new(0, 0)),
+                    RouteOrientation::HorizontalFirst,
+                )
+                .unwrap()
+        );
+        assert!(session.undo.is_empty());
+        assert_eq!(
+            session.route_geometric(
+                RouteTarget::ExistingEndpoint(P::new(0, 0)),
+                RouteTarget::ExistingEndpoint(P::new(5, 0)),
+                RouteOrientation::HorizontalFirst,
+            ),
+            Err(EditError::InvalidRouteTarget)
+        );
+        assert_eq!(session.document.wires.geometric().unwrap().len(), 1);
     }
 }
