@@ -218,6 +218,9 @@ pub struct DigitalApp {
     approved_close: bool,
     label_modal: Option<LabelDraft>,
     restore_canvas_focus: bool,
+    fragment_focus_claimed: bool,
+    fragment_focus_check_pending: bool,
+    fragment_canvas_had_focus: bool,
     view: CanvasViewState,
     pan_owner: Option<egui::PointerButton>,
     fit_view_pending: bool,
@@ -313,6 +316,9 @@ impl DigitalApp {
             approved_close: false,
             label_modal: None,
             restore_canvas_focus: false,
+            fragment_focus_claimed: false,
+            fragment_focus_check_pending: false,
+            fragment_canvas_had_focus: false,
             view: CanvasViewState::default(),
             pan_owner: None,
             fit_view_pending: false,
@@ -377,6 +383,9 @@ impl DigitalApp {
             keyboard_adjusted: false,
         });
         self.restore_canvas_focus = true;
+        self.fragment_focus_claimed = false;
+        self.fragment_focus_check_pending = false;
+        self.fragment_canvas_had_focus = false;
         Ok(())
     }
 
@@ -419,6 +428,11 @@ impl DigitalApp {
                         }
                     }
                 },
+                Ok(None)
+                    if self.selection.components.is_empty() && !self.selection.wires.is_empty() =>
+                {
+                    self.clipboard_error = Some("Cut not performed: a partial boundary wire cannot be copied or cut by itself.".into());
+                }
                 Ok(None) => {}
                 Err(error) => self.clipboard_error = Some(error.to_string()),
             },
@@ -1613,11 +1627,15 @@ impl DigitalApp {
             ui.label(format!("Randomized startup is deterministic for the displayed seed; policy: {} (SplitMix64 + Fisher–Yates, sorted component IDs). Not Java trace-compatible.", crate::runtime::STARTUP_RANDOM_POLICY));
             ui.horizontal(|ui| {
                 ui.label("Startup seed");
+                let seed_had_focus = self.seed_field_focused;
                 let response = ui.add_enabled(!active, egui::TextEdit::singleline(&mut self.startup_seed_text).id_salt("simulation_startup_seed").desired_width(140.0).hint_text("unsigned decimal u64"));
                 self.seed_field_id = Some(response.id);
                 if self.seed_focus_requested {
                     response.request_focus();
                     self.seed_focus_requested = false;
+                }
+                if seed_had_focus && response.lost_focus() && ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    response.request_focus();
                 }
                 if response.has_focus()
                     && ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -2016,6 +2034,23 @@ impl DigitalApp {
             if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 { self.canvas_rect = None; return; }
             self.canvas_rect = Some(rect);
             self.canvas_id = Some(response.id);
+            // Placement owns keyboard input only while the canvas retains focus. A click on
+            // another widget (notably the startup-seed editor) cancels placement instead of
+            // stealing that widget's Enter/text input.
+            let focus_check_pending = std::mem::replace(&mut self.fragment_focus_check_pending, false);
+            if self.fragment_draft.is_some() && response.has_focus() {
+                self.fragment_canvas_had_focus = true;
+            }
+            if self.fragment_draft.is_some()
+                && self.fragment_focus_claimed
+                && !focus_check_pending
+                && (self.seed_field_focused
+                    || (self.fragment_canvas_had_focus
+                        && ctx.memory(|memory| memory.focused()).is_some_and(|focused| focused != response.id)))
+            {
+                self.fragment_draft = None;
+                self.fragment_focus_claimed = false;
+            }
             // A queued navigation action may outlive the frame/UI event that created it.
             // Revalidate modality at the point of execution, just like the toolbar controls.
             if let Some(action) = self
@@ -2055,6 +2090,8 @@ impl DigitalApp {
                 self.marquee = None;
                 self.placing = None;
                 self.fragment_draft = None;
+                self.fragment_focus_claimed = false;
+                self.fragment_canvas_had_focus = false;
                 self.geometric_route_start = None;
             }
             // Gesture ownership is acquired only when unowned. A chorded/extra press must
@@ -2126,15 +2163,20 @@ impl DigitalApp {
             let Some(transform) = self.view.transform(rect) else { return; };
             draw_grid(&painter, rect, transform, ui.visuals().widgets.noninteractive.bg_stroke.color);
             let pointer = (!cancelled && !pan_sequence).then(|| response.interact_pointer_pos()).flatten();
-            let pointer_moved = ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::PointerMoved(_))));
+            let draft_pointer = (!cancelled && !pan_sequence)
+                .then(|| ctx.input(|input| input.pointer.hover_pos()).filter(|point| rect.contains(*point)))
+                .flatten();
+            let pointer_moved_over_canvas = draft_pointer.is_some()
+                && ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::PointerMoved(_))));
             if let Some(draft) = &mut self.fragment_draft {
-                if pointer_moved { draft.keyboard_adjusted = false; }
-                if !draft.keyboard_adjusted && let Some(target) = pointer.or_else(|| draft.center_fallback.then_some(rect.center())) {
+                if pointer_moved_over_canvas { draft.keyboard_adjusted = false; }
+                if !draft.keyboard_adjusted && let Some(target) = draft_pointer.or_else(|| draft.center_fallback.then_some(rect.center())) {
                     let world = transform.to_world(target);
                     let dx = ((f64::from(world[0]) - draft.anchor[0]) / 20.0).round() * 20.0;
                     let dy = ((f64::from(world[1]) - draft.anchor[1]) / 20.0).round() * 20.0;
                     if dx.is_finite() && dy.is_finite() && dx >= i32::MIN as f64 && dx <= i32::MAX as f64 && dy >= i32::MIN as f64 && dy <= i32::MAX as f64 {
                         draft.delta = [dx as i32, dy as i32];
+                        draft.center_fallback = false;
                     }
                 }
             }
@@ -2588,10 +2630,11 @@ impl DigitalApp {
                 && ctx.input(|input| input.focused)
             {
                 response.request_focus();
+                if self.fragment_draft.is_some() {
+                    self.fragment_focus_claimed = true;
+                    self.fragment_focus_check_pending = true;
+                }
                 self.restore_canvas_focus = false;
-            }
-            if self.fragment_draft.is_some() && !self.modality_active() && !pan_sequence {
-                response.request_focus();
             }
             let placement_keyboard = response.has_focus() && !self.modality_active() && !pan_sequence && self.fragment_draft.is_some();
             if placement_keyboard && !locked {
@@ -2948,6 +2991,64 @@ mod tests {
     }
 
     #[test]
+    fn partial_wire_only_cut_is_a_visible_noop_preserving_clipboard_and_history() {
+        let state = Rc::new(RefCell::new(FakeClipboardState {
+            text: "keep clipboard".into(),
+            ..Default::default()
+        }));
+        let mut app = DigitalApp::with_file_io(None, None)
+            .with_clipboard(Box::new(FakeClipboard(state.clone())));
+        let input = app
+            .session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let output = app
+            .session
+            .place(ComponentKind::Output, Position { x: 80.0, y: 0.0 })
+            .unwrap();
+        app.session
+            .connect([
+                PinRef {
+                    component: input,
+                    pin: PinId {
+                        direction: PinDirection::Output,
+                        index: 0,
+                    },
+                },
+                PinRef {
+                    component: output,
+                    pin: PinId {
+                        direction: PinDirection::Input,
+                        index: 0,
+                    },
+                },
+            ])
+            .unwrap();
+        let segment = app.session.document().wires.geometric().unwrap()[0];
+        app.selection
+            .wires
+            .insert(segment.id, crate::selection::EndpointMask::A);
+        let document = app.session.document().clone();
+        app.run_clipboard_action(ClipboardAction::Cut);
+        assert_eq!(app.session.document(), &document);
+        app.session.undo().unwrap();
+        assert_ne!(
+            app.session.document(),
+            &document,
+            "prior undo history remains available"
+        );
+        app.session.redo().unwrap();
+        assert_eq!(app.session.document(), &document);
+        assert_eq!(state.borrow().text, "keep clipboard");
+        assert_eq!(state.borrow().writes, 0);
+        assert!(
+            app.clipboard_error
+                .as_deref()
+                .is_some_and(|message| message.contains("partial boundary wire"))
+        );
+    }
+
+    #[test]
     fn cut_write_failure_preserves_document_history_selection_and_clipboard() {
         let state = Rc::new(RefCell::new(FakeClipboardState {
             text: "old clipboard".into(),
@@ -3132,6 +3233,147 @@ mod tests {
         assert_eq!((state.borrow().reads, state.borrow().writes), (0, 0));
     }
     #[test]
+    fn pointer_move_updates_paste_preview_and_click_or_enter_commits_same_transformed_position() {
+        use crate::canvas::CanvasViewState;
+
+        let fragment = digital_rust::formats::DigV2 {
+            elements: vec![digital_rust::formats::DigElement {
+                name: "In".into(),
+                x: 0,
+                y: 0,
+                label: Some("Hover paste".into()),
+                value: None,
+            }],
+            wires: vec![],
+        };
+        for commit_by_enter in [false, true] {
+            let mut app = DigitalApp::default();
+            app.begin_fragment_draft(fragment.clone(), [0, 0], false)
+                .unwrap();
+            let ctx = egui::Context::default();
+            frame(&ctx, &mut app, vec![], true);
+            let rect = app.canvas_rect.unwrap();
+            app.view = CanvasViewState::default();
+            app.view.pan(Vec2::new(37.0, -23.0));
+            app.view.zoom_at(rect, rect.center(), 1.7);
+            let pointer = rect.center() + Vec2::new(41.0, 29.0);
+            let transform = app.view.transform(rect).unwrap();
+            let world = transform.to_world(pointer);
+            let anchor = app.fragment_draft.as_ref().unwrap().anchor;
+            let expected = [
+                (((f64::from(world[0]) - anchor[0]) / 20.0).round() * 20.0) as i32,
+                (((f64::from(world[1]) - anchor[1]) / 20.0).round() * 20.0) as i32,
+            ];
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerMoved(pointer)],
+                true,
+            );
+            assert_eq!(
+                app.fragment_draft.as_ref().unwrap().delta,
+                expected,
+                "pointer-move-only preview must use canvas hover under pan/zoom"
+            );
+            let outside = Pos2::new(rect.right() + 30.0, rect.bottom() + 30.0);
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerMoved(outside)],
+                true,
+            );
+            assert_eq!(
+                app.fragment_draft.as_ref().unwrap().delta,
+                expected,
+                "leaving the canvas retains the last valid draft position"
+            );
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerMoved(pointer)],
+                true,
+            );
+            if commit_by_enter {
+                frame(
+                    &ctx,
+                    &mut app,
+                    vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+                    true,
+                );
+            } else {
+                frame(&ctx, &mut app, vec![button(pointer, true)], true);
+                frame(&ctx, &mut app, vec![button(pointer, false)], true);
+            }
+            assert_eq!(app.session.document().components.len(), 1);
+            let source = digital_rust::formats::to_domain(&fragment).unwrap();
+            assert_eq!(
+                app.session.document().components[0].position,
+                Position {
+                    x: source.components[0].position.x + expected[0] as f32,
+                    y: source.components[0].position.y + expected[1] as f32,
+                },
+                "source={:?} expected delta={expected:?}",
+                source.components[0].position
+            );
+            assert!(app.fragment_draft.is_none());
+        }
+    }
+
+    #[test]
+    fn placement_draft_releases_focus_to_seed_editor_and_enter_only_edits_seed() {
+        let fragment = digital_rust::formats::DigV2 {
+            elements: vec![digital_rust::formats::DigElement {
+                name: "In".into(),
+                x: 0,
+                y: 0,
+                label: Some("Must not insert".into()),
+                value: None,
+            }],
+            wires: vec![],
+        };
+        let mut app = DigitalApp::default();
+        app.begin_fragment_draft(fragment, [0, 0], false).unwrap();
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], true);
+        let seed_rect = app.seed_field_rect.unwrap();
+        let seed = seed_rect.center();
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(seed), button(seed, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![button(seed, false)], true);
+        assert!(
+            app.fragment_draft.is_none(),
+            "focus transfer cancels placement"
+        );
+        assert!(
+            app.seed_field_focused,
+            "the clicked seed editor retains focus"
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::A, egui::Modifiers::COMMAND)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![egui::Event::Text("42".into())], true);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(app.startup_seed_text, "42");
+        assert!(app.seed_field_focused);
+        assert!(
+            app.session.document().components.is_empty(),
+            "seed Enter must not commit a fragment"
+        );
+    }
+
+    #[test]
     fn paste_preview_is_transient_and_keyboard_offset_commits_once_with_fresh_selection() {
         let fragment = digital_rust::formats::DigV2 {
             elements: vec![digital_rust::formats::DigElement {
@@ -3152,13 +3394,21 @@ mod tests {
         }));
         let mut app = DigitalApp::with_file_io(None, None)
             .with_clipboard(Box::new(FakeClipboard(state.clone())));
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, vec![], true);
+        let canvas = app.canvas_rect.unwrap().center();
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(canvas), button(canvas, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![button(canvas, false)], true);
         let original = app.session.document().clone();
         app.run_clipboard_action(ClipboardAction::Paste(None));
         assert_eq!(app.session.document(), &original);
         assert_eq!(state.borrow().reads, 1);
-        let ctx = egui::Context::default();
         frame(&ctx, &mut app, vec![], true);
-        ctx.memory_mut(|memory| memory.request_focus(app.canvas_id.unwrap()));
         let before_arrow = app.fragment_draft.as_ref().unwrap().delta;
         frame(
             &ctx,
@@ -3168,12 +3418,9 @@ mod tests {
         );
         let offset = app.fragment_draft.as_ref().unwrap().delta;
         assert_eq!(offset[0], before_arrow[0] + 20);
-        frame(
-            &ctx,
-            &mut app,
-            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
-            true,
-        );
+        let canvas = app.canvas_rect.unwrap().center();
+        frame(&ctx, &mut app, vec![button(canvas, true)], true);
+        frame(&ctx, &mut app, vec![button(canvas, false)], true);
         assert_eq!(
             app.session.document().components.len(),
             1,
