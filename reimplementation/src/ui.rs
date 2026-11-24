@@ -104,6 +104,8 @@ pub struct DigitalApp {
     session: Session,
     selected: Option<ComponentId>,
     selected_segment: Option<u64>,
+    selection: crate::selection::Selection,
+    marquee: Option<(Pos2, egui::Modifiers)>,
     wiring: bool,
     geometric_route_start: Option<crate::engine::RouteTarget>,
     route_orientation: digital_rust::geometric_wiring::RouteOrientation,
@@ -199,6 +201,8 @@ impl DigitalApp {
             session: Session::default(),
             selected: None,
             selected_segment: None,
+            selection: crate::selection::Selection::default(),
+            marquee: None,
             wiring: false,
             geometric_route_start: None,
             route_orientation: digital_rust::geometric_wiring::RouteOrientation::HorizontalFirst,
@@ -429,6 +433,7 @@ impl DigitalApp {
         self.focused_route_target = None;
         self.route_pick_cycle = 0;
         self.drag = None;
+        self.marquee = None;
     }
     fn begin_pending(&mut self, action: PendingAction) {
         // A published warning is an acknowledgement barrier. In particular, a window-manager
@@ -521,6 +526,8 @@ impl DigitalApp {
         self.pan_owner = None;
         self.selected = None;
         self.selected_segment = None;
+        self.selection.clear();
+        self.marquee = None;
         self.cancel_gestures();
         self.failed_start = None;
         self.settling = false;
@@ -1116,6 +1123,7 @@ impl DigitalApp {
                         self.geometric_route_start = None;
                         self.focused_pin = None;
                         self.drag = None;
+                        self.marquee = None;
                         self.failed_start = None;
                         self.error = None;
                         self.settling = action == SimAction::Start;
@@ -1474,7 +1482,9 @@ impl DigitalApp {
             ui.separator();
             ui.label("Click canvas to place. Drag to move. Escape cancels. Delete removes; Ctrl/Cmd-Z undoes; Shift-Ctrl/Cmd-Z redoes.");
             ui.label(if self.session.dirty() { "Modified" } else { "Unmodified" });
-            if let Some(id) = self.selected {
+            if self.selection.wires.is_empty()
+                && (self.selection.components.len() == 1 || (self.selection.components.is_empty() && self.selected.is_some()))
+                && let Some(id) = self.selected.or_else(|| self.selection.components.iter().next().copied()) {
                 let label = self.session.document().components.iter().find(|component| component.id == id).map(|component| component.label.clone());
                 if let Some(label) = label {
                     ui.label(format!("Selected label: {label}"));
@@ -1706,6 +1716,7 @@ impl DigitalApp {
             if cancelled {
                 self.pan_owner = None;
                 self.drag = None;
+                self.marquee = None;
                 self.placing = None;
                         self.geometric_route_start = None;
             }
@@ -1764,11 +1775,12 @@ impl DigitalApp {
                         }
                     }
                 }
-                let pan_keys = ctx.input_mut(|i| {
-                    [egui::Key::ArrowLeft, egui::Key::ArrowRight, egui::Key::ArrowUp, egui::Key::ArrowDown]
-                        .into_iter()
-                        .find(|key| i.consume_key(egui::Modifiers::NONE, *key))
-                });
+                let pan_keys = ctx.input(|i| i.events.iter().find_map(|event| match event {
+                    egui::Event::Key { key, pressed: true, modifiers, .. }
+                        if *modifiers == egui::Modifiers::NONE
+                            && matches!(key, egui::Key::ArrowLeft|egui::Key::ArrowRight|egui::Key::ArrowUp|egui::Key::ArrowDown) => Some(*key),
+                    _ => None,
+                }));
                 if let Some(key) = pan_keys {
                     let delta = match key { egui::Key::ArrowLeft => Vec2::new(40.,0.), egui::Key::ArrowRight => Vec2::new(-40.,0.), egui::Key::ArrowUp => Vec2::new(0.,40.), _ => Vec2::new(0.,-40.) };
                     let _ = self.view.pan(delta);
@@ -1809,13 +1821,13 @@ impl DigitalApp {
                         pos,
                         button: egui::PointerButton::Primary,
                         pressed: true,
-                        ..
-                    } => Some(*pos),
+                        modifiers,
+                    } => Some((*pos, *modifiers)),
                     _ => None,
                 })
             });
             if !cancelled && !pan_sequence
-                && let Some(p) = press
+                && let Some((p, modifiers)) = press
                 && rect.contains(p)
             {
                 response.request_focus();
@@ -1850,8 +1862,29 @@ impl DigitalApp {
                             Err(error) => { self.error = Some(format!("Cannot select wire: {error}")); None }
                         }
                     } else { None };
-                    self.selected = hit.map(|v| v.0);
-                    self.drag = hit.filter(|_| !locked).map(|(id, pos)| (id, pos, p));
+                    if let Some((id, _)) = hit {
+                        let toggle=modifiers.command || modifiers.ctrl;
+                        if modifiers.shift || toggle || !self.selection.components.contains(&id) {
+                            self.selection.select_component(id, modifiers.shift, toggle);
+                        }
+                        self.selected = (self.selection.components.len() == 1)
+                            .then(|| self.selection.components.iter().next().copied())
+                            .flatten();
+                        self.selected_segment = None;
+                        self.drag = (!locked && self.selection.components.contains(&id)).then(|| (id, hit.map(|v| v.1).unwrap_or(Position{x:0.,y:0.}), p));
+                    } else if let Some(id) = self.selected_segment {
+                        let toggle=modifiers.command || modifiers.ctrl;
+                        if modifiers.shift || toggle || !self.selection.wires.contains_key(&id) {
+                            self.selection.select_wire_endpoint(id, crate::selection::EndpointMask::BOTH, modifiers.shift, toggle);
+                        }
+                        self.selected = None;
+                        self.drag = (!locked).then_some((ComponentId(u64::MAX), Position{x:0.,y:0.}, p));
+                        if !modifiers.shift && !(modifiers.command || modifiers.ctrl) { self.selected_segment = Some(id); }
+                    } else {
+                        self.selection.clear();
+                        self.selected = None;
+                        self.marquee = Some((p, modifiers));
+                    }
                     if locked
                         && let Some((id, _)) = hit
                         && self
@@ -1874,54 +1907,82 @@ impl DigitalApp {
                 let [x, y] = transform.to_world(p);
                 match self.session.place(kind, snap_component_center(style, kind, x, y)) {
                     Ok(id) => {
+                        self.selection.clear();
+                        self.selection.components.insert(id);
                         self.selected = Some(id);
-                                        self.selected_segment = None;
+                        self.selected_segment = None;
                     }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
             if !cancelled && !pan_sequence && response.clicked() {
                 self.drag = None;
+                self.marquee = None;
             }
             if !cancelled && !pan_sequence
                 && !locked
                 && response.drag_stopped()
-                && let (Some((id, start, origin)), Some(p)) = (self.drag.take(), pointer)
+                && let (Some((_id, start, origin)), Some(p)) = (self.drag.take(), pointer)
             {
                 let [dx, dy] = transform.delta_to_world(p - origin);
-                let kind = self.session.document().components.iter().find(|c| c.id == id).map(|c| c.kind);
-                let Some(kind) = kind else {
-                    self.error = Some("Cannot move component: identity no longer exists".into());
-                    return;
-                };
-                let snapped = snap_component_center(style, kind, start.x + dx, start.y + dy);
-                match self.session.move_component(id, snapped) {
-                    Ok(()) => {
-                        // Retain exact integer center deltas in transient pin hit geometry.
-                        let committed_dx = snapped.x - start.x;
-                        let committed_dy = snapped.y - start.y;
+                // A multi-selection uses one common grid delta; preserve the established single
+                // component snap origin for asymmetric artwork placements.
+                let (snapped_dx, snapped_dy) = if self.selection.components.len()==1 && self.selection.wires.is_empty() {
+                    let id=self.selection.components.iter().next().copied();
+                    let kind=id.and_then(|id| self.session.document().components.iter().find(|c| c.id==id).map(|c| c.kind));
+                    kind.map(|kind| { let snapped=snap_component_center(style,kind,start.x+dx,start.y+dy); ((snapped.x-start.x) as i32,(snapped.y-start.y) as i32) }).unwrap_or(((dx/20.).round() as i32*20,(dy/20.).round() as i32*20))
+                } else { ((dx/20.).round() as i32*20,(dy/20.).round() as i32*20) };
+                match self.session.move_selection(&self.selection, snapped_dx, snapped_dy) {
+                    Ok(_) => {
                         for (pin, pos) in &mut pins {
-                            if pin.component == id {
-                                pos[0] += committed_dx;
-                                pos[1] += committed_dy;
+                            if self.selection.components.contains(&pin.component) {
+                                pos[0] += snapped_dx as f32;
+                                pos[1] += snapped_dy as f32;
                             }
                         }
                     }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
+            if !cancelled && !pan_sequence && !locked
+                && response.drag_stopped()
+                && let (Some((start, modifiers)), Some(end)) = (self.marquee.take(), pointer)
+            {
+                let world_rect = crate::selection::Rect::normalized(transform.to_world(start), transform.to_world(end));
+                let doc = self.session.document();
+                let components = doc.components.iter().filter_map(|c| {
+                    SymbolLayout::centered_on(style, c.kind, [c.position.x,c.position.y]).map(|layout| { let b=layout.bounds(); (c.id,b.min,b.max) })
+                }).collect::<Vec<_>>();
+                let wires = doc.wires.geometric().map(|s| s.to_vec()).unwrap_or_default();
+                self.selection.apply_marquee(crate::selection::marquee(components,&wires,world_rect), modifiers.shift, modifiers.command || modifiers.ctrl);
+                self.selected = if self.selection.components.len()==1 && self.selection.wires.is_empty() { self.selection.components.iter().next().copied() } else { None };
+                self.selected_segment = if self.selection.wires.len()==1 { self.selection.wires.keys().next().copied() } else { None };
+            }
             let palette = Palette::from_visuals(ui.visuals());
-            // Use the same transient position for attached wires and symbols.
+            if let Some((start, _)) = self.marquee
+                && let Some(end) = pointer
+            {
+                let selection_rect = Rect::from_two_pos(start, end);
+                painter.rect_stroke(selection_rect, 0.0, Stroke::new(1.0_f32, palette.selection), egui::StrokeKind::Middle);
+            }
+            let gesture_delta = if let (Some((drag_id,start,origin)),Some(p))=(self.drag,pointer) {
+                let [dx,dy]=transform.delta_to_world(p-origin);
+                if self.selection.components.len()==1 && self.selection.wires.is_empty() && drag_id != ComponentId(u64::MAX) {
+                    let kind=self.selection.components.iter().next().and_then(|id| self.session.document().components.iter().find(|c| c.id==*id).map(|c| c.kind));
+                    kind.map(|kind| { let snapped=snap_component_center(style,kind,start.x+dx,start.y+dy); [snapped.x-start.x,snapped.y-start.y] }).unwrap_or([((dx/20.).round()*20.),((dy/20.).round()*20.)])
+                } else { [((dx/20.).round()*20.),((dy/20.).round()*20.)] }
+            } else {[0.,0.]};
+            // Use a single snapped preview delta for every selected symbol and endpoint.
             let wire_pins: Vec<_> = pins
                 .iter()
                 .map(|(pin, pos)| {
                     let mut pos = *pos;
-                    if let (Some((id, _, origin)), Some(p)) = (self.drag, pointer)
-                        && id == pin.component
+                    if let (Some((_id, _, origin)), Some(p)) = (self.drag, pointer)
+                        && self.selection.components.contains(&pin.component)
                     {
-                        let [dx, dy] = transform.delta_to_world(p - origin);
-                        pos[0] += dx;
-                        pos[1] += dy;
+                        let _ = (p, origin);
+                        pos[0] += gesture_delta[0];
+                        pos[1] += gesture_delta[1];
                     }
                     (*pin, pos)
                 })
@@ -1935,11 +1996,16 @@ impl DigitalApp {
             };
                 let mut incidence = std::collections::BTreeMap::<digital_rust::geometric_wiring::Point, usize>::new();
                 for segment in segments {
-                    *incidence.entry(segment.a).or_default() += 1;
-                    *incidence.entry(segment.b).or_default() += 1;
-                    let color = if self.selected_segment == Some(segment.id) { palette.selection } else { palette.ink };
+                    let mut a=segment.a; let mut b=segment.b;
+                    if let Some(mask)=self.selection.wires.get(&segment.id) {
+                        if mask.contains_a() { a.x=a.x.saturating_add(gesture_delta[0] as i32); a.y=a.y.saturating_add(gesture_delta[1] as i32); }
+                        if mask.contains_b() { b.x=b.x.saturating_add(gesture_delta[0] as i32); b.y=b.y.saturating_add(gesture_delta[1] as i32); }
+                    }
+                    *incidence.entry(a).or_default() += 1;
+                    *incidence.entry(b).or_default() += 1;
+                    let color = if self.selected_segment == Some(segment.id) || self.selection.wires.contains_key(&segment.id) { palette.selection } else { palette.ink };
                     painter.line_segment(
-                        [transform.to_screen([segment.a.x as f32, segment.a.y as f32]), transform.to_screen([segment.b.x as f32, segment.b.y as f32])],
+                        [transform.to_screen([a.x as f32, a.y as f32]), transform.to_screen([b.x as f32, b.y as f32])],
                         Stroke::new(2.0_f32, color),
                     );
                 }
@@ -2004,17 +2070,13 @@ impl DigitalApp {
             let pending_view = self.session.inspect().map(|runtime| runtime.pending_inspection());
             for c in &self.session.document().components {
                 let mut pos = c.position;
-                if let (Some((id, start, origin)), Some(p)) = (self.drag, pointer)
-                    && id == c.id
+                if let (Some((_id, _start, _origin)), Some(_p)) = (self.drag, pointer)
+                    && self.selection.components.contains(&c.id)
                 {
-                    let [dx, dy] = transform.delta_to_world(p - origin);
-                    pos = Position {
-                        x: start.x + dx,
-                        y: start.y + dy,
-                    };
+                    pos = Position { x: c.position.x + gesture_delta[0], y: c.position.y + gesture_delta[1] };
                 }
                 let affected = self.session.oscillation_diagnostic().is_some_and(|diagnostic| diagnostic.components.iter().any(|component| component.id == c.id));
-                let state = if affected { PaintState::Error } else if self.selected == Some(c.id) { PaintState::Selection } else { PaintState::Ink };
+                let state = if affected { PaintState::Error } else if self.selection.components.contains(&c.id) || self.selected == Some(c.id) { PaintState::Selection } else { PaintState::Ink };
                 let Some(layout) = SymbolLayout::centered_on(style, c.kind, [pos.x, pos.y]) else {
                     self.error = Some(format!("No symbol is drawn for {}", c.kind.name()));
                     continue;
@@ -2074,7 +2136,7 @@ impl DigitalApp {
                         }
                     }
                 }
-                if self.selected == Some(c.id) {
+                if self.selection.components.contains(&c.id) || self.selected == Some(c.id) {
                     let frame = Rect::from_min_max(
                         transform.to_screen(bounds.min),
                         transform.to_screen(bounds.max),
@@ -2142,6 +2204,26 @@ impl DigitalApp {
                     )
                 });
             }
+            if owns_keyboard && !locked {
+                let select_all = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A) || i.consume_key(egui::Modifiers::CTRL, egui::Key::A));
+                if select_all {
+                    self.selection.components = self.session.document().components.iter().map(|c| c.id).collect();
+                    self.selection.wires = self.session.document().wires.geometric().map(|segments| segments.iter().map(|s| (s.id, crate::selection::EndpointMask::BOTH)).collect()).unwrap_or_default();
+                    self.selected = (self.selection.components.len()==1).then(|| self.selection.components.iter().next().copied()).flatten();
+                    self.selected_segment = None;
+                }
+                // Shift+arrows nudge the mixed selection; unmodified arrows remain camera pan.
+                let nudge = ctx.input(|i| i.events.iter().find_map(|event| match event {
+                    egui::Event::Key { key, pressed: true, modifiers, .. }
+                        if modifiers.shift && !modifiers.ctrl && !modifiers.command
+                            && matches!(key, egui::Key::ArrowLeft|egui::Key::ArrowRight|egui::Key::ArrowUp|egui::Key::ArrowDown) => Some(*key),
+                    _ => None,
+                }));
+                if let Some(key) = nudge {
+                    let (dx,dy) = match key { egui::Key::ArrowLeft=>(-20,0),egui::Key::ArrowRight=>(20,0),egui::Key::ArrowUp=>(0,-20),_=>(0,20) };
+                    if let Err(error)=self.session.move_selection(&self.selection,dx,dy) { self.error=Some(error.to_string()); }
+                }
+            }
             if owns_keyboard && locked {
                 // Edit shortcuts are refused here, before the engine would refuse them.
                 let command = egui::Modifiers::COMMAND;
@@ -2166,7 +2248,7 @@ impl DigitalApp {
                 if attempted {
                     self.error = Some(EditError::SimulationActive.to_string());
                 }
-                if self.selected.is_some_and(|id| {
+                if self.selection.wires.is_empty() && (self.selection.components.len()==1 || (self.selection.components.is_empty() && self.selected.is_some())) && self.selected.is_some_and(|id| {
                     self.session
                         .document()
                         .components
@@ -2180,6 +2262,8 @@ impl DigitalApp {
             }
             if owns_keyboard
                 && !locked
+                && self.selection.wires.is_empty()
+                && (self.selection.components.len()==1 || (self.selection.components.is_empty() && self.selected.is_some()))
                 && let Some(id) = self.selected
                 && self
                     .session
@@ -2204,6 +2288,8 @@ impl DigitalApp {
             }
             if owns_keyboard
                 && !locked
+                && self.selection.components.len() <= 1
+                && self.selection.wires.is_empty()
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2))
             {
                 self.begin_label_edit();
@@ -2284,6 +2370,8 @@ impl DigitalApp {
                                 };
                                 self.selected_segment = Some(segments[next].id);
                                 self.selected = None;
+                                self.selection.clear();
+                                self.selection.wires.insert(segments[next].id, crate::selection::EndpointMask::BOTH);
                             }
                             Ok(_) => {}
                             Err(error) => self.error = Some(format!("Cannot navigate wire selection: {error}")),
@@ -2308,26 +2396,22 @@ impl DigitalApp {
                         self.error = Some("Focused wire target is stale; select a current target".into());
                     }
                 }
-                if let Some(id) = self.selected_segment
-                    && !locked
-                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-                {
-                    match self.session.delete_geometric_segment(id) {
-                        Ok(_) => { self.selected_segment = None; self.error = None; }
-                        Err(error) => self.error = Some(error.to_string()),
-                    }
-                }
             }
             if owns_keyboard
                 && !locked
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-                && let Some(id) = self.selected
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace))
             {
-                match self.session.delete(id) {
-                    Ok(()) => {
-                        self.selected = None;
-                        self.drag = None;
-                    }
+                let result = if let Some(id)=self.selected.filter(|id| !self.selection.components.contains(id)) {
+                    self.session.delete(id).map(|_| true)
+                } else if !self.selection.is_empty() {
+                    self.session.delete_selection(&self.selection)
+                } else if let Some(id)=self.selected_segment {
+                    self.session.delete_geometric_segment(id)
+                } else if let Some(id)=self.selected {
+                    self.session.delete(id).map(|_| true)
+                } else { Ok(false) };
+                match result {
+                    Ok(_) => { self.selection.clear(); self.selected=None; self.selected_segment=None; self.drag=None; self.error=None; }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -2354,6 +2438,8 @@ impl DigitalApp {
                 self.geometric_route_start = None;
                 if self.session.undo().is_ok() {
                     self.selected = None;
+                    self.selected_segment = None;
+                    self.selection.clear();
                     self.drag = None;
                 }
             }
@@ -2363,6 +2449,8 @@ impl DigitalApp {
                 self.geometric_route_start = None;
                 if self.session.redo().is_ok() {
                     self.selected = None;
+                    self.selected_segment = None;
+                    self.selection.clear();
                     self.drag = None;
                 }
             }
@@ -5496,6 +5584,135 @@ mod tests {
         );
         assert!(app.session.document().wires.geometric().unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn production_selection_shortcuts_nudge_groups_in_one_undo_step() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let a = app
+            .session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        let b = app
+            .session
+            .place(ComponentKind::Output, Position { x: 200., y: 100. })
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let rect = app.canvas_rect.unwrap();
+        let transform = app.view.transform(rect).unwrap();
+        let point = transform.to_screen([100., 100.]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(point),
+                button(point, true),
+                button(point, false),
+            ],
+            true,
+        );
+        press(&ctx, &mut app, egui::Key::A, egui::Modifiers::COMMAND);
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([a, b])
+        );
+        let before = app.session.document().clone();
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::ArrowRight,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(
+            app.session.document().components[0].position.x,
+            before.components[0].position.x + 20.
+        );
+        assert_eq!(
+            app.session.document().components[1].position.x,
+            before.components[1].position.x + 20.
+        );
+        let after_nudge = app.session.document().clone();
+        let drag_start = app
+            .view
+            .transform(app.canvas_rect.unwrap())
+            .unwrap()
+            .to_screen([120., 100.]);
+        let drag_end = drag_start + Vec2::new(40., 0.);
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(drag_start),
+                button(drag_start, true),
+            ],
+            true,
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(drag_end)],
+            true,
+        );
+        assert_eq!(
+            app.session.document(),
+            &after_nudge,
+            "drag preview must not mutate the session"
+        );
+        frame(&ctx, &mut app, vec![button(drag_end, false)], true);
+        assert_eq!(
+            app.session.document().components[0].position.x,
+            after_nudge.components[0].position.x + 40.
+        );
+        assert_eq!(
+            app.session.document().components[1].position.x,
+            after_nudge.components[1].position.x + 40.
+        );
+        app.session.undo().unwrap();
+        assert_eq!(
+            app.session.document(),
+            &after_nudge,
+            "one release creates one grouped history snapshot"
+        );
+        app.session.undo().unwrap();
+        assert_eq!(app.session.document(), &before);
+    }
+
+    #[test]
+    fn production_marquee_selects_wholly_contained_symbol_after_release() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let inside = app
+            .session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        let outside = app
+            .session
+            .place(ComponentKind::Output, Position { x: 220., y: 100. })
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let rect = app.canvas_rect.unwrap();
+        let transform = app.view.transform(rect).unwrap();
+        let bounds = SymbolLayout::centered_on(app.style, ComponentKind::Input, [100., 100.])
+            .unwrap()
+            .bounds();
+        let start = transform.to_screen([bounds.min[0] - 5., bounds.min[1] - 5.]);
+        let end = transform.to_screen([bounds.max[0] + 5., bounds.max[1] + 5.]);
+        let before = app.session.document().clone();
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)], true);
+        assert_eq!(app.session.document(), &before);
+        frame(&ctx, &mut app, vec![button(end, false)], true);
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([inside])
+        );
+        assert!(!app.selection.components.contains(&outside));
     }
 
     #[test]

@@ -61,6 +61,7 @@ pub enum EditError {
     DuplicateConnection,
     Geometry(crate::geometric_wiring::GeometryError),
     InvalidRouteTarget,
+    InvalidSelection,
 }
 impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -76,6 +77,7 @@ impl std::fmt::Display for EditError {
             Self::DuplicateConnection => "Pins are already connected",
             Self::Geometry(error) => return write!(f, "Geometric wire edit rejected: {error}"),
             Self::InvalidRouteTarget => "Wire route target is stale or invalid",
+            Self::InvalidSelection => "Selection contains a stale or invalid element",
         })
     }
 }
@@ -802,6 +804,117 @@ impl Session {
         next.components.remove(index);
         self.edit(next);
         Ok(())
+    }
+    /// Atomically translate a mixed transient selection by an integral world-space delta.
+    /// Segment endpoints are independent; unselected endpoint coordinates are preserved.
+    pub fn move_selection(
+        &mut self,
+        selection: &crate::selection::Selection,
+        dx: i32,
+        dy: i32,
+    ) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        if selection.is_empty() {
+            return Ok(false);
+        }
+        let mut next = self.document.clone();
+        for id in &selection.components {
+            let component = next
+                .components
+                .iter_mut()
+                .find(|c| c.id == *id)
+                .ok_or(EditError::UnknownComponent)?;
+            let x = component.position.x as f64 + f64::from(dx);
+            let y = component.position.y as f64 + f64::from(dy);
+            let position = Position {
+                x: x as f32,
+                y: y as f32,
+            };
+            if !valid_geometric_position(position)
+                || f64::from(position.x) != x
+                || f64::from(position.y) != y
+            {
+                return Err(EditError::InvalidPosition);
+            }
+            component.position = position;
+            validate_component_pin_geometry(component)?;
+        }
+        let segments = next.wires.geometric_mut().map_err(EditError::Geometry)?;
+        let mut known = std::collections::BTreeSet::new();
+        for segment in segments.iter_mut() {
+            if let Some(mask) = selection.wires.get(&segment.id) {
+                known.insert(segment.id);
+                let shift = |p: crate::geometric_wiring::Point| -> Result<crate::geometric_wiring::Point, EditError> {
+                    Ok(crate::geometric_wiring::Point::new(
+                        if mask.contains_a() { p.x.checked_add(dx).ok_or(EditError::InvalidPosition)? } else { p.x },
+                        if mask.contains_a() { p.y.checked_add(dy).ok_or(EditError::InvalidPosition)? } else { p.y },
+                    ))
+                };
+                if mask.is_empty() {
+                    return Err(EditError::InvalidSelection);
+                }
+                if mask.contains_a() {
+                    segment.a = shift(segment.a)?;
+                }
+                if mask.contains_b() {
+                    segment.b = crate::geometric_wiring::Point::new(
+                        segment
+                            .b
+                            .x
+                            .checked_add(dx)
+                            .ok_or(EditError::InvalidPosition)?,
+                        segment
+                            .b
+                            .y
+                            .checked_add(dy)
+                            .ok_or(EditError::InvalidPosition)?,
+                    );
+                }
+            }
+        }
+        if known.len() != selection.wires.len() {
+            return Err(EditError::InvalidSelection);
+        }
+        // Only selected/moved segments can collapse; remove those deterministically, retaining all
+        // unrelated imported geometry exactly as stored.
+        segments.retain(|s| !selection.wires.contains_key(&s.id) || s.a != s.b);
+        if next == self.document {
+            return Ok(false);
+        }
+        self.edit(next);
+        Ok(true)
+    }
+    /// Delete all selected components and selected wire segments in a single history step.
+    /// Selecting either wire endpoint deletes that stored segment; component deletion does not
+    /// infer or remove attached wires.
+    pub fn delete_selection(
+        &mut self,
+        selection: &crate::selection::Selection,
+    ) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        if selection.is_empty() {
+            return Ok(false);
+        }
+        let mut next = self.document.clone();
+        let before = next.components.len();
+        next.components
+            .retain(|c| !selection.components.contains(&c.id));
+        if before - next.components.len() != selection.components.len() {
+            return Err(EditError::InvalidSelection);
+        }
+        let segments = next.wires.geometric_mut().map_err(EditError::Geometry)?;
+        let existing: std::collections::BTreeSet<_> = segments.iter().map(|s| s.id).collect();
+        if selection.wires.keys().any(|id| !existing.contains(id))
+            || selection.wires.values().any(|m| m.is_empty())
+        {
+            return Err(EditError::InvalidSelection);
+        }
+        segments.retain(|s| !selection.wires.contains_key(&s.id));
+        if next == self.document {
+            return Ok(false);
+        }
+        self.edit(next);
+        Ok(true)
     }
     /// Route between valid pins through the shared geometric editing path.
     pub fn connect(&mut self, endpoints: [PinRef; 2]) -> Result<(), EditError> {
@@ -3504,5 +3617,158 @@ mod tests {
             Err(EditError::InvalidRouteTarget)
         );
         assert_eq!(session.document.wires.geometric().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mixed_group_edit_is_atomic_undoable_and_preserves_unselected_wire_geometry() {
+        use crate::geometric_wiring::{Point as P, Segment};
+        let mut session = Session::default();
+        let a = session
+            .place(ComponentKind::Input, Position { x: 20., y: 20. })
+            .unwrap();
+        let b = session
+            .place(ComponentKind::Output, Position { x: 120., y: 20. })
+            .unwrap();
+        session.document.wires = crate::domain::Wiring::GeometricSegments(vec![
+            Segment {
+                id: 7,
+                a: P::new(0, 0),
+                b: P::new(30, 0),
+            },
+            Segment {
+                id: 8,
+                a: P::new(50, 50),
+                b: P::new(70, 50),
+            },
+        ]);
+        session.next_segment_id = 9;
+        let before = session.document().clone();
+        let history_before = session.undo.len();
+        let mut selected = crate::selection::Selection::default();
+        selected.components.insert(a);
+        selected.components.insert(b);
+        selected.wires.insert(7, crate::selection::EndpointMask::A);
+        assert!(session.move_selection(&selected, 20, 0).unwrap());
+        assert_eq!(
+            session.document.components[0].position,
+            Position { x: 40., y: 20. }
+        );
+        let segments = session.document.wires.geometric().unwrap();
+        assert_eq!(
+            (segments[0].a, segments[0].b),
+            (P::new(20, 0), P::new(30, 0))
+        );
+        assert_eq!(segments[1], before.wires.geometric().unwrap()[1]);
+        let encoded =
+            crate::formats::serialize_v2(&crate::formats::from_domain(session.document()).unwrap())
+                .unwrap();
+        let reopened =
+            crate::formats::to_domain(&crate::formats::parse_v2(&encoded).unwrap()).unwrap();
+        assert_eq!(reopened.components, session.document.components);
+        assert_eq!(
+            reopened
+                .wires
+                .geometric()
+                .unwrap()
+                .iter()
+                .map(|s| (s.a, s.b))
+                .collect::<Vec<_>>(),
+            segments.iter().map(|s| (s.a, s.b)).collect::<Vec<_>>()
+        );
+        assert_eq!(session.undo.len(), history_before + 1);
+        session.undo().unwrap();
+        assert_eq!(session.document(), &before);
+        session.redo().unwrap();
+        let dirty = session.dirty();
+        assert!(!session.move_selection(&selected, 0, 0).unwrap());
+        assert_eq!(session.dirty(), dirty);
+    }
+
+    #[test]
+    fn selection_rejections_preserve_state_and_delete_keeps_stationary_unselected_wires() {
+        use crate::geometric_wiring::{Point as P, Segment};
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::Input, Position { x: 20., y: 20. })
+            .unwrap();
+        session.document.wires = crate::domain::Wiring::GeometricSegments(vec![
+            Segment {
+                id: 1,
+                a: P::new(0, 0),
+                b: P::new(20, 0),
+            },
+            Segment {
+                id: 2,
+                a: P::new(10, 10),
+                b: P::new(20, 10),
+            },
+        ]);
+        let before = session.document().clone();
+        let hist = session.undo.len();
+        let mut stale = crate::selection::Selection::default();
+        stale.wires.insert(99, crate::selection::EndpointMask::A);
+        assert_eq!(
+            session.move_selection(&stale, 20, 0),
+            Err(EditError::InvalidSelection)
+        );
+        assert_eq!(session.document(), &before);
+        assert_eq!(session.undo.len(), hist);
+        let mut delete = crate::selection::Selection::default();
+        delete.components.insert(id);
+        delete.wires.insert(1, crate::selection::EndpointMask::A);
+        assert!(session.delete_selection(&delete).unwrap());
+        assert!(session.document.components.is_empty());
+        assert_eq!(
+            session.document.wires.geometric().unwrap(),
+            &[Segment {
+                id: 2,
+                a: P::new(10, 10),
+                b: P::new(20, 10)
+            }]
+        );
+        assert_eq!(session.undo.len(), hist + 1);
+        session.undo().unwrap();
+        assert_eq!(session.document(), &before);
+    }
+
+    #[test]
+    fn selection_edit_obeys_simulation_lock_before_validation() {
+        let mut session = Session::default();
+        let _id = session
+            .place(ComponentKind::Input, Position { x: 20., y: 20. })
+            .unwrap();
+        session.start_simulation().unwrap();
+        let mut selection = crate::selection::Selection::default();
+        selection.components.insert(ComponentId(999));
+        assert_eq!(
+            session.move_selection(&selection, 1, 0),
+            Err(EditError::SimulationActive)
+        );
+        assert_eq!(
+            session.delete_selection(&selection),
+            Err(EditError::SimulationActive)
+        );
+    }
+
+    #[test]
+    fn overflowing_group_move_preserves_document_redo_and_id_state() {
+        let mut session = Session::default();
+        let id = session
+            .place(ComponentKind::Input, Position { x: 0., y: 0. })
+            .unwrap();
+        let mut selected = crate::selection::Selection::default();
+        selected.components.insert(id);
+        session.move_selection(&selected, 20, 0).unwrap();
+        session.undo().unwrap();
+        let before = session.document().clone();
+        let redo_count = session.redo.len();
+        assert_eq!(
+            session.move_selection(&selected, i32::MAX, 0),
+            Err(EditError::InvalidPosition)
+        );
+        assert_eq!(session.document(), &before);
+        assert_eq!(session.redo.len(), redo_count);
+        session.redo().unwrap();
+        assert_eq!(session.document().components[0].position.x, 20.);
     }
 }
