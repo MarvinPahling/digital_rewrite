@@ -50,6 +50,9 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
         CompileError::WorkLimit => {
             format!("The circuit is too large to simulate (work limit {MAX_WORK}).")
         }
+        CompileError::GeometricWiring => {
+            "Geometric wiring must be migrated before simulation.".into()
+        }
         CompileError::DuplicateComponent(id) => {
             format!("Component id #{} is used more than once.", id.0)
         }
@@ -223,7 +226,7 @@ mod tests {
                 component(1, ComponentKind::And, "AND"),
                 component(2, ComponentKind::Or, "carry"),
             ],
-            wires: vec![],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
         }
     }
 

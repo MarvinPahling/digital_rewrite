@@ -309,7 +309,7 @@ fn feedback_permitted_outcomes_and_normal_trace_ignore_net_index_order() {
     );
     let mut reordered = reconvergent.clone();
     reordered.components.reverse();
-    reordered.wires.reverse();
+    reordered.wires.legacy_mut().unwrap().reverse();
     let traces = [reconvergent, reordered].map(|doc| {
         let mut runtime =
             Runtime::start_with_trace(&doc, 77, TraceLog::new(4096, 77, 1).unwrap()).unwrap();

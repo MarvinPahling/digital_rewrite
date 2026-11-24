@@ -14,6 +14,7 @@ pub enum CompileError {
     ComponentLimit,
     WireLimit,
     WorkLimit,
+    GeometricWiring,
     DuplicateComponent(ComponentId),
     DuplicateWire(WireId),
     InvalidConstantConfiguration { component: ComponentId },
@@ -40,6 +41,9 @@ fn root(parent: &mut [usize], mut n: usize) -> usize {
 }
 
 pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
+    if !matches!(document.wires, Wiring::LegacyPinPairs(_)) {
+        return Err(CompileError::GeometricWiring);
+    }
     if document.components.len() > MAX_COMPONENTS {
         return Err(CompileError::ComponentLimit);
     }
@@ -85,7 +89,11 @@ pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
     }
     let mut parent: Vec<_> = (0..pins.len()).collect();
     let mut wire_ids = HashSet::new();
-    for wire in &document.wires {
+    for wire in document
+        .wires
+        .legacy()
+        .map_err(|_| CompileError::GeometricWiring)?
+    {
         if !wire_ids.insert(wire.id) {
             return Err(CompileError::DuplicateWire(wire.id));
         }
@@ -165,7 +173,7 @@ mod tests {
         assert_eq!(
             compile(&Document {
                 components: vec![invalid],
-                wires: vec![]
+                wires: crate::domain::Wiring::LegacyPinPairs(vec![])
             }),
             Err(CompileError::InvalidConstantConfiguration {
                 component: ComponentId(7)
@@ -174,7 +182,7 @@ mod tests {
         assert!(
             compile(&Document {
                 components: vec![component(7, ComponentKind::Input)],
-                wires: vec![]
+                wires: crate::domain::Wiring::LegacyPinPairs(vec![])
             })
             .is_ok()
         );
@@ -191,10 +199,10 @@ mod tests {
                 component(2, ComponentKind::Output),
                 component(3, ComponentKind::Output),
             ],
-            wires: vec![wire(1, a, o), wire(2, b, a)],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![wire(1, a, o), wire(2, b, a)]),
         };
         assert_eq!(compile(&d).unwrap().nets[0].receivers.len(), 2);
-        d.wires.pop();
+        d.wires.legacy_mut().unwrap().pop();
         assert!(matches!(
             compile(&d),
             Err(CompileError::MissingDriver { .. })
@@ -209,13 +217,13 @@ mod tests {
                 component(1, ComponentKind::Input),
                 component(2, ComponentKind::Input),
             ],
-            wires: vec![wire(1, a, b)],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![wire(1, a, b)]),
         };
         assert!(matches!(
             compile(&d),
             Err(CompileError::MultipleDrivers { .. })
         ));
-        d.wires[0].endpoints[1].pin.index = 4;
+        d.wires.legacy_mut().unwrap()[0].endpoints[1].pin.index = 4;
         assert!(matches!(
             compile(&d),
             Err(CompileError::InvalidEndpoint { .. })
@@ -226,8 +234,9 @@ mod tests {
             Err(CompileError::DuplicateComponent(_))
         ));
         d.components.pop();
-        d.wires[0].endpoints[1] = a;
-        d.wires.push(d.wires[0].clone());
+        d.wires.legacy_mut().unwrap()[0].endpoints[1] = a;
+        let duplicate = d.wires.legacy().unwrap()[0].clone();
+        d.wires.legacy_mut().unwrap().push(duplicate);
         assert!(matches!(compile(&d), Err(CompileError::DuplicateWire(_))));
     }
     #[test]
@@ -237,7 +246,7 @@ mod tests {
         let o = |n| pin(n, PinDirection::Output, 0);
         let self_loop = Document {
             components: vec![component(1, ComponentKind::Not)],
-            wires: vec![wire(1, i(1), o(1))],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![wire(1, i(1), o(1))]),
         };
         assert!(compile(&self_loop).is_ok());
 
@@ -250,12 +259,12 @@ mod tests {
                 component(4, ComponentKind::Input),
                 component(5, ComponentKind::Output),
             ],
-            wires: vec![
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![
                 wire(1, o(1), i(2)),
                 wire(2, o(2), i(1)),
                 wire(3, o(2), pin(3, PinDirection::Input, 0)),
                 wire(4, o(4), pin(5, PinDirection::Input, 0)),
-            ],
+            ]),
         };
         assert!(compile(&multi).is_ok());
     }
@@ -269,18 +278,18 @@ mod tests {
                 component(1, ComponentKind::Not),
                 component(2, ComponentKind::Not),
             ],
-            wires: vec![wire(1, o(1), i(1))],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![wire(1, o(1), i(1))]),
         };
         assert!(matches!(
             compile(&missing),
             Err(CompileError::MissingDriver { .. })
         ));
 
-        missing.wires = vec![
+        missing.wires = Wiring::LegacyPinPairs(vec![
             wire(1, o(1), i(1)),
             wire(2, o(1), i(2)),
             wire(3, o(2), i(2)),
-        ];
+        ]);
         assert!(matches!(
             compile(&missing),
             Err(CompileError::MultipleDrivers { .. })
@@ -293,7 +302,7 @@ mod tests {
         source_b.position = source_a.position;
         let document = Document {
             components: vec![source_a, source_b],
-            wires: vec![],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
         };
         let compiled = compile(&document).unwrap();
         assert_eq!(compiled.nets.len(), 2);
@@ -350,7 +359,7 @@ mod tests {
                 at_pin(2, ComponentKind::Output, receiver_b.pin, [100.0, 100.0]),
                 at_pin(3, ComponentKind::Output, receiver_c.pin, [100.0, 0.0]),
             ],
-            wires: vec![wire(1, source, receiver_b)],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![wire(1, source, receiver_b)]),
         };
         assert_eq!(
             compile(&document),
@@ -369,7 +378,7 @@ mod tests {
             components: (0..MAX_COMPONENTS as u64)
                 .map(|id| component(id, ComponentKind::Input))
                 .collect(),
-            wires: vec![],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
         };
         assert!(compile(&d).is_ok());
         d.components
@@ -381,9 +390,9 @@ mod tests {
             pin(0, PinDirection::Output, 0),
             pin(0, PinDirection::Output, 0),
         );
-        d.wires = vec![w; MAX_WIRES + 1];
+        d.wires = Wiring::LegacyPinPairs(vec![w; MAX_WIRES + 1]);
         assert_eq!(compile(&d), Err(CompileError::WireLimit));
-        d.wires.pop();
+        d.wires.legacy_mut().unwrap().pop();
         assert!(matches!(
             compile(&d),
             Err(CompileError::InvalidEndpoint { .. })
@@ -403,15 +412,23 @@ mod tests {
                 .collect(),
         };
         assert!(compile(&d).is_ok());
-        d.wires.push(wire(MAX_WIRES as u64, output, output));
+        d.wires
+            .legacy_mut()
+            .unwrap()
+            .push(wire(MAX_WIRES as u64, output, output));
         assert_eq!(compile(&d), Err(CompileError::WireLimit));
         d.components = (0..MAX_COMPONENTS as u64)
             .map(|i| component(i, ComponentKind::Input))
             .collect();
-        d.wires.truncate((MAX_WORK - MAX_COMPONENTS * 5) / 2);
+        d.wires
+            .legacy_mut()
+            .unwrap()
+            .truncate((MAX_WORK - MAX_COMPONENTS * 5) / 2);
         assert!(compile(&d).is_ok());
         d.components.pop();
         d.wires
+            .legacy_mut()
+            .unwrap()
             .extend((20000..20003).map(|id| wire(id, output, output)));
         assert_eq!(compile(&d), Err(CompileError::WorkLimit));
     }
@@ -424,7 +441,7 @@ mod tests {
                 component(1, ComponentKind::Output),
                 component(2, ComponentKind::Output),
             ],
-            wires: vec![wire(1, i(1), i(2))],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![wire(1, i(1), i(2))]),
         };
         assert_eq!(
             compile(&d),
@@ -437,13 +454,13 @@ mod tests {
             component(2, ComponentKind::Output),
             component(3, ComponentKind::Output),
         ];
-        d.wires = vec![wire(1, o(1), i(2))];
+        d.wires = Wiring::LegacyPinPairs(vec![wire(1, o(1), i(2))]);
         assert_eq!(
             compile(&d),
             Err(CompileError::MissingDriver { pins: vec![i(3)] })
         );
         d.components = vec![component(1, ComponentKind::Not)];
-        d.wires.clear();
+        d.wires.legacy_mut().unwrap().clear();
         assert!(matches!(
             compile(&d),
             Err(CompileError::MissingDriver { .. })
@@ -466,7 +483,7 @@ mod tests {
         }
         let d = Document {
             components,
-            wires: vec![
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![
                 wire(
                     1,
                     pin(1, PinDirection::Output, 0),
@@ -477,7 +494,7 @@ mod tests {
                     pin(3, PinDirection::Output, 0),
                     pin(4, PinDirection::Input, 0),
                 ),
-            ],
+            ]),
         };
         let compiled = compile(&d).unwrap();
         assert_eq!(compiled.nets.len(), 2);

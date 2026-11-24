@@ -1527,7 +1527,7 @@ mod tests {
             assert_eq!(snapshot(&whole, &doc), snapshot(&repeated, &doc));
             let mut reordered = doc.clone();
             reordered.components.reverse();
-            reordered.wires.reverse();
+            reordered.wires.legacy_mut().unwrap().reverse();
             let mut canonical = Runtime::start_with_seed(&reordered, seed).unwrap();
             settled(&mut canonical);
             assert_eq!(snapshot(&whole, &doc), snapshot(&canonical, &reordered));
@@ -1841,7 +1841,7 @@ mod tests {
             );
             if reverse {
                 doc.components.reverse();
-                doc.wires.reverse();
+                doc.wires.legacy_mut().unwrap().reverse();
             }
             doc
         };
@@ -2109,7 +2109,7 @@ mod tests {
         assert_eq!(runtime.output_value(ComponentId(4)), Some(Low));
         let mut reversed = doc.clone();
         reversed.components.reverse();
-        reversed.wires.reverse();
+        reversed.wires.legacy_mut().unwrap().reverse();
         let mut reordered = running(&reversed);
         settled(&mut reordered);
         assert_eq!(reordered.output_value(ComponentId(4)), Some(Low));
@@ -2134,10 +2134,10 @@ mod tests {
         a.constant_value = b.constant_value;
         let doc = Document {
             components: vec![a, b],
-            wires: vec![Wire {
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![Wire {
                 id: WireId(1),
                 endpoints: [out(1), out(2)],
-            }],
+            }]),
         };
         assert!(matches!(
             Runtime::start(&doc),

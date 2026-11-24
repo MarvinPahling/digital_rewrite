@@ -1455,15 +1455,23 @@ fn decode_entities(value: &str, offset: usize) -> Result<String, DigReadError> {
 const GEOMETRY_WORK_LIMIT: usize = 80_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DomainCodecError(pub String);
+pub enum DomainCodecError {
+    Invalid(String),
+    GeometricWiring,
+}
 impl std::fmt::Display for DomainCodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::GeometricWiring => {
+                f.write_str("geometric wiring cannot be exported by the legacy .dig writer")
+            }
+        }
     }
 }
 impl std::error::Error for DomainCodecError {}
 fn invalid(message: impl Into<String>) -> DomainCodecError {
-    DomainCodecError(message.into())
+    DomainCodecError::Invalid(message.into())
 }
 type Coord = (i32, i32);
 
@@ -1589,7 +1597,7 @@ pub fn to_domain(dig: &DigV2) -> Result<Document, DomainCodecError> {
     }
     let mut document = Document {
         components,
-        wires: Vec::new(),
+        wires: crate::domain::Wiring::LegacyPinPairs(Vec::new()),
     };
     let pins = all_pins(&document)?;
     let pin_at = unique_pin_coordinates(&pins)?;
@@ -1894,6 +1902,9 @@ fn point_on_interior(p: Coord, w: &DigWire) -> bool {
 
 /// Convert editable data to the supported Digital v2 representation, validating resulting geometric nets.
 pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
+    if !matches!(doc.wires, crate::domain::Wiring::LegacyPinPairs(_)) {
+        return Err(DomainCodecError::GeometricWiring);
+    }
     if doc.components.len() > MAX_ELEMENTS || doc.wires.len() > MAX_WIRES {
         return Err(invalid("document exceeds element/wire limit"));
     }
@@ -1949,7 +1960,11 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
     let mut seen_wire_ids = BTreeSet::new();
     let mut seen_edges = BTreeSet::new();
     let mut wires = Vec::with_capacity(doc.wires.len());
-    for w in &doc.wires {
+    for w in doc
+        .wires
+        .legacy()
+        .map_err(|_| DomainCodecError::GeometricWiring)?
+    {
         if !seen_wire_ids.insert(w.id.0) {
             return Err(invalid("duplicate wire ID"));
         }
@@ -2022,7 +2037,11 @@ pub fn from_domain(doc: &Document) -> Result<DigV2, DomainCodecError> {
         }
         representative
     }
-    for w in &doc.wires {
+    for w in doc
+        .wires
+        .legacy()
+        .map_err(|_| DomainCodecError::GeometricWiring)?
+    {
         let a = root(&mut parent, w.endpoints[0]);
         let b = root(&mut parent, w.endpoints[1]);
         parent.insert(a, b);
@@ -2203,7 +2222,7 @@ mod tests {
                 SymbolLayout::centered_on(SymbolStyle::Rect, kind, [dx as f32, dy as f32]).unwrap();
             for (pin, coord) in all_pins(&Document {
                 components: vec![component.clone()],
-                wires: vec![],
+                wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
             })
             .unwrap()
             {
@@ -2216,7 +2235,7 @@ mod tests {
             }
             let encoded = from_domain(&Document {
                 components: vec![component],
-                wires: vec![],
+                wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
             })
             .unwrap();
             assert_eq!(
@@ -2246,7 +2265,7 @@ mod tests {
         };
         let doc = Document {
             components: vec![input.clone(), output.clone()],
-            wires: vec![Wire {
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![Wire {
                 id: WireId(5),
                 endpoints: [
                     PinRef {
@@ -2264,7 +2283,7 @@ mod tests {
                         },
                     },
                 ],
-            }],
+            }]),
         };
         let xml = serialize_v2(&from_domain(&doc).unwrap()).unwrap();
         let reopened = to_domain(&parse_v2(&xml).unwrap()).unwrap();
@@ -2400,7 +2419,7 @@ mod tests {
             ],
         };
         let error = to_domain(&source).unwrap_err();
-        assert!(error.0.contains("canonical"), "{error}");
+        assert!(error.to_string().contains("canonical"), "{error}");
     }
 
     #[test]
@@ -2562,7 +2581,7 @@ mod tests {
         assert!(
             geometry_groups(&over_budget, &BTreeMap::new())
                 .unwrap_err()
-                .0
+                .to_string()
                 .contains("budget")
         );
     }
@@ -2585,7 +2604,7 @@ mod tests {
         };
         let doc = Document {
             components: vec![a.clone(), b.clone()],
-            wires: vec![Wire {
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![Wire {
                 id: WireId(9),
                 endpoints: [
                     PinRef {
@@ -2603,12 +2622,12 @@ mod tests {
                         },
                     },
                 ],
-            }],
+            }]),
         };
         let dig = from_domain(&doc).unwrap();
         assert_eq!(dig.wires.len(), 2);
         let mut reversed = doc.clone();
-        reversed.wires[0].endpoints.swap(0, 1);
+        reversed.wires.legacy_mut().unwrap()[0].endpoints.swap(0, 1);
         assert_eq!(from_domain(&reversed).unwrap().wires, dig.wires);
         let restored = to_domain(&dig).unwrap();
         assert_eq!(restored.wires.len(), 1);
@@ -2651,7 +2670,7 @@ mod tests {
                 component(3, ComponentKind::Input, 50., 0.),
                 component(4, ComponentKind::Output, 50., 50.),
             ],
-            wires: vec![
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![
                 Wire {
                     id: WireId(0),
                     endpoints: [input(1), output(2)],
@@ -2660,9 +2679,14 @@ mod tests {
                     id: WireId(1),
                     endpoints: [input(3), output(4)],
                 },
-            ],
+            ]),
         };
-        assert!(from_domain(&doc).unwrap_err().0.contains("interior"));
+        assert!(
+            from_domain(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("interior")
+        );
     }
     #[test]
     fn exact_coordinate_and_bad_reference_validation() {
@@ -2675,7 +2699,7 @@ mod tests {
                 label: String::new(),
                 constant_value: true,
             }],
-            wires: vec![],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
         };
         assert!(from_domain(&fractional).is_err());
         let f32_i32_overflow = Document {
@@ -2689,12 +2713,12 @@ mod tests {
                 label: String::new(),
                 constant_value: true,
             }],
-            wires: vec![],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
         };
         assert!(from_domain(&f32_i32_overflow).is_err());
         let bad = Document {
             components: vec![],
-            wires: vec![Wire {
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![Wire {
                 id: WireId(1),
                 endpoints: [
                     PinRef {
@@ -2712,7 +2736,7 @@ mod tests {
                         },
                     },
                 ],
-            }],
+            }]),
         };
         assert!(from_domain(&bad).is_err());
     }
@@ -3549,12 +3573,12 @@ mod tests {
                 label: String::new(),
                 constant_value: false,
             }],
-            wires: vec![],
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![]),
         };
         assert!(
             from_domain(&low_nonconst)
                 .unwrap_err()
-                .0
+                .to_string()
                 .contains("not Const")
         );
     }

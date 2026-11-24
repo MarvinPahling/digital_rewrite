@@ -264,7 +264,12 @@ fn run_with_io_output(
                 );
             }
             outln!("wires={}", session.document().wires.len());
-            for wire in &session.document().wires {
+            for wire in session
+                .document()
+                .wires
+                .legacy()
+                .map_err(|error| (error.to_string(), 1))?
+            {
                 let endpoint = |pin: &digital_rust::domain::PinRef| {
                     let direction = match pin.pin.direction {
                         digital_rust::domain::PinDirection::Input => "in",
@@ -643,7 +648,7 @@ mod tests {
         };
         let document = Document {
             components: vec![not, output],
-            wires: vec![
+            wires: digital_rust::domain::Wiring::LegacyPinPairs(vec![
                 Wire {
                     id: WireId(1),
                     endpoints: [pin(1, PinDirection::Output), pin(1, PinDirection::Input)],
@@ -652,7 +657,7 @@ mod tests {
                     id: WireId(2),
                     endpoints: [pin(1, PinDirection::Output), pin(2, PinDirection::Input)],
                 },
-            ],
+            ]),
         };
         let dig = digital_rust::formats::from_domain(&document).unwrap();
         digital_rust::formats::serialize_v2(&dig).unwrap()

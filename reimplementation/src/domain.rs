@@ -120,10 +120,66 @@ pub struct Component {
     /// Configured one-bit constant output; meaningful only for `Const`, defaults HIGH.
     pub constant_value: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wiring {
+    LegacyPinPairs(Vec<Wire>),
+    GeometricSegments(Vec<crate::geometric_wiring::Segment>),
+}
+impl Default for Wiring {
+    fn default() -> Self {
+        Self::LegacyPinPairs(Vec::new())
+    }
+}
+impl From<Vec<Wire>> for Wiring {
+    fn from(wires: Vec<Wire>) -> Self {
+        Self::LegacyPinPairs(wires)
+    }
+}
+impl FromIterator<Wire> for Wiring {
+    fn from_iter<T: IntoIterator<Item = Wire>>(iter: T) -> Self {
+        Self::LegacyPinPairs(iter.into_iter().collect())
+    }
+}
+impl Wiring {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::LegacyPinPairs(w) => w.len(),
+            Self::GeometricSegments(s) => s.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn iter_legacy(
+        &self,
+    ) -> Result<std::slice::Iter<'_, Wire>, crate::geometric_wiring::GeometryError> {
+        Ok(self.legacy()?.iter())
+    }
+    pub fn legacy_mut(&mut self) -> Result<&mut Vec<Wire>, crate::geometric_wiring::GeometryError> {
+        match self {
+            Self::LegacyPinPairs(wires) => Ok(wires),
+            Self::GeometricSegments(_) => Err(crate::geometric_wiring::GeometryError::WrongMode),
+        }
+    }
+    pub fn legacy(&self) -> Result<&[Wire], crate::geometric_wiring::GeometryError> {
+        match self {
+            Self::LegacyPinPairs(wires) => Ok(wires),
+            Self::GeometricSegments(_) => Err(crate::geometric_wiring::GeometryError::WrongMode),
+        }
+    }
+    pub fn geometric(
+        &self,
+    ) -> Result<&[crate::geometric_wiring::Segment], crate::geometric_wiring::GeometryError> {
+        match self {
+            Self::GeometricSegments(segments) => Ok(segments),
+            Self::LegacyPinPairs(_) => Err(crate::geometric_wiring::GeometryError::WrongMode),
+        }
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Document {
     pub components: Vec<Component>,
-    pub wires: Vec<Wire>,
+    pub wires: Wiring,
 }
 
 #[cfg(test)]

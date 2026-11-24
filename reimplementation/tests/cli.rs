@@ -251,7 +251,7 @@ fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
         set_component_at(&mut d, 0, K::Input, (0, 0), (0, 0), "input");
         set_component_at(&mut d, 1, K::Not, (100, 0), (0, 0), "inverter");
         set_component_at(&mut d, 2, K::Output, (200, 0), (0, 0), "result");
-        d.wires = vec![
+        d.wires = digital_rust::domain::Wiring::LegacyPinPairs(vec![
             Wire {
                 id: WireId(0),
                 endpoints: [p(0, D::Output, 0), p(1, D::Input, 0)],
@@ -260,13 +260,13 @@ fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
                 id: WireId(1),
                 endpoints: [p(1, D::Output, 0), p(2, D::Input, 0)],
             },
-        ];
+        ])
     } else {
         set_component_at(&mut d, 0, K::Input, (0, 0), (0, 0), "a");
         set_component_at(&mut d, 1, K::Input, (0, 40), (0, 0), "b");
         set_component_at(&mut d, 2, kind, (100, 0), (0, 0), "gate");
         set_component_at(&mut d, 3, K::Output, (220, 20), (0, 0), "result");
-        d.wires = vec![
+        d.wires = digital_rust::domain::Wiring::LegacyPinPairs(vec![
             Wire {
                 id: WireId(0),
                 endpoints: [p(0, D::Output, 0), p(2, D::Input, 0)],
@@ -279,7 +279,7 @@ fn gate_document(kind: digital_rust::domain::ComponentKind) -> Vec<u8> {
                 id: WireId(2),
                 endpoints: [p(2, D::Output, 0), p(3, D::Input, 0)],
             },
-        ];
+        ])
     }
     digital_rust::formats::serialize_v2(&digital_rust::formats::from_domain(&d).unwrap()).unwrap()
 }
@@ -313,10 +313,10 @@ fn cli_reports_real_feedback_startup_oscillation_without_success_rows() {
             label: "ring".into(),
             constant_value: true,
         }],
-        wires: vec![Wire {
+        wires: digital_rust::domain::Wiring::LegacyPinPairs(vec![Wire {
             id: WireId(0),
             endpoints: [output, input],
-        }],
+        }]),
     };
     let encoded = digital_rust::formats::serialize_v2(
         &digital_rust::formats::from_domain(&document).unwrap(),
@@ -538,7 +538,7 @@ fn validate_keeps_driver_errors_but_accepts_feedback_without_claiming_convergenc
     assert!(String::from_utf8_lossy(&out.stderr).contains("Nothing drives"));
 
     let mut multiple = formats::to_domain(&formats::parse_v2(&base).unwrap()).unwrap();
-    multiple.wires.push(Wire {
+    multiple.wires.legacy_mut().unwrap().push(Wire {
         id: WireId(99),
         endpoints: [
             PinRef {
@@ -565,7 +565,7 @@ fn validate_keeps_driver_errors_but_accepts_feedback_without_claiming_convergenc
 
     let mut cycle = digital_rust::domain::Document::default();
     set_component_at(&mut cycle, 0, K::Not, (0, 0), (0, 0), "loop");
-    cycle.wires.push(Wire {
+    cycle.wires.legacy_mut().unwrap().push(Wire {
         id: WireId(0),
         endpoints: [
             PinRef {
@@ -695,10 +695,10 @@ fn feedback_startup_exhaustion_is_an_error_with_replay_seed_and_no_rows() {
             label: "loop".into(),
             constant_value: true,
         }],
-        wires: vec![Wire {
+        wires: digital_rust::domain::Wiring::LegacyPinPairs(vec![Wire {
             id: WireId(0),
             endpoints: [output, input],
-        }],
+        }]),
     };
     let dig = digital_rust::formats::from_domain(&doc).unwrap();
     let bytes = digital_rust::formats::serialize_v2(&dig).unwrap();
@@ -781,7 +781,7 @@ fn trace_terminal_failure_reports_diagnostic_rows_without_settled_success() {
                 constant_value: true,
             },
         ],
-        wires: vec![
+        wires: digital_rust::domain::Wiring::LegacyPinPairs(vec![
             Wire {
                 id: WireId(1),
                 endpoints: [pin(1, D::Output), pin(1, D::Input)],
@@ -790,7 +790,7 @@ fn trace_terminal_failure_reports_diagnostic_rows_without_settled_success() {
                 id: WireId(2),
                 endpoints: [pin(1, D::Output), pin(2, D::Input)],
             },
-        ],
+        ]),
     };
     let bytes = digital_rust::formats::serialize_v2(
         &digital_rust::formats::from_domain(&document).unwrap(),

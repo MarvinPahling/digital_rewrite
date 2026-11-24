@@ -27,6 +27,7 @@ pub struct Session {
     saved: Document,
     next_id: u64,
     next_wire_id: u64,
+    next_segment_id: u64,
     /// Transient simulation state. Never part of the document or its history.
     runtime: Option<Runtime>,
     oscillation_diagnostic: Option<OscillationDiagnostic>,
@@ -49,6 +50,8 @@ pub enum EditError {
     DuplicateWire,
     UnknownWire,
     WireIdExhausted,
+    GeometricMode,
+    Geometry(crate::geometric_wiring::GeometryError),
 }
 impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,6 +67,8 @@ impl std::fmt::Display for EditError {
             Self::DuplicateWire => "Wire already exists",
             Self::UnknownWire => "Unknown wire",
             Self::WireIdExhausted => "No wire IDs remaining",
+            Self::GeometricMode => "Operation requires legacy pin-pair wiring",
+            Self::Geometry(error) => return write!(f, "Geometric wire edit rejected: {error}"),
         })
     }
 }
@@ -71,6 +76,8 @@ impl std::error::Error for EditError {}
 #[derive(Debug)]
 pub enum SessionDigError {
     SimulationActive,
+    GeometricMode,
+    GeometryMigration(&'static str),
     Read(DigReadError),
     Domain(formats::DomainCodecError),
     Write(DigWriteError),
@@ -82,6 +89,8 @@ impl std::fmt::Display for SessionDigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SimulationActive => f.write_str("Stop the simulation before opening a document"),
+            Self::GeometricMode => f.write_str("Operation requires legacy pin-pair wiring"),
+            Self::GeometryMigration(reason) => write!(f, "Cannot migrate wiring: {reason}"),
             Self::Read(e) => e.fmt(f),
             Self::Domain(e) => e.fmt(f),
             Self::Write(e) => e.fmt(f),
@@ -160,6 +169,22 @@ impl std::fmt::Display for SimulationError {
     }
 }
 impl std::error::Error for SimulationError {}
+fn integer_point_on_segment(
+    p: crate::geometric_wiring::Point,
+    a: crate::geometric_wiring::Point,
+    b: crate::geometric_wiring::Point,
+) -> bool {
+    let dx = i128::from(b.x) - i128::from(a.x);
+    let dy = i128::from(b.y) - i128::from(a.y);
+    let px = i128::from(p.x) - i128::from(a.x);
+    let py = i128::from(p.y) - i128::from(a.y);
+    px * dy == py * dx
+        && p.x >= a.x.min(b.x)
+        && p.x <= a.x.max(b.x)
+        && p.y >= a.y.min(b.y)
+        && p.y <= a.y.max(b.y)
+}
+
 impl Session {
     /// Replace this document with a clean untitled document. Dirty state requires an explicit
     /// discard intent; simulation is checked first, before any session state is changed.
@@ -180,6 +205,7 @@ impl Session {
         self.redo.clear();
         self.next_id = 0;
         self.next_wire_id = 0;
+        self.next_segment_id = 0;
         Ok(())
     }
 
@@ -194,12 +220,14 @@ impl Session {
         let parsed = formats::parse_v2(bytes).map_err(SessionDigError::Read)?;
         let document = formats::to_domain(&parsed).map_err(SessionDigError::Domain)?;
         let next_id = u64::try_from(document.components.len()).map_err(|_| {
-            SessionDigError::Domain(formats::DomainCodecError(
+            SessionDigError::Domain(formats::DomainCodecError::Invalid(
                 "component ID counter overflow".into(),
             ))
         })?;
         let next_wire_id = u64::try_from(document.wires.len()).map_err(|_| {
-            SessionDigError::Domain(formats::DomainCodecError("wire ID counter overflow".into()))
+            SessionDigError::Domain(formats::DomainCodecError::Invalid(
+                "wire ID counter overflow".into(),
+            ))
         })?;
         self.document = document.clone();
         self.trace = None;
@@ -211,6 +239,7 @@ impl Session {
         self.redo.clear();
         self.next_id = next_id;
         self.next_wire_id = next_wire_id;
+        self.next_segment_id = 0;
         Ok(())
     }
     /// Export is read-only and never marks the session saved.
@@ -273,12 +302,14 @@ impl Session {
         let parsed = formats::parse_v2(bytes).map_err(SessionDigError::Read)?;
         let document = formats::to_domain(&parsed).map_err(SessionDigError::Domain)?;
         let next_id = u64::try_from(document.components.len()).map_err(|_| {
-            SessionDigError::Domain(formats::DomainCodecError(
+            SessionDigError::Domain(formats::DomainCodecError::Invalid(
                 "component ID counter overflow".into(),
             ))
         })?;
         let next_wire_id = u64::try_from(document.wires.len()).map_err(|_| {
-            SessionDigError::Domain(formats::DomainCodecError("wire ID counter overflow".into()))
+            SessionDigError::Domain(formats::DomainCodecError::Invalid(
+                "wire ID counter overflow".into(),
+            ))
         })?;
         self.document = document.clone();
         self.trace = None;
@@ -289,6 +320,7 @@ impl Session {
         self.redo.clear();
         self.next_id = next_id;
         self.next_wire_id = next_wire_id;
+        self.next_segment_id = 0;
         self.path = path;
         Ok(())
     }
@@ -732,13 +764,20 @@ impl Session {
             .position(|c| c.id == id)
             .ok_or(EditError::UnknownComponent)?;
         next.components.remove(index);
-        next.wires
-            .retain(|wire| wire.endpoints.iter().all(|pin| pin.component != id));
+        if let crate::domain::Wiring::LegacyPinPairs(wires) = &mut next.wires {
+            wires.retain(|wire| wire.endpoints.iter().all(|pin| pin.component != id));
+        }
         self.edit(next);
         Ok(())
     }
     pub fn connect(&mut self, endpoints: [PinRef; 2]) -> Result<WireId, EditError> {
         self.ensure_editable()?;
+        if !matches!(
+            self.document.wires,
+            crate::domain::Wiring::LegacyPinPairs(_)
+        ) {
+            return Err(EditError::GeometricMode);
+        }
         for endpoint in endpoints {
             let component = self
                 .document
@@ -756,7 +795,8 @@ impl Session {
         if self
             .document
             .wires
-            .iter()
+            .iter_legacy()
+            .map_err(|_| EditError::GeometricMode)?
             .any(|w| w.endpoints == endpoints || w.endpoints == [endpoints[1], endpoints[0]])
         {
             return Err(EditError::DuplicateWire);
@@ -767,22 +807,299 @@ impl Session {
             .checked_add(1)
             .ok_or(EditError::WireIdExhausted)?;
         let mut next = self.document.clone();
-        next.wires.push(Wire { id, endpoints });
+        next.wires
+            .legacy_mut()
+            .map_err(|_| EditError::GeometricMode)?
+            .push(Wire { id, endpoints });
         self.next_wire_id = next_id;
         self.edit(next);
         Ok(id)
     }
     pub fn delete_wire(&mut self, id: WireId) -> Result<(), EditError> {
         self.ensure_editable()?;
+        if !matches!(
+            self.document.wires,
+            crate::domain::Wiring::LegacyPinPairs(_)
+        ) {
+            return Err(EditError::GeometricMode);
+        }
         let mut next = self.document.clone();
-        let index = next
+        let wires = next
             .wires
+            .legacy_mut()
+            .map_err(|_| EditError::GeometricMode)?;
+        let index = wires
             .iter()
             .position(|w| w.id == id)
             .ok_or(EditError::UnknownWire)?;
-        next.wires.remove(index);
+        wires.remove(index);
         self.edit(next);
         Ok(())
+    }
+    fn commit_geometric(&mut self, segments: Vec<crate::geometric_wiring::Segment>) -> bool {
+        let mut next = self.document.clone();
+        next.wires = crate::domain::Wiring::GeometricSegments(segments);
+        if next == self.document {
+            return false;
+        }
+        self.edit(next);
+        true
+    }
+    pub fn add_geometric_segments(
+        &mut self,
+        segments: &[(
+            crate::geometric_wiring::Point,
+            crate::geometric_wiring::Point,
+        )],
+    ) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        let existing = self
+            .document
+            .wires
+            .geometric()
+            .map_err(EditError::Geometry)?;
+        let mut all = existing.to_vec();
+        let mut next_id = self.next_segment_id;
+        for &(a, b) in segments {
+            if a == b {
+                return Err(EditError::Geometry(
+                    crate::geometric_wiring::GeometryError::ZeroLength,
+                ));
+            }
+            all.push(crate::geometric_wiring::Segment { id: next_id, a, b });
+            next_id = next_id.checked_add(1).ok_or(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::IdExhausted,
+            ))?;
+        }
+        let normalized =
+            crate::geometric_wiring::normalize_with_high_water(&all, next_id.saturating_sub(1))
+                .map_err(EditError::Geometry)?;
+        if normalized == existing {
+            return Ok(false);
+        }
+        let changed = self.commit_geometric(normalized);
+        if changed {
+            self.next_segment_id = next_id;
+        }
+        Ok(changed)
+    }
+    pub fn delete_geometric_segment(&mut self, id: u64) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        let mut segments = self
+            .document
+            .wires
+            .geometric()
+            .map_err(EditError::Geometry)?
+            .to_vec();
+        let count = segments.len();
+        segments.retain(|segment| segment.id != id);
+        if segments.len() == count {
+            return Ok(false);
+        }
+        let normalized = crate::geometric_wiring::normalize_with_high_water(
+            &segments,
+            self.next_segment_id.saturating_sub(1),
+        )
+        .map_err(EditError::Geometry)?;
+        Ok(self.commit_geometric(normalized))
+    }
+    pub fn move_geometric_segment(&mut self, id: u64, dx: i32, dy: i32) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        let mut segments = self
+            .document
+            .wires
+            .geometric()
+            .map_err(EditError::Geometry)?
+            .to_vec();
+        let Some(segment) = segments.iter_mut().find(|segment| segment.id == id) else {
+            return Ok(false);
+        };
+        let shift = |point: crate::geometric_wiring::Point| {
+            Some(crate::geometric_wiring::Point::new(
+                point.x.checked_add(dx)?,
+                point.y.checked_add(dy)?,
+            ))
+        };
+        segment.a = shift(segment.a).ok_or(EditError::Geometry(
+            crate::geometric_wiring::GeometryError::InvalidMigration("coordinate overflow"),
+        ))?;
+        segment.b = shift(segment.b).ok_or(EditError::Geometry(
+            crate::geometric_wiring::GeometryError::InvalidMigration("coordinate overflow"),
+        ))?;
+        let normalized = crate::geometric_wiring::normalize_with_high_water(
+            &segments,
+            self.next_segment_id.saturating_sub(1),
+        )
+        .map_err(EditError::Geometry)?;
+        Ok(self.commit_geometric(normalized))
+    }
+    pub fn move_geometric_endpoint(
+        &mut self,
+        id: u64,
+        endpoint: usize,
+        point: crate::geometric_wiring::Point,
+    ) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        if endpoint > 1 {
+            return Err(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::InvalidMigration("endpoint index"),
+            ));
+        }
+        let mut segments = self
+            .document
+            .wires
+            .geometric()
+            .map_err(EditError::Geometry)?
+            .to_vec();
+        let Some(segment) = segments.iter_mut().find(|segment| segment.id == id) else {
+            return Ok(false);
+        };
+        if endpoint == 0 {
+            segment.a = point;
+        } else {
+            segment.b = point;
+        }
+        let normalized = crate::geometric_wiring::normalize_with_high_water(
+            &segments,
+            self.next_segment_id.saturating_sub(1),
+        )
+        .map_err(EditError::Geometry)?;
+        Ok(self.commit_geometric(normalized))
+    }
+    pub fn split_geometric_segment(
+        &mut self,
+        id: u64,
+        point: crate::geometric_wiring::Point,
+    ) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        let mut segments = self
+            .document
+            .wires
+            .geometric()
+            .map_err(EditError::Geometry)?
+            .to_vec();
+        let Some(index) = segments.iter().position(|segment| segment.id == id) else {
+            return Ok(false);
+        };
+        let original = segments[index];
+        if point == original.a || point == original.b {
+            return Ok(false);
+        }
+        if !integer_point_on_segment(point, original.a, original.b) {
+            return Err(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::InvalidMigration(
+                    "split point is not on segment",
+                ),
+            ));
+        }
+        if segments.len() >= crate::geometric_wiring::MAX_SEGMENTS {
+            return Err(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::SegmentLimit,
+            ));
+        }
+        let segment_id = self.next_segment_id;
+        let next_id = segment_id.checked_add(1).ok_or(EditError::Geometry(
+            crate::geometric_wiring::GeometryError::IdExhausted,
+        ))?;
+        segments[index].b = point;
+        segments.push(crate::geometric_wiring::Segment {
+            id: segment_id,
+            a: point,
+            b: original.b,
+        });
+        let changed = self.commit_geometric(segments);
+        if changed {
+            self.next_segment_id = next_id;
+        }
+        Ok(changed)
+    }
+    pub fn merge_geometric_segments(&mut self) -> Result<bool, EditError> {
+        self.ensure_editable()?;
+        let normalized = crate::geometric_wiring::normalize_with_high_water(
+            self.document
+                .wires
+                .geometric()
+                .map_err(EditError::Geometry)?,
+            self.next_segment_id.saturating_sub(1),
+        )
+        .map_err(EditError::Geometry)?;
+        Ok(self.commit_geometric(normalized))
+    }
+    /// Canonical, transactional legacy-route conversion. The codec's shared pin metrics/router
+    /// create route points and its import checker proves the same pin partition is recovered.
+    pub fn migrate_to_geometric_wiring(&mut self) -> Result<bool, SessionDigError> {
+        if self.runtime.is_some() {
+            return Err(SessionDigError::SimulationActive);
+        }
+        let legacy = self
+            .document
+            .wires
+            .legacy()
+            .map_err(|_| SessionDigError::GeometricMode)?;
+        let dig = formats::from_domain(&self.document).map_err(SessionDigError::Domain)?;
+        let recovered = formats::to_domain(&dig).map_err(SessionDigError::Domain)?;
+        let expected: std::collections::BTreeSet<_> = legacy
+            .iter()
+            .map(|wire| {
+                let mut endpoints = wire.endpoints;
+                endpoints.sort();
+                endpoints
+            })
+            .collect();
+        let actual: std::collections::BTreeSet<_> = recovered
+            .wires
+            .legacy()
+            .map_err(|_| SessionDigError::GeometricMode)?
+            .iter()
+            .map(|wire| {
+                let mut endpoints = wire.endpoints;
+                for endpoint in &mut endpoints {
+                    endpoint.component = self
+                        .document
+                        .components
+                        .get(endpoint.component.0 as usize)
+                        .map(|component| component.id)
+                        .unwrap_or(endpoint.component);
+                }
+                endpoints.sort();
+                endpoints
+            })
+            .collect();
+        if expected != actual {
+            return Err(SessionDigError::GeometryMigration(
+                "canonical routing changes pin connectivity",
+            ));
+        }
+        let segments: Vec<crate::geometric_wiring::Segment> = dig
+            .wires
+            .iter()
+            .enumerate()
+            .map(|(id, wire)| crate::geometric_wiring::Segment {
+                id: id as u64,
+                a: crate::geometric_wiring::Point::new(wire.p1.x, wire.p1.y),
+                b: crate::geometric_wiring::Point::new(wire.p2.x, wire.p2.y),
+            })
+            .collect();
+        let normalized = crate::geometric_wiring::normalize(&segments).map_err(|_| {
+            SessionDigError::GeometryMigration("canonical routes cannot be normalized")
+        })?;
+        if matches!(
+            self.document.wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ) {
+            return Err(SessionDigError::GeometricMode);
+        }
+        let mut next = self.document.clone();
+        next.wires = crate::domain::Wiring::GeometricSegments(normalized.clone());
+        self.next_segment_id = normalized
+            .iter()
+            .map(|segment| segment.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(SessionDigError::GeometryMigration("segment ID exhausted"))?;
+        self.edit(next);
+        Ok(true)
     }
     pub fn undo(&mut self) -> Result<(), EditError> {
         self.ensure_editable()?;
@@ -807,6 +1124,179 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometric_wiring::Point;
+    fn simple_legacy_session() -> Session {
+        let mut session = Session::default();
+        let input = session
+            .place(ComponentKind::Input, Position { x: 18.0, y: 0.0 })
+            .unwrap();
+        let output = session
+            .place(ComponentKind::Output, Position { x: 78.0, y: 0.0 })
+            .unwrap();
+        session
+            .connect([
+                PinRef {
+                    component: input,
+                    pin: crate::domain::PinId {
+                        direction: crate::domain::PinDirection::Output,
+                        index: 0,
+                    },
+                },
+                PinRef {
+                    component: output,
+                    pin: crate::domain::PinId {
+                        direction: crate::domain::PinDirection::Input,
+                        index: 0,
+                    },
+                },
+            ])
+            .unwrap();
+        session
+    }
+    #[test]
+    fn session_owns_geometric_batches_history_noops_failures_and_lock() {
+        let mut session = Session::default();
+        session.migrate_to_geometric_wiring().unwrap();
+        assert!(
+            session
+                .add_geometric_segments(&[(Point::new(0, 0), Point::new(10, 0))])
+                .unwrap()
+        );
+        assert!(matches!(
+            session.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
+        assert!(!session.add_geometric_segments(&[]).unwrap());
+        let before = session.document().clone();
+        let undo = session.undo.len();
+        assert!(
+            session
+                .add_geometric_segments(&[(Point::new(4, 4), Point::new(4, 4))])
+                .is_err()
+        );
+        assert_eq!(session.document(), &before);
+        assert_eq!(session.undo.len(), undo);
+        let first_segment = session.document().wires.geometric().unwrap()[0].id;
+        assert!(
+            session
+                .split_geometric_segment(first_segment, Point::new(5, 0))
+                .unwrap()
+        );
+        assert!(
+            session
+                .add_geometric_segments(&[(Point::new(5, 0), Point::new(5, 5))])
+                .unwrap()
+        );
+        let branch = session.document().clone();
+        assert!(session.undo().is_ok());
+        assert!(session.redo().is_ok());
+        assert_eq!(session.document(), &branch);
+        let segment_id = session.document().wires.geometric().unwrap()[0].id;
+        assert!(session.move_geometric_segment(segment_id, 1, 0).unwrap());
+        assert!(session.undo().is_ok());
+        assert!(matches!(
+            session.move_geometric_endpoint(segment_id, 2, Point::new(0, 0)),
+            Err(EditError::Geometry(_))
+        ));
+        assert!(session.delete_geometric_segment(segment_id).unwrap());
+        assert!(session.undo().is_ok());
+        assert!(!session.merge_geometric_segments().unwrap());
+        let mut locked_session = Session::default();
+        locked_session.start_running_for_test().unwrap();
+        locked_session.document.wires =
+            crate::domain::Wiring::GeometricSegments(vec![crate::geometric_wiring::Segment {
+                id: 0,
+                a: Point::new(0, 0),
+                b: Point::new(10, 0),
+            }]);
+        let locked = locked_session.document().clone();
+        assert!(matches!(
+            locked_session.add_geometric_segments(&[]),
+            Err(EditError::SimulationActive)
+        ));
+        assert!(matches!(
+            locked_session.undo(),
+            Err(EditError::SimulationActive)
+        ));
+        assert_eq!(locked_session.document(), &locked);
+        locked_session.stop_simulation().unwrap();
+    }
+    #[test]
+    fn canonical_migration_is_transactional_undoable_and_export_refuses_before_io() {
+        let mut session = simple_legacy_session();
+        assert!(matches!(
+            session.document().wires,
+            crate::domain::Wiring::LegacyPinPairs(_)
+        ));
+        let legacy = session.document().clone();
+        assert!(session.migrate_to_geometric_wiring().unwrap());
+        let geometric = session.document().clone();
+        let segments = geometric.wires.geometric().unwrap();
+        assert!(!segments.is_empty());
+        assert!(session.dirty());
+        assert!(matches!(
+            session.export_dig_bytes(),
+            Err(SessionDigError::Domain(
+                formats::DomainCodecError::GeometricWiring
+            ))
+        ));
+        let mut io = NoFileAccess;
+        let save = session.save_as(&mut io, Path::new("blocked.dig"), SaveAsIntent::Replace);
+        assert!(matches!(
+            save,
+            Err(SaveError::Codec(SessionDigError::Domain(
+                formats::DomainCodecError::GeometricWiring
+            )))
+        ));
+        assert!(session.undo().is_ok());
+        assert_eq!(session.document(), &legacy);
+        assert!(session.redo().is_ok());
+        assert_eq!(session.document(), &geometric);
+        assert!(matches!(
+            crate::simulation::compile(session.document()),
+            Err(CompileError::GeometricWiring)
+        ));
+    }
+    #[test]
+    fn failed_or_locked_geometry_migration_preserves_session_state() {
+        let mut invalid = Session::default();
+        invalid
+            .place(
+                ComponentKind::Input,
+                Position {
+                    x: f32::MAX,
+                    y: 0.0,
+                },
+            )
+            .unwrap();
+        let document = invalid.document().clone();
+        let undo = invalid.undo.len();
+        assert!(invalid.migrate_to_geometric_wiring().is_err());
+        assert_eq!(invalid.document(), &document);
+        assert_eq!(invalid.undo.len(), undo);
+        let mut locked = simple_legacy_session();
+        locked.start_running_for_test().unwrap();
+        let document = locked.document().clone();
+        assert!(matches!(
+            locked.migrate_to_geometric_wiring(),
+            Err(SessionDigError::SimulationActive)
+        ));
+        assert_eq!(locked.document(), &document);
+        locked.stop_simulation().unwrap();
+    }
+    #[test]
+    fn component_move_and_delete_preserve_independent_geometric_segments() {
+        let mut session = simple_legacy_session();
+        session.migrate_to_geometric_wiring().unwrap();
+        let before = session.document().wires.clone();
+        let component = session.document().components[0].id;
+        session
+            .move_component(component, Position { x: 100.0, y: 200.0 })
+            .unwrap();
+        assert_eq!(session.document().wires, before);
+        session.delete(component).unwrap();
+        assert_eq!(session.document().wires, before);
+    }
     #[test]
     fn set_input_changes_only_runtime_not_document_history_or_dirty_state() {
         let mut session = Session::default();
@@ -1921,10 +2411,10 @@ mod tests {
                 label: "NOT".into(),
                 constant_value: true,
             }],
-            wires: vec![Wire {
+            wires: crate::domain::Wiring::LegacyPinPairs(vec![Wire {
                 id: WireId(0),
                 endpoints: [output, pin],
-            }],
+            }]),
         };
         let mut session = Session {
             document: document.clone(),
@@ -2072,7 +2562,7 @@ mod tests {
         use crate::domain::{PinDirection, PinId};
         let mut s = Session::default();
         let (input, not, _) = wired_not(&mut s);
-        let wire = s.document.wires[0].id;
+        let wire = s.document.wires.legacy().unwrap()[0].id;
         let spare = s
             .place(ComponentKind::Input, Position { x: 9.0, y: 9.0 })
             .unwrap();

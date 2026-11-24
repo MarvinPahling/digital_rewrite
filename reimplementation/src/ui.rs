@@ -270,7 +270,7 @@ fn document_view_bounds(
         label_width = label_width.max(galley.size().x);
         label_height = label_height.max(galley.size().y);
     }
-    for wire in &doc.wires {
+    for wire in doc.wires.iter_legacy().into_iter().flatten() {
         let (Some(a), Some(b)) = (
             anchors.get(&wire.endpoints[0]),
             anchors.get(&wire.endpoints[1]),
@@ -1558,7 +1558,10 @@ impl DigitalApp {
                         self.session
                             .document()
                             .wires
-                            .iter()
+                            .iter_legacy()
+                            .ok()
+                            .into_iter()
+                            .flatten()
                             .rev()
                             .find(|wire| {
                                 let a = pins.iter().find(|v| v.0 == wire.endpoints[0]);
@@ -1649,7 +1652,7 @@ impl DigitalApp {
                     (*pin, pos)
                 })
                 .collect();
-            for wire in &self.session.document().wires {
+            for wire in self.session.document().wires.iter_legacy().into_iter().flatten() {
                 let a = wire_pins.iter().find(|v| v.0 == wire.endpoints[0]);
                 let b = wire_pins.iter().find(|v| v.0 == wire.endpoints[1]);
                 if let Some((a, b)) = a.zip(b) {
@@ -1942,11 +1945,11 @@ impl DigitalApp {
                             None => 0,
                         };
                         self.focused_pin = Some(visible_pins[next].0);
-                    } else if !self.wiring && !self.session.document().wires.is_empty() {
-                        let wires = &self.session.document().wires;
-                        let current = self
-                            .selected_wire
-                            .and_then(|id| wires.iter().position(|w| w.id == id));
+                    } else if !self.wiring
+                        && let Ok(wires) = self.session.document().wires.legacy()
+                        && !wires.is_empty()
+                    {
+                        let current = self.selected_wire.and_then(|id| wires.iter().position(|w| w.id == id));
                         let next = match current {
                             Some(i) if backwards => (i + wires.len() - 1) % wires.len(),
                             Some(i) => (i + 1) % wires.len(),
@@ -2167,7 +2170,7 @@ mod tests {
         app.session
             .connect([pin(a, PinDirection::Output), pin(b, PinDirection::Input)])
             .unwrap();
-        app.selected_wire = Some(app.session.document().wires[0].id);
+        app.selected_wire = Some(app.session.document().wires.legacy().unwrap()[0].id);
         app.placing = Some(ComponentKind::And);
         frame(&ctx, &mut app, vec![], true);
         let p = Pos2::new(500., 300.);
@@ -2651,7 +2654,7 @@ mod tests {
                 component.label
             );
         }
-        let wire = &app.session.document().wires[0];
+        let wire = &app.session.document().wires.legacy().unwrap()[0];
         let a = SymbolLayout::centered_on(app.style, ComponentKind::Input, [-420., -180.])
             .unwrap()
             .pin_position(wire.endpoints[0].pin)
@@ -4729,7 +4732,7 @@ mod tests {
         let (input, _) = inverter_chain(&mut app, 1);
         let before = app.session.document().clone();
         app.selected = Some(input);
-        app.selected_wire = Some(app.session.document().wires[0].id);
+        app.selected_wire = Some(app.session.document().wires.legacy().unwrap()[0].id);
         app.placing = Some(ComponentKind::And);
         app.wiring = true;
         app.wire_start = Some(pin_ref(input, PinDirection::Output, 0));
