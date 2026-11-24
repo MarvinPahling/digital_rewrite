@@ -127,7 +127,7 @@ pub enum Wiring {
 }
 impl Default for Wiring {
     fn default() -> Self {
-        Self::LegacyPinPairs(Vec::new())
+        Self::GeometricSegments(Vec::new())
     }
 }
 impl From<Vec<Wire>> for Wiring {

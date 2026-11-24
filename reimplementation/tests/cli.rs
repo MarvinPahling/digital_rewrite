@@ -586,9 +586,7 @@ fn non_utf8_filename_is_passed_as_an_os_path() {
 #[test]
 fn validate_keeps_driver_errors_but_accepts_feedback_without_claiming_convergence() {
     use digital_rust::{
-        domain::{
-            ComponentId as C, ComponentKind as K, PinDirection as D, PinId, PinRef, Wire, WireId,
-        },
+        domain::{ComponentKind as K, PinDirection as D, PinId},
         formats,
     };
     let dir = TempDir::new();
@@ -625,25 +623,29 @@ fn validate_keeps_driver_errors_but_accepts_feedback_without_claiming_convergenc
 
     let mut cycle = digital_rust::domain::Document::default();
     set_component_at(&mut cycle, 0, K::Not, (0, 0), (0, 0), "loop");
-    cycle.wires.legacy_mut().unwrap().push(Wire {
-        id: WireId(0),
-        endpoints: [
-            PinRef {
-                component: C(0),
-                pin: PinId {
-                    direction: D::Input,
-                    index: 0,
-                },
-            },
-            PinRef {
-                component: C(0),
-                pin: PinId {
-                    direction: D::Output,
-                    index: 0,
-                },
-            },
-        ],
-    });
+    let input = digital_rust::pin_geometry::pin_point(
+        &cycle.components[0],
+        PinId {
+            direction: D::Input,
+            index: 0,
+        },
+    )
+    .unwrap();
+    let output = digital_rust::pin_geometry::pin_point(
+        &cycle.components[0],
+        PinId {
+            direction: D::Output,
+            index: 0,
+        },
+    )
+    .unwrap();
+    cycle.wires = digital_rust::domain::Wiring::GeometricSegments(vec![
+        digital_rust::geometric_wiring::Segment {
+            id: 0,
+            a: input,
+            b: output,
+        },
+    ]);
     let bytes = formats::serialize_v2(&formats::from_domain(&cycle).unwrap()).unwrap();
     fs::write(dir.0.join("cycle.dig"), bytes).unwrap();
     let out = cli(&dir, &["validate", "cycle.dig"]);

@@ -18,6 +18,15 @@ use eframe::egui::{self, Pos2, Rect, Sense, Stroke, Vec2};
 
 /// Extra reach of a click around a symbol's bounds, in screen points.
 const PICK_TOLERANCE: f32 = 2.0;
+
+/// Positions are artwork-bounds centers; every supported symbol's origin-to-center offset is
+/// integral, so snapping the center to the integer grid preserves exact Digital pin coordinates.
+fn snap_component_center(x: f32, y: f32) -> Position {
+    Position {
+        x: x.round(),
+        y: y.round(),
+    }
+}
 /// Gap between a symbol's bounds and its selection frame, in world units.
 const SELECTION_MARGIN: f32 = 2.0;
 /// Gap between a symbol's bounds and its label, in screen points.
@@ -812,12 +821,20 @@ impl DigitalApp {
         ) {
             let target = crate::engine::RouteTarget::Pin(pin);
             if let Some(start) = self.geometric_route_start.take() {
+                if start == target {
+                    self.geometric_route_start = Some(start);
+                    self.error = Some("Choose a different route endpoint".into());
+                    return;
+                }
                 match self
                     .session
                     .route_geometric(start, target, self.route_orientation)
                 {
                     Ok(_) => self.error = None,
-                    Err(error) => self.error = Some(error.to_string()),
+                    Err(error) => {
+                        self.geometric_route_start = Some(start);
+                        self.error = Some(error.to_string());
+                    }
                 }
             } else {
                 self.geometric_route_start = Some(target);
@@ -1671,10 +1688,11 @@ impl DigitalApp {
                 && let Some(p) = pointer
             {
                 let [x, y] = transform.to_world(p);
-                match self.session.place(kind, Position { x, y }) {
+                match self.session.place(kind, snap_component_center(x, y)) {
                     Ok(id) => {
                         self.selected = Some(id);
                         self.selected_wire = None;
+                        self.selected_segment = None;
                     }
                     Err(e) => self.error = Some(e.to_string()),
                 }
@@ -1688,19 +1706,16 @@ impl DigitalApp {
                 && let (Some((id, start, origin)), Some(p)) = (self.drag.take(), pointer)
             {
                 let [dx, dy] = transform.delta_to_world(p - origin);
-                match self.session.move_component(
-                    id,
-                    Position {
-                        x: start.x + dx,
-                        y: start.y + dy,
-                    },
-                ) {
+                let snapped = snap_component_center(start.x + dx, start.y + dy);
+                match self.session.move_component(id, snapped) {
                     Ok(()) => {
-                        // Keep committed wire anchors aligned with the symbol on the release frame.
+                        // Retain exact integer center deltas in transient pin hit geometry.
+                        let committed_dx = snapped.x - start.x;
+                        let committed_dy = snapped.y - start.y;
                         for (pin, pos) in &mut pins {
                             if pin.component == id {
-                                pos[0] += dx;
-                                pos[1] += dy;
+                                pos[0] += committed_dx;
+                                pos[1] += committed_dy;
                             }
                         }
                     }
@@ -2053,19 +2068,32 @@ impl DigitalApp {
                             None => 0,
                         };
                         self.focused_pin = Some(visible_pins[next].0);
-                    } else if !self.wiring
-                        && let Ok(wires) = self.session.document().wires.legacy()
-                        && !wires.is_empty()
-                    {
-                        let current = self.selected_wire.and_then(|id| wires.iter().position(|w| w.id == id));
-                        let next = match current {
-                            Some(i) if backwards => (i + wires.len() - 1) % wires.len(),
-                            Some(i) => (i + 1) % wires.len(),
-                            None if backwards => wires.len() - 1,
-                            None => 0,
-                        };
-                        self.selected_wire = Some(wires[next].id);
-                        self.selected = None;
+                    } else if !self.wiring {
+                        let segments = self.session.document().wires.geometric().unwrap_or(&[]);
+                        if !segments.is_empty() {
+                            let current = self.selected_segment.and_then(|id| segments.iter().position(|s| s.id == id));
+                            let next = match current {
+                                Some(i) if backwards => (i + segments.len() - 1) % segments.len(),
+                                Some(i) => (i + 1) % segments.len(),
+                                None if backwards => segments.len() - 1,
+                                None => 0,
+                            };
+                            self.selected_segment = Some(segments[next].id);
+                            self.selected_wire = None;
+                            self.selected = None;
+                        } else if let Ok(wires) = self.session.document().wires.legacy()
+                            && !wires.is_empty()
+                        {
+                            let current = self.selected_wire.and_then(|id| wires.iter().position(|w| w.id == id));
+                            let next = match current {
+                                Some(i) if backwards => (i + wires.len() - 1) % wires.len(),
+                                Some(i) => (i + 1) % wires.len(),
+                                None if backwards => wires.len() - 1,
+                                None => 0,
+                            };
+                            self.selected_wire = Some(wires[next].id);
+                            self.selected = None;
+                        }
                     }
                 }
                 if self.wiring
@@ -2186,7 +2214,10 @@ mod tests {
         };
         app.choose_pin(a);
         app.choose_pin(a);
-        assert_eq!(app.wire_start, Some(a));
+        assert_eq!(
+            app.geometric_route_start,
+            Some(crate::engine::RouteTarget::Pin(a))
+        );
         assert!(app.error.is_some());
         app.choose_pin(b);
         assert_eq!(app.session.document().wires.len(), 1);
@@ -2199,7 +2230,7 @@ mod tests {
             vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
             true,
         );
-        assert_eq!(app.wire_start, None);
+        assert_eq!(app.geometric_route_start, None);
         assert_eq!(app.session.document().wires.len(), 1);
     }
     #[test]
@@ -2289,7 +2320,7 @@ mod tests {
         app.session
             .connect([pin(a, PinDirection::Output), pin(b, PinDirection::Input)])
             .unwrap();
-        app.selected_wire = Some(app.session.document().wires.legacy().unwrap()[0].id);
+        app.selected_segment = Some(app.session.document().wires.geometric().unwrap()[0].id);
         app.placing = Some(ComponentKind::And);
         frame(&ctx, &mut app, vec![], true);
         let p = Pos2::new(500., 300.);
@@ -2550,7 +2581,7 @@ mod tests {
             true,
         );
         frame(&ctx, &mut app, vec![button(start, false)], true);
-        assert!(app.wire_start.is_some());
+        assert!(app.geometric_route_start.is_some());
         let hover = Pos2::new(450., 180.);
         let output = frame(&ctx, &mut app, vec![egui::Event::PointerMoved(hover)], true);
         assert!(has_line(&output, start, Pos2::new(hover.x, start.y), 1.));
@@ -2613,10 +2644,9 @@ mod tests {
         let moved = anchor(ComponentKind::Input, [150., 150.], input_pin);
         let old = anchor(ComponentKind::Input, [100., 100.], input_pin);
         let target = anchor(ComponentKind::Output, [200., 100.], output_pin);
-        let corner = Pos2::new(target.x, moved.y);
-        assert!(has_line(&output, moved, corner, 2.));
-        assert!(has_line(&output, corner, target, 2.));
-        assert!(!has_line(&output, old, target, 2.));
+        // Digital leaves a geometric route stationary when only one component moves.
+        assert!(has_line(&output, old, target, 2.));
+        assert!(!has_line(&output, moved, target, 2.));
     }
     fn button(pos: Pos2, pressed: bool) -> egui::Event {
         pointer_button(
@@ -2773,20 +2803,13 @@ mod tests {
                 component.label
             );
         }
-        let wire = &app.session.document().wires.legacy().unwrap()[0];
-        let a = SymbolLayout::centered_on(app.style, ComponentKind::Input, [-420., -180.])
-            .unwrap()
-            .pin_position(wire.endpoints[0].pin)
-            .unwrap();
-        let b = SymbolLayout::centered_on(app.style, ComponentKind::Output, [520., 260.])
-            .unwrap()
-            .pin_position(wire.endpoints[1].pin)
-            .unwrap();
-        for point in crate::wire_geometry::path((wire.endpoints[0], a), (wire.endpoints[1], b)) {
-            assert!(
-                rect.contains(transform.to_screen(point)),
-                "fitted wire path remains visible"
-            );
+        for segment in app.session.document().wires.geometric().unwrap() {
+            for point in [segment.a, segment.b] {
+                assert!(
+                    rect.contains(transform.to_screen([point.x as f32, point.y as f32])),
+                    "fitted wire path remains visible"
+                );
+            }
         }
         assert!(output_frame.shapes.iter().all(|shape| match &shape.shape {
             egui::Shape::LineSegment { points, .. } => points.iter().all(|p| p.is_finite()),
@@ -4056,14 +4079,14 @@ mod tests {
             let wire_inside = transform.to_screen(mid) + along * 5.5;
             click_at(&ctx, &mut app, wire_inside);
             assert_eq!(
-                app.selected_wire,
-                Some(wire),
+                app.selected_segment,
+                Some(wire.0),
                 "wire pick includes 5.5 screen points at zoom {zoom}"
             );
             let wire_outside = transform.to_screen(mid) + along * 6.5;
             click_at(&ctx, &mut app, wire_outside);
             assert_eq!(
-                app.selected_wire, None,
+                app.selected_segment, None,
                 "wire pick excludes 6.5 screen points at zoom {zoom}"
             );
         }
@@ -4990,7 +5013,7 @@ mod tests {
         let (input, _) = inverter_chain(&mut app, 1);
         let before = app.session.document().clone();
         app.selected = Some(input);
-        app.selected_wire = Some(app.session.document().wires.legacy().unwrap()[0].id);
+        app.selected_segment = Some(app.session.document().wires.geometric().unwrap()[0].id);
         app.placing = Some(ComponentKind::And);
         app.wiring = true;
         app.wire_start = Some(pin_ref(input, PinDirection::Output, 0));

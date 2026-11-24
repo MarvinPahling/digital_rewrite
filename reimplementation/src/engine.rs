@@ -201,6 +201,15 @@ fn normalize_document_segments(
         .map_err(EditError::Geometry)
 }
 
+fn valid_geometric_position(position: Position) -> bool {
+    position.valid()
+        && [position.x, position.y].into_iter().all(|coordinate| {
+            coordinate.fract() == 0.0
+                && (coordinate as f64) >= i32::MIN as f64
+                && (coordinate as f64) <= i32::MAX as f64
+        })
+}
+
 fn integer_point_on_segment(
     p: crate::geometric_wiring::Point,
     a: crate::geometric_wiring::Point,
@@ -701,7 +710,7 @@ impl Session {
         position: Position,
     ) -> Result<ComponentId, EditError> {
         self.ensure_editable()?;
-        if !position.valid() {
+        if !valid_geometric_position(position) {
             return Err(EditError::InvalidPosition);
         }
         let id = ComponentId(self.next_id);
@@ -771,7 +780,7 @@ impl Session {
     }
     pub fn move_component(&mut self, id: ComponentId, position: Position) -> Result<(), EditError> {
         self.ensure_editable()?;
-        if !position.valid() {
+        if !valid_geometric_position(position) {
             return Err(EditError::InvalidPosition);
         }
         let mut next = self.document.clone();
@@ -801,13 +810,62 @@ impl Session {
         self.edit(next);
         Ok(())
     }
+    /// Compatibility convenience for pin-to-pin wiring. On geometric documents this delegates
+    /// to the same checked route command used by the canvas; no hidden logical edge is stored.
     pub fn connect(&mut self, endpoints: [PinRef; 2]) -> Result<WireId, EditError> {
         self.ensure_editable()?;
-        if !matches!(
+        if matches!(
             self.document.wires,
-            crate::domain::Wiring::LegacyPinPairs(_)
+            crate::domain::Wiring::GeometricSegments(_)
         ) {
-            return Err(EditError::GeometricMode);
+            for endpoint in endpoints {
+                let component = self
+                    .document
+                    .components
+                    .iter()
+                    .find(|c| c.id == endpoint.component)
+                    .ok_or(EditError::UnknownComponent)?;
+                if !component.kind.has_pin(endpoint.pin) {
+                    return Err(EditError::InvalidPin);
+                }
+            }
+            if endpoints[0] == endpoints[1] {
+                return Err(EditError::SameEndpoint);
+            }
+            if crate::simulation::logical_pin_partitions(&self.document).is_ok_and(|nets| {
+                nets.iter()
+                    .any(|net| endpoints.iter().all(|pin| net.contains(pin)))
+            }) {
+                return Err(EditError::DuplicateWire);
+            }
+            let before: std::collections::BTreeSet<_> = self
+                .document
+                .wires
+                .geometric()
+                .map_err(EditError::Geometry)?
+                .iter()
+                .map(|s| s.id)
+                .collect();
+            let first_id = self.next_segment_id;
+            let added = self.route_geometric(
+                RouteTarget::Pin(endpoints[0]),
+                RouteTarget::Pin(endpoints[1]),
+                crate::geometric_wiring::RouteOrientation::HorizontalFirst,
+            )?;
+            if !added {
+                return Err(EditError::DuplicateWire);
+            }
+            let new_id = self
+                .document
+                .wires
+                .geometric()
+                .map_err(EditError::Geometry)?
+                .iter()
+                .filter(|s| !before.contains(&s.id))
+                .map(|s| s.id)
+                .min()
+                .unwrap_or(first_id);
+            return Ok(WireId(new_id));
         }
         for endpoint in endpoints {
             let component = self
@@ -822,6 +880,14 @@ impl Session {
         }
         if endpoints[0] == endpoints[1] {
             return Err(EditError::SameEndpoint);
+        }
+        if self.document.wires.geometric().is_ok()
+            && crate::simulation::logical_pin_partitions(&self.document).is_ok_and(|nets| {
+                nets.iter()
+                    .any(|net| endpoints.iter().all(|pin| net.contains(pin)))
+            })
+        {
+            return Err(EditError::DuplicateWire);
         }
         if self
             .document
@@ -848,11 +914,15 @@ impl Session {
     }
     pub fn delete_wire(&mut self, id: WireId) -> Result<(), EditError> {
         self.ensure_editable()?;
-        if !matches!(
+        if matches!(
             self.document.wires,
-            crate::domain::Wiring::LegacyPinPairs(_)
+            crate::domain::Wiring::GeometricSegments(_)
         ) {
-            return Err(EditError::GeometricMode);
+            return if self.delete_geometric_segment(id.0)? {
+                Ok(())
+            } else {
+                Err(EditError::UnknownWire)
+            };
         }
         let mut next = self.document.clone();
         let wires = next
@@ -1206,11 +1276,11 @@ impl Session {
         if self.runtime.is_some() {
             return Err(SessionDigError::SimulationActive);
         }
-        if !matches!(
+        if matches!(
             self.document.wires,
-            crate::domain::Wiring::LegacyPinPairs(_)
+            crate::domain::Wiring::GeometricSegments(_)
         ) {
-            return Err(SessionDigError::GeometricMode);
+            return Ok(false);
         }
         let dig = formats::from_domain(&self.document).map_err(SessionDigError::Domain)?;
         // The migration comparison is deliberately electrical-connectivity-only: incomplete
@@ -1276,6 +1346,8 @@ mod tests {
     use crate::geometric_wiring::Point;
     fn simple_legacy_session() -> Session {
         let mut session = Session::default();
+        // This compatibility fixture is intentionally legacy for the migration regressions.
+        session.document.wires = crate::domain::Wiring::LegacyPinPairs(Vec::new());
         let input = session
             .place(ComponentKind::Input, Position { x: 18.0, y: 0.0 })
             .unwrap();
@@ -1302,6 +1374,98 @@ mod tests {
             .unwrap();
         session
     }
+    #[test]
+    fn component_commands_require_exact_integer_artwork_centers_transactionally() {
+        let mut session = Session::default();
+        assert_eq!(
+            session.place(ComponentKind::Input, Position { x: 0.5, y: 0.0 }),
+            Err(EditError::InvalidPosition)
+        );
+        let id = session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let document = session.document().clone();
+        let undo = session.undo.len();
+        assert_eq!(
+            session.move_component(id, Position { x: 2.5, y: 0.0 }),
+            Err(EditError::InvalidPosition)
+        );
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo.len(), undo);
+    }
+
+    #[test]
+    fn default_document_routes_fanout_simulates_roundtrips_and_undoes_geometry() {
+        let mut session = Session::default();
+        assert!(matches!(
+            session.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
+        let input = session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
+            .unwrap();
+        let out_a = session
+            .place(ComponentKind::Output, Position { x: 120.0, y: 40.0 })
+            .unwrap();
+        let out_b = session
+            .place(ComponentKind::Output, Position { x: 120.0, y: -40.0 })
+            .unwrap();
+        let pin = |component, direction| PinRef {
+            component,
+            pin: crate::domain::PinId {
+                direction,
+                index: 0,
+            },
+        };
+        session
+            .connect([
+                pin(input, crate::domain::PinDirection::Output),
+                pin(out_a, crate::domain::PinDirection::Input),
+            ])
+            .unwrap();
+        session
+            .connect([
+                pin(input, crate::domain::PinDirection::Output),
+                pin(out_b, crate::domain::PinDirection::Input),
+            ])
+            .unwrap();
+        assert!(session.document().wires.len() >= 2);
+        crate::simulation::compile(session.document()).unwrap();
+        session.start_running_for_test().unwrap();
+        session.settle_simulation(100).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(out_a),
+            Some(crate::runtime::Level::Low)
+        );
+        assert_eq!(
+            session.inspect().unwrap().output_value(out_b),
+            Some(crate::runtime::Level::Low)
+        );
+        session.stop_simulation().unwrap();
+
+        let full = session.document().clone();
+        session.undo().unwrap();
+        assert_ne!(session.document(), &full);
+        session.redo().unwrap();
+        assert_eq!(session.document(), &full);
+        use crate::file_session::{DiscardIntent, LocalFileIo, SaveAsIntent};
+        let dir = std::env::temp_dir().join(format!(
+            "digital-rust-geometric-default-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut io = LocalFileIo::new(&dir);
+        session
+            .save_as(&mut io, Path::new("fanout.dig"), SaveAsIntent::CreateOnly)
+            .unwrap();
+        let mut reopened = Session::default();
+        reopened
+            .open_path(&mut io, Path::new("fanout.dig"), DiscardIntent::RefuseDirty)
+            .unwrap();
+        assert_eq!(reopened.document(), session.document());
+        crate::simulation::compile(reopened.document()).unwrap();
+    }
+
     #[test]
     fn geometric_session_keeps_allocated_ids_unique_and_migration_high_water_monotonic() {
         let mut session = Session::default();
@@ -1620,9 +1784,9 @@ mod tests {
         let expected = crate::simulation::logical_pin_partitions(session.document()).unwrap();
         assert!(matches!(
             crate::simulation::compile(session.document()),
-            Err(CompileError::MultipleDrivers { .. })
+            Err(CompileError::GeometricMultipleDrivers { .. })
         ));
-        assert!(session.migrate_to_geometric_wiring().unwrap());
+        assert!(!session.migrate_to_geometric_wiring().unwrap());
         assert_eq!(
             crate::simulation::logical_pin_partitions(session.document()).unwrap(),
             expected
@@ -1684,8 +1848,8 @@ mod tests {
 
         let mut first_order = make_session(false);
         let mut reverse_order = make_session(true);
-        assert!(first_order.migrate_to_geometric_wiring().unwrap());
-        assert!(reverse_order.migrate_to_geometric_wiring().unwrap());
+        assert!(!first_order.migrate_to_geometric_wiring().unwrap());
+        assert!(!reverse_order.migrate_to_geometric_wiring().unwrap());
         assert!(matches!(
             first_order.document().wires,
             crate::domain::Wiring::GeometricSegments(_)
@@ -1707,7 +1871,7 @@ mod tests {
             .place(ComponentKind::Output, Position { x: 20.0, y: 40.0 })
             .unwrap();
         assert!(crate::simulation::compile(session.document()).is_err());
-        assert!(session.migrate_to_geometric_wiring().unwrap());
+        assert!(!session.migrate_to_geometric_wiring().unwrap());
         assert!(matches!(
             session.document().wires,
             crate::domain::Wiring::GeometricSegments(_)
@@ -1739,18 +1903,20 @@ mod tests {
     #[test]
     fn failed_or_locked_geometry_migration_preserves_session_state() {
         let mut invalid = Session::default();
-        invalid
-            .place(
-                ComponentKind::Input,
-                Position {
-                    x: f32::MAX,
-                    y: 0.0,
-                },
-            )
+        let id = invalid
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
             .unwrap();
+        invalid
+            .document
+            .components
+            .iter_mut()
+            .find(|c| c.id == id)
+            .unwrap()
+            .position
+            .x = f32::MAX;
         let document = invalid.document().clone();
         let undo = invalid.undo.len();
-        assert!(invalid.migrate_to_geometric_wiring().is_err());
+        assert!(invalid.export_dig_bytes().is_err());
         assert_eq!(invalid.document(), &document);
         assert_eq!(invalid.undo.len(), undo);
         let mut locked = simple_legacy_session();
@@ -2176,15 +2342,17 @@ mod tests {
     fn codec_refusal_does_not_reach_filesystem() {
         let mut io = NoFileAccess;
         let mut session = Session::default();
-        session
-            .place(
-                ComponentKind::Input,
-                Position {
-                    x: f32::MAX,
-                    y: 0.0,
-                },
-            )
+        let id = session
+            .place(ComponentKind::Input, Position { x: 0.0, y: 0.0 })
             .unwrap();
+        session
+            .document
+            .components
+            .iter_mut()
+            .find(|c| c.id == id)
+            .unwrap()
+            .position
+            .x = f32::MAX;
         assert!(matches!(
             session.save_as(
                 &mut io,
@@ -2576,7 +2744,7 @@ mod tests {
         let y = pin(b, PinDirection::Input, 0);
         let z = pin(b, PinDirection::Input, 1);
         let first = s.connect([x, y]).unwrap();
-        let second = s.connect([x, z]).unwrap();
+        let _second = s.connect([x, z]).unwrap();
         let snapshot = s.document.clone();
         assert_eq!(s.connect([y, x]), Err(EditError::DuplicateWire));
         assert_eq!(s.connect([x, x]), Err(EditError::SameEndpoint));
@@ -2591,7 +2759,8 @@ mod tests {
         assert_eq!(s.delete_wire(WireId(999)), Err(EditError::UnknownWire));
         assert_eq!(s.document, snapshot);
         s.delete(b).unwrap();
-        assert!(s.document.wires.is_empty());
+        // Digital leaves geometric records stationary when a single component is deleted.
+        assert_eq!(s.document.wires, snapshot.wires);
         s.undo().unwrap();
         assert_eq!(s.document, snapshot);
         s.redo().unwrap();
@@ -2599,16 +2768,22 @@ mod tests {
         s.delete_wire(first).unwrap();
         s.undo().unwrap();
         s.undo().unwrap();
-        s.next_wire_id = u64::MAX;
-        assert_eq!(s.connect([x, z]), Err(EditError::WireIdExhausted));
+        s.next_segment_id = u64::MAX;
+        assert!(matches!(
+            s.connect([x, z]),
+            Err(EditError::Geometry(
+                crate::geometric_wiring::GeometryError::IdExhausted
+            ))
+        ));
         s.redo().unwrap();
         assert_eq!(s.document, snapshot);
         s.undo().unwrap();
-        s.next_wire_id = 2;
-        let third = s.connect([y, z]).unwrap();
-        assert_ne!(third, second);
+        s.next_segment_id = 2;
+        let before = s.document.clone();
+        let _third = s.connect([y, z]).unwrap();
+        assert_ne!(s.document, before);
         s.redo().unwrap();
-        assert_eq!(s.document.wires.len(), 2);
+        assert_eq!(s.document.wires.len(), 3);
     }
     #[test]
     fn pin_sets_are_kind_specific() {
@@ -3291,7 +3466,9 @@ mod tests {
         let before = snapshot(&s);
         assert!(matches!(
             s.start_simulation(),
-            Err(SimulationError::Compile(CompileError::MissingDriver { .. }))
+            Err(SimulationError::Compile(
+                CompileError::DisconnectedReceiver { .. }
+            ))
         ));
         assert!(!s.simulation_active());
         assert!(s.inspect().is_none());
@@ -3310,7 +3487,7 @@ mod tests {
         use crate::domain::{PinDirection, PinId};
         let mut s = Session::default();
         let (input, not, _) = wired_not(&mut s);
-        let wire = s.document.wires.legacy().unwrap()[0].id;
+        let wire = WireId(s.document.wires.geometric().unwrap()[0].id);
         let spare = s
             .place(ComponentKind::Input, Position { x: 9.0, y: 9.0 })
             .unwrap();
