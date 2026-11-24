@@ -66,8 +66,11 @@ pub struct DigitalApp {
     session: Session,
     selected: Option<ComponentId>,
     selected_wire: Option<WireId>,
+    selected_segment: Option<u64>,
     wiring: bool,
     wire_start: Option<PinRef>,
+    geometric_route_start: Option<crate::engine::RouteTarget>,
+    route_orientation: digital_rust::geometric_wiring::RouteOrientation,
     focused_pin: Option<PinRef>,
     placing: Option<ComponentKind>,
     drag: Option<(ComponentId, Position, Pos2)>,
@@ -158,8 +161,11 @@ impl DigitalApp {
             session: Session::default(),
             selected: None,
             selected_wire: None,
+            selected_segment: None,
             wiring: false,
             wire_start: None,
+            geometric_route_start: None,
+            route_orientation: digital_rust::geometric_wiring::RouteOrientation::HorizontalFirst,
             focused_pin: None,
             placing: None,
             drag: None,
@@ -402,6 +408,7 @@ impl DigitalApp {
         self.placing = None;
         self.wiring = false;
         self.wire_start = None;
+        self.geometric_route_start = None;
         self.focused_pin = None;
         self.drag = None;
     }
@@ -799,10 +806,29 @@ impl DigitalApp {
         }
     }
     fn choose_pin(&mut self, pin: PinRef) {
+        if matches!(
+            self.session.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ) {
+            let target = crate::engine::RouteTarget::Pin(pin);
+            if let Some(start) = self.geometric_route_start.take() {
+                match self
+                    .session
+                    .route_geometric(start, target, self.route_orientation)
+                {
+                    Ok(_) => self.error = None,
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            } else {
+                self.geometric_route_start = Some(target);
+            }
+            return;
+        }
         if let Some(start) = self.wire_start {
             match self.session.connect([start, pin]) {
                 Ok(_) => {
                     self.wire_start = None;
+                    self.geometric_route_start = None;
                     self.error = None;
                 }
                 Err(e) => self.error = Some(e.to_string()),
@@ -862,6 +888,7 @@ impl DigitalApp {
                         self.placing = None;
                         self.wiring = false;
                         self.wire_start = None;
+                        self.geometric_route_start = None;
                         self.focused_pin = None;
                         self.drag = None;
                         self.failed_start = None;
@@ -1171,17 +1198,29 @@ impl DigitalApp {
                             self.placing = Some(kind);
                             self.wiring = false;
                             self.wire_start = None;
+                self.geometric_route_start = None;
                         }
                     }
-                    let geometric = matches!(self.session.document().wires, crate::domain::Wiring::GeometricSegments(_));
-                    let wire_label = if geometric { "Wire (W) — read-only" } else { "Wire (W)" };
-                    if ui.add_enabled(!geometric, egui::Button::new(wire_label).selected(self.wiring))
-                        .on_hover_text(if geometric { "Geometric segments are read-only in the native editor" } else { "Create a pin-pair wire (W)" })
+                    if ui.add(egui::Button::new("Wire (W)").selected(self.wiring))
+                        .on_hover_text("Create a wire; Shift+W flips the L-route orientation")
                         .clicked() {
                         self.wiring = !self.wiring;
                         self.wire_start = None;
+                        self.geometric_route_start = None;
                         self.placing = None;
                         self.drag = None;
+                    }
+                    if self.wiring {
+                        if ui.button("Flip route (Shift+W)").clicked() {
+                            self.route_orientation = match self.route_orientation {
+                                digital_rust::geometric_wiring::RouteOrientation::HorizontalFirst => digital_rust::geometric_wiring::RouteOrientation::VerticalFirst,
+                                digital_rust::geometric_wiring::RouteOrientation::VerticalFirst => digital_rust::geometric_wiring::RouteOrientation::HorizontalFirst,
+                            };
+                        }
+                        ui.label(match self.route_orientation {
+                            digital_rust::geometric_wiring::RouteOrientation::HorizontalFirst => "Horizontal first",
+                            digital_rust::geometric_wiring::RouteOrientation::VerticalFirst => "Vertical first",
+                        });
                     }
                 });
             });
@@ -1439,6 +1478,7 @@ impl DigitalApp {
                 self.drag = None;
                 self.placing = None;
                 self.wire_start = None;
+                self.geometric_route_start = None;
             }
             // Gesture ownership is acquired only when unowned. A chorded/extra press must
             // never replace the button whose release terminates the current pan.
@@ -1576,7 +1616,16 @@ impl DigitalApp {
                                 .is_some_and(|layout| layout.hit(world, tolerance))
                         })
                         .map(|c| (c.id, c.position));
-                    self.selected_wire = if hit.is_none() {
+                    self.selected_segment = if hit.is_none() {
+                        self.session.document().wires.geometric().ok().into_iter().flatten().rev().find(|segment| {
+                            crate::wire_geometry::hit(
+                                &[[segment.a.x as f32, segment.a.y as f32], [segment.b.x as f32, segment.b.y as f32]],
+                                world,
+                                transform.length_to_world(6.),
+                            )
+                        }).map(|segment| segment.id)
+                    } else { None };
+                    self.selected_wire = if hit.is_none() && self.selected_segment.is_none() {
                         self.session
                             .document()
                             .wires
@@ -1699,11 +1748,20 @@ impl DigitalApp {
                 }
             }
             if let crate::domain::Wiring::GeometricSegments(segments) = &self.session.document().wires {
+                let mut incidence = std::collections::BTreeMap::<digital_rust::geometric_wiring::Point, usize>::new();
                 for segment in segments {
+                    *incidence.entry(segment.a).or_default() += 1;
+                    *incidence.entry(segment.b).or_default() += 1;
+                    let color = if self.selected_segment == Some(segment.id) { palette.selection } else { palette.ink };
                     painter.line_segment(
                         [transform.to_screen([segment.a.x as f32, segment.a.y as f32]), transform.to_screen([segment.b.x as f32, segment.b.y as f32])],
-                        Stroke::new(2.0_f32, palette.ink),
+                        Stroke::new(2.0_f32, color),
                     );
+                }
+                for (point, count) in incidence {
+                    if count > 2 {
+                        painter.circle_filled(transform.to_screen([point.x as f32, point.y as f32]), 3.0, palette.ink);
+                    }
                 }
             }
             if self.wiring {
@@ -1719,19 +1777,29 @@ impl DigitalApp {
                     );
                 }
                 if !cancelled && !pan_sequence
-                    && let Some(start) = self.wire_start
-                    && let Some(a) = wire_pins.iter().find(|v| v.0 == start)
                     && let Some(p) = response.hover_pos()
                 {
-                    let b = (start, transform.to_world(p));
-                    for segment in crate::wire_geometry::path(*a, b).windows(2) {
-                        painter.line_segment(
-                            [
-                                transform.to_screen(segment[0]),
-                                transform.to_screen(segment[1]),
-                            ],
-                            Stroke::new(1_f32, palette.selection),
-                        );
+                    if let Some(start) = self.geometric_route_start
+                        && let crate::engine::RouteTarget::Pin(pin) = start
+                        && let Some((_, a)) = wire_pins.iter().find(|v| v.0 == pin)
+                    {
+                        let a = digital_rust::geometric_wiring::Point::new(a[0].round() as i32, a[1].round() as i32);
+                        let world = transform.to_world(p);
+                        let b = digital_rust::geometric_wiring::Point::new(world[0].round() as i32, world[1].round() as i32);
+                        let points = digital_rust::geometric_wiring::plan_orthogonal_route(a, b, self.route_orientation);
+                        for pair in points.windows(2) {
+                            painter.line_segment(
+                                [transform.to_screen([pair[0].x as f32, pair[0].y as f32]), transform.to_screen([pair[1].x as f32, pair[1].y as f32])],
+                                Stroke::new(1_f32, palette.selection),
+                            );
+                        }
+                    } else if let Some(start) = self.wire_start
+                        && let Some(a) = wire_pins.iter().find(|v| v.0 == start)
+                    {
+                        let b = (start, transform.to_world(p));
+                        for segment in crate::wire_geometry::path(*a, b).windows(2) {
+                            painter.line_segment([transform.to_screen(segment[0]), transform.to_screen(segment[1])], Stroke::new(1_f32, palette.selection));
+                        }
                     }
                 }
             }
@@ -1947,15 +2015,20 @@ impl DigitalApp {
                 && !locked
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W))
             {
-                if matches!(self.session.document().wires, crate::domain::Wiring::GeometricSegments(_)) {
-                    self.wiring = false;
-                    self.error = Some("Geometric segments are read-only in the native editor; wire editing is not implemented".into());
-                } else {
-                    self.wiring = !self.wiring;
-                }
+                self.wiring = !self.wiring;
                 self.wire_start = None;
+                self.geometric_route_start = None;
                 self.placing = None;
                 self.drag = None;
+            }
+            if owns_keyboard
+                && self.wiring
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::W))
+            {
+                self.route_orientation = match self.route_orientation {
+                    digital_rust::geometric_wiring::RouteOrientation::HorizontalFirst => digital_rust::geometric_wiring::RouteOrientation::VerticalFirst,
+                    digital_rust::geometric_wiring::RouteOrientation::VerticalFirst => digital_rust::geometric_wiring::RouteOrientation::HorizontalFirst,
+                };
             }
             if owns_keyboard {
                 let backwards =
@@ -2002,6 +2075,15 @@ impl DigitalApp {
                 {
                     self.choose_pin(pin);
                 }
+                if let Some(id) = self.selected_segment
+                    && !locked
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+                {
+                    match self.session.delete_geometric_segment(id) {
+                        Ok(_) => { self.selected_segment = None; self.error = None; }
+                        Err(error) => self.error = Some(error.to_string()),
+                    }
+                }
                 if self.selected_wire.is_some()
                     && !locked
                     && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
@@ -2044,6 +2126,7 @@ impl DigitalApp {
             if undo {
                 self.focused_pin = None;
                 self.wire_start = None;
+                self.geometric_route_start = None;
                 self.selected_wire = None;
                 if self.session.undo().is_ok() {
                     self.selected = None;
@@ -2053,6 +2136,7 @@ impl DigitalApp {
             if redo {
                 self.focused_pin = None;
                 self.wire_start = None;
+                self.geometric_route_start = None;
                 self.selected_wire = None;
                 if self.session.redo().is_ok() {
                     self.selected = None;
@@ -4594,7 +4678,7 @@ mod tests {
     }
 
     #[test]
-    fn native_open_draws_geometric_segments_and_disables_wire_editing() {
+    fn native_open_draws_geometric_segments_and_enables_wire_mode() {
         let ctx = egui::Context::default();
         let dir = test_dir("native-geometric-readonly");
         let geometric = digital_rust::formats::DigV2 {
@@ -4629,12 +4713,8 @@ mod tests {
             vec![key(egui::Key::W, egui::Modifiers::NONE)],
             true,
         );
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|message| message.contains("read-only"))
-        );
-        assert!(!app.wiring);
+        assert!(app.wiring, "W must enable geometric wire creation");
+        assert!(app.error.is_none());
         let transform = app.view.transform(app.canvas_rect.unwrap()).unwrap();
         let a = transform.to_screen([9.0, 8.0]);
         let b = transform.to_screen([2.0, 3.0]);
@@ -4642,7 +4722,94 @@ mod tests {
             has_line(&output, a, b, 2.0) || has_line(&output, b, a, 2.0),
             "the exact geometric segment must be drawn"
         );
+        click_at(&ctx, &mut app, transform.to_screen([5.5, 5.5]));
+        assert_eq!(app.selected_segment, Some(0));
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Delete, egui::Modifiers::NONE)],
+            true,
+        );
+        assert!(app.session.document().wires.geometric().unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn geometric_wire_mode_routes_between_real_canvas_pins_through_the_session() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let dig = digital_rust::formats::DigV2 {
+            elements: vec![
+                digital_rust::formats::DigElement {
+                    name: "In".into(),
+                    x: 0,
+                    y: 0,
+                    label: None,
+                    value: None,
+                },
+                digital_rust::formats::DigElement {
+                    name: "Out".into(),
+                    x: 100,
+                    y: 80,
+                    label: None,
+                    value: None,
+                },
+            ],
+            wires: vec![],
+        };
+        app.session
+            .open_dig_bytes(&digital_rust::formats::serialize_v2(&dig).unwrap())
+            .unwrap();
+        let input = app.session.document().components[0].id;
+        let output = app.session.document().components[1].id;
+        frame(&ctx, &mut app, vec![], true);
+        app.wiring = true;
+        let rect = app.canvas_rect.unwrap();
+        let transform = app.view.transform(rect).unwrap();
+        let input_pin = PinRef {
+            component: input,
+            pin: PinId {
+                direction: PinDirection::Output,
+                index: 0,
+            },
+        };
+        let output_pin = PinRef {
+            component: output,
+            pin: PinId {
+                direction: PinDirection::Input,
+                index: 0,
+            },
+        };
+        let pin_screen = |component: ComponentId, kind: ComponentKind, pin: PinId| {
+            let doc_component = app
+                .session
+                .document()
+                .components
+                .iter()
+                .find(|c| c.id == component)
+                .unwrap();
+            let position = SymbolLayout::centered_on(
+                app.style,
+                kind,
+                [doc_component.position.x, doc_component.position.y],
+            )
+            .unwrap()
+            .pin_position(pin)
+            .unwrap();
+            transform.to_screen(position)
+        };
+        let input_screen = pin_screen(input, ComponentKind::Input, input_pin.pin);
+        let output_screen = pin_screen(output, ComponentKind::Output, output_pin.pin);
+        click_at(&ctx, &mut app, input_screen);
+        click_at(&ctx, &mut app, output_screen);
+        let segments = app.session.document().wires.geometric().unwrap();
+        assert_eq!(
+            segments.len(),
+            2,
+            "diagonal pin displacement makes a two-leg L"
+        );
+        assert!(segments.iter().all(|s| s.a.x == s.b.x || s.a.y == s.b.y));
+        assert!(app.session.dirty());
     }
 
     #[test]
