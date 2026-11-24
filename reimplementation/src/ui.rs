@@ -424,6 +424,33 @@ impl DigitalApp {
             }
         }
     }
+    fn reconcile_selection(&mut self) {
+        let components: std::collections::BTreeSet<_> = self
+            .session
+            .document()
+            .components
+            .iter()
+            .map(|component| component.id)
+            .collect();
+        self.selection
+            .components
+            .retain(|id| components.contains(id));
+        let wires: std::collections::BTreeSet<_> = self
+            .session
+            .document()
+            .wires
+            .geometric()
+            .map(|segments| segments.iter().map(|segment| segment.id).collect())
+            .unwrap_or_default();
+        self.selection.wires.retain(|id, _| wires.contains(id));
+        self.selected = self
+            .selected
+            .filter(|id| self.selection.components.contains(id));
+        self.selected_segment = self
+            .selected_segment
+            .filter(|id| self.selection.wires.contains_key(id));
+    }
+
     fn cancel_gestures(&mut self) {
         self.pan_owner = None;
         self.placing = None;
@@ -1881,8 +1908,8 @@ impl DigitalApp {
                         self.drag = (!locked).then_some((ComponentId(u64::MAX), Position{x:0.,y:0.}, p));
                         if !modifiers.shift && !(modifiers.command || modifiers.ctrl) { self.selected_segment = Some(id); }
                     } else {
-                        self.selection.clear();
-                        self.selected = None;
+                        // Keep the old selection while a marquee is only a preview. Release
+                        // applies its modifier semantics; cancellation leaves it untouched.
                         self.marquee = Some((p, modifiers));
                     }
                     if locked
@@ -1917,7 +1944,19 @@ impl DigitalApp {
             }
             if !cancelled && !pan_sequence && response.clicked() {
                 self.drag = None;
-                self.marquee = None;
+                if let Some((_, modifiers)) = self.marquee.take() {
+                    self.selection.apply_marquee(
+                        crate::selection::Selection::default(),
+                        modifiers.shift,
+                        modifiers.command || modifiers.ctrl,
+                    );
+                    self.selected = if self.selection.components.len() == 1 && self.selection.wires.is_empty() {
+                        self.selection.components.iter().next().copied()
+                    } else { None };
+                    self.selected_segment = if self.selection.wires.len() == 1 {
+                        self.selection.wires.keys().next().copied()
+                    } else { None };
+                }
             }
             if !cancelled && !pan_sequence
                 && !locked
@@ -1934,6 +1973,7 @@ impl DigitalApp {
                 } else { ((dx/20.).round() as i32*20,(dy/20.).round() as i32*20) };
                 match self.session.move_selection(&self.selection, snapped_dx, snapped_dy) {
                     Ok(_) => {
+                        self.reconcile_selection();
                         for (pin, pos) in &mut pins {
                             if self.selection.components.contains(&pin.component) {
                                 pos[0] += snapped_dx as f32;
@@ -2221,7 +2261,10 @@ impl DigitalApp {
                 }));
                 if let Some(key) = nudge {
                     let (dx,dy) = match key { egui::Key::ArrowLeft=>(-20,0),egui::Key::ArrowRight=>(20,0),egui::Key::ArrowUp=>(0,-20),_=>(0,20) };
-                    if let Err(error)=self.session.move_selection(&self.selection,dx,dy) { self.error=Some(error.to_string()); }
+                    match self.session.move_selection(&self.selection,dx,dy) {
+                        Ok(_) => self.reconcile_selection(),
+                        Err(error) => self.error=Some(error.to_string()),
+                    }
                 }
             }
             if owns_keyboard && locked {
@@ -5676,6 +5719,240 @@ mod tests {
         );
         app.session.undo().unwrap();
         assert_eq!(app.session.document(), &before);
+    }
+
+    #[test]
+    fn production_marquee_modifiers_and_cancellation_preserve_selection_until_release() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let first = app
+            .session
+            .place(ComponentKind::Input, Position { x: 100., y: 100. })
+            .unwrap();
+        let second = app
+            .session
+            .place(ComponentKind::Output, Position { x: 220., y: 100. })
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let transform = app.view.transform(app.canvas_rect.unwrap()).unwrap();
+        let style = app.style;
+        let bounds = |kind, center| {
+            SymbolLayout::centered_on(style, kind, center)
+                .unwrap()
+                .bounds()
+        };
+        let marquee_points = |kind, center| {
+            let b = bounds(kind, center);
+            (
+                transform.to_screen([b.min[0] - 5., b.min[1] - 5.]),
+                transform.to_screen([b.max[0] + 5., b.max[1] + 5.]),
+            )
+        };
+        let (a0, a1) = marquee_points(ComponentKind::Input, [100., 100.]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(a0), button(a0, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(a1)], true);
+        frame(&ctx, &mut app, vec![button(a1, false)], true);
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([first])
+        );
+
+        let (b0, b1) = marquee_points(ComponentKind::Output, [220., 100.]);
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(b0),
+                pointer_button(b0, egui::PointerButton::Primary, true, shift),
+            ],
+            true,
+        );
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([first]),
+            "press must not clear the old selection"
+        );
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(b1)], true);
+        frame(
+            &ctx,
+            &mut app,
+            vec![pointer_button(
+                b1,
+                egui::PointerButton::Primary,
+                false,
+                shift,
+            )],
+            true,
+        );
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([first, second])
+        );
+
+        let (a0, a1) = marquee_points(ComponentKind::Input, [100., 100.]);
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(a0),
+                pointer_button(a0, egui::PointerButton::Primary, true, ctrl),
+            ],
+            true,
+        );
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(a1)], true);
+        frame(
+            &ctx,
+            &mut app,
+            vec![pointer_button(
+                a1,
+                egui::PointerButton::Primary,
+                false,
+                ctrl,
+            )],
+            true,
+        );
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([second]),
+            "Ctrl marquee toggles membership"
+        );
+
+        // Plain release replaces the old selection with the marquee result.
+        let (a0, a1) = marquee_points(ComponentKind::Input, [100., 100.]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(a0), button(a0, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(a1)], true);
+        frame(&ctx, &mut app, vec![button(a1, false)], true);
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([first])
+        );
+
+        // Begin an unmodified replacement marquee, then cancel it. The prior selection remains.
+        let empty = transform.to_screen([400., 300.]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(empty), button(empty, true)],
+            true,
+        );
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([first])
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![button(empty, false)], true);
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([first])
+        );
+
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(empty), button(empty, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![], false);
+        frame(&ctx, &mut app, vec![button(empty, false)], true);
+        assert_eq!(
+            app.selection.components,
+            std::collections::BTreeSet::from([first]),
+            "focus loss cancels without replacing selection"
+        );
+    }
+
+    #[test]
+    fn production_nudge_reconciles_wire_selection_after_collapsed_segment() {
+        use digital_rust::geometric_wiring::{Point as P, Segment};
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        app.session
+            .add_geometric_segments(&[
+                (P::new(0, 0), P::new(20, 0)),
+                (P::new(100, 0), P::new(120, 0)),
+            ])
+            .unwrap();
+        app.session
+            .place(ComponentKind::Input, Position { x: 200., y: 100. })
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        let point = app
+            .view
+            .transform(app.canvas_rect.unwrap())
+            .unwrap()
+            .to_screen([200., 100.]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(point), button(point, true)],
+            true,
+        );
+        frame(&ctx, &mut app, vec![button(point, false)], true);
+        app.selection
+            .wires
+            .insert(0, crate::selection::EndpointMask::A);
+        app.selection
+            .wires
+            .insert(1, crate::selection::EndpointMask::BOTH);
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::ArrowRight,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(
+            app.session.document().wires.geometric().unwrap(),
+            &[Segment {
+                id: 1,
+                a: P::new(120, 0),
+                b: P::new(140, 0)
+            }]
+        );
+        assert_eq!(
+            app.selection.wires.keys().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+        ctx.memory_mut(|memory| memory.request_focus(app.canvas_id.unwrap()));
+        press(
+            &ctx,
+            &mut app,
+            egui::Key::ArrowRight,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(
+            app.session.document().wires.geometric().unwrap()[0],
+            Segment {
+                id: 1,
+                a: P::new(140, 0),
+                b: P::new(160, 0)
+            }
+        );
+        ctx.memory_mut(|memory| memory.request_focus(app.canvas_id.unwrap()));
+        press(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
+        assert!(app.session.document().wires.geometric().unwrap().is_empty());
     }
 
     #[test]

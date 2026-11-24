@@ -3732,6 +3732,34 @@ mod tests {
     }
 
     #[test]
+    fn plain_wire_selection_replaces_components_for_group_move_and_delete() {
+        use crate::geometric_wiring::{Point as P, Segment};
+        let mut session = Session::default();
+        let component = session
+            .place(ComponentKind::Input, Position { x: 20., y: 20. })
+            .unwrap();
+        session.document.wires = crate::domain::Wiring::GeometricSegments(vec![Segment {
+            id: 1,
+            a: P::new(0, 0),
+            b: P::new(20, 0),
+        }]);
+        let original_position = session.document.components[0].position;
+        let mut selection = crate::selection::Selection::default();
+        selection.select_component(component, false, false);
+        selection.select_wire_endpoint(1, crate::selection::EndpointMask::BOTH, false, false);
+        assert!(selection.components.is_empty());
+        assert!(session.move_selection(&selection, 20, 0).unwrap());
+        assert_eq!(session.document.components[0].position, original_position);
+        assert_eq!(
+            session.document.wires.geometric().unwrap()[0].a,
+            P::new(20, 0)
+        );
+        assert!(session.delete_selection(&selection).unwrap());
+        assert_eq!(session.document.components[0].id, component);
+        assert!(session.document.wires.geometric().unwrap().is_empty());
+    }
+
+    #[test]
     fn selection_edit_obeys_simulation_lock_before_validation() {
         let mut session = Session::default();
         let _id = session

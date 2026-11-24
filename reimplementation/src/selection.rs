@@ -63,7 +63,7 @@ impl Selection {
         toggle: bool,
     ) {
         if !shift && !toggle {
-            self.wires.clear();
+            self.clear();
         }
         let mask = self.wires.entry(id).or_default();
         *mask = if toggle {
@@ -203,8 +203,14 @@ mod tests {
         mixed.select_wire_endpoint(1, EndpointMask::A, true, false);
         assert!(mixed.components.contains(&a));
         assert_eq!(mixed.wires.get(&1), Some(&EndpointMask::A));
+        mixed.select_wire_endpoint(2, EndpointMask::BOTH, false, false);
+        assert!(mixed.components.is_empty());
+        assert_eq!(
+            mixed.wires,
+            std::collections::BTreeMap::from([(2, EndpointMask::BOTH)])
+        );
         mixed.select_wire_endpoint(1, EndpointMask::A, false, true);
-        assert!(mixed.components.contains(&a));
-        assert!(!mixed.wires.contains_key(&1));
+        assert!(mixed.wires.contains_key(&2));
+        assert!(mixed.wires.contains_key(&1));
     }
 }
