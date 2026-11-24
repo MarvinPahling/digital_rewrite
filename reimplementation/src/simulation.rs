@@ -1,5 +1,4 @@
-//! Bounded compiler for the supported one-bit circuits with explicit-pin connectivity.
-//! Geometry never joins nets. Floating receiving pins and multiple drivers are errors.
+//! Bounded one-bit compiler. Legacy documents use explicit pin pairs; geometric documents use exact integer endpoints.
 use crate::domain::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -14,13 +13,45 @@ pub enum CompileError {
     ComponentLimit,
     WireLimit,
     WorkLimit,
-    GeometricWiring,
+    FractionalPlacement {
+        component: ComponentId,
+    },
+    InvalidPlacement {
+        component: ComponentId,
+    },
+    ZeroLengthSegment {
+        segment: u64,
+    },
+    DuplicateSegmentId {
+        segment: u64,
+    },
+    GeometricWorkLimit,
     DuplicateComponent(ComponentId),
     DuplicateWire(WireId),
-    InvalidConstantConfiguration { component: ComponentId },
-    InvalidEndpoint { wire: WireId, pin: PinRef },
-    MissingDriver { pins: Vec<PinRef> },
-    MultipleDrivers { pins: Vec<PinRef> },
+    InvalidConstantConfiguration {
+        component: ComponentId,
+    },
+    InvalidEndpoint {
+        wire: WireId,
+        pin: PinRef,
+    },
+    MissingDriver {
+        pins: Vec<PinRef>,
+    },
+    DisconnectedReceiver {
+        pin: PinRef,
+    },
+    FloatingReceiverNet {
+        pins: Vec<PinRef>,
+        segment_ids: Vec<u64>,
+    },
+    MultipleDrivers {
+        pins: Vec<PinRef>,
+    },
+    GeometricMultipleDrivers {
+        pins: Vec<PinRef>,
+        segment_ids: Vec<u64>,
+    },
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Net {
@@ -32,6 +63,114 @@ pub struct CompiledCircuit {
     pub nets: Vec<Net>,
 }
 
+/// Connectivity only, without electrical validation. Used by transactional topology migration so
+/// incomplete circuits can be compared without requiring a successful simulation compile.
+pub fn logical_pin_partitions(document: &Document) -> Result<Vec<Vec<PinRef>>, CompileError> {
+    if document.components.len() > MAX_COMPONENTS {
+        return Err(CompileError::ComponentLimit);
+    }
+    if document.wires.len() > MAX_WIRES {
+        return Err(CompileError::WireLimit);
+    }
+    if document
+        .components
+        .len()
+        .saturating_mul(5)
+        .saturating_add(document.wires.len().saturating_mul(2))
+        > MAX_WORK
+    {
+        return Err(CompileError::WorkLimit);
+    }
+    let mut pins = Vec::new();
+    let mut indices = HashMap::new();
+    let mut component_indices = HashMap::new();
+    for (component_index, component) in document.components.iter().enumerate() {
+        if component_indices
+            .insert(component.id, component_index)
+            .is_some()
+        {
+            return Err(CompileError::DuplicateComponent(component.id));
+        }
+        for direction in [PinDirection::Input, PinDirection::Output] {
+            for index in 0..2 {
+                let pin = PinId { direction, index };
+                if component.kind.has_pin(pin) {
+                    let r = PinRef {
+                        component: component.id,
+                        pin,
+                    };
+                    indices.insert(r, pins.len());
+                    pins.push(r);
+                }
+            }
+        }
+    }
+    let result = match &document.wires {
+        Wiring::LegacyPinPairs(wires) => {
+            let mut parent: Vec<_> = (0..pins.len()).collect();
+            let mut ids = HashSet::new();
+            for wire in wires {
+                if !ids.insert(wire.id) {
+                    return Err(CompileError::DuplicateWire(wire.id));
+                }
+                let a = *indices
+                    .get(&wire.endpoints[0])
+                    .ok_or(CompileError::InvalidEndpoint {
+                        wire: wire.id,
+                        pin: wire.endpoints[0],
+                    })?;
+                let b = *indices
+                    .get(&wire.endpoints[1])
+                    .ok_or(CompileError::InvalidEndpoint {
+                        wire: wire.id,
+                        pin: wire.endpoints[1],
+                    })?;
+                let a = root(&mut parent, a);
+                let b = root(&mut parent, b);
+                parent[a] = b;
+            }
+            let mut groups = BTreeMap::<usize, Vec<PinRef>>::new();
+            for (i, p) in pins.iter().enumerate() {
+                groups.entry(root(&mut parent, i)).or_default().push(*p);
+            }
+            groups.into_values().collect()
+        }
+        Wiring::GeometricSegments(segments) => {
+            let mut placed = Vec::new();
+            for pin in &pins {
+                let component_index = *component_indices.get(&pin.component).ok_or(
+                    CompileError::InvalidPlacement {
+                        component: pin.component,
+                    },
+                )?;
+                let component = &document.components[component_index];
+                let point = crate::pin_geometry::pin_point(component, pin.pin).map_err(|e| {
+                    if matches!(e, crate::pin_geometry::PinGeometryError::Fractional(_)) {
+                        CompileError::FractionalPlacement {
+                            component: component.id,
+                        }
+                    } else {
+                        CompileError::InvalidPlacement {
+                            component: component.id,
+                        }
+                    }
+                })?;
+                placed.push(crate::topology::PinPoint { pin: *pin, point });
+            }
+            crate::topology::resolve(&placed, segments).map_err(|e| match e {
+                crate::topology::TopologyError::ZeroLength(id) => {
+                    CompileError::ZeroLengthSegment { segment: id }
+                }
+                crate::topology::TopologyError::DuplicateSegment(id) => {
+                    CompileError::DuplicateSegmentId { segment: id }
+                }
+                crate::topology::TopologyError::WorkLimit => CompileError::GeometricWorkLimit,
+            })?
+        }
+    };
+    Ok(result)
+}
+
 fn root(parent: &mut [usize], mut n: usize) -> usize {
     while parent[n] != n {
         parent[n] = parent[parent[n]];
@@ -41,9 +180,6 @@ fn root(parent: &mut [usize], mut n: usize) -> usize {
 }
 
 pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
-    if !matches!(document.wires, Wiring::LegacyPinPairs(_)) {
-        return Err(CompileError::GeometricWiring);
-    }
     if document.components.len() > MAX_COMPONENTS {
         return Err(CompileError::ComponentLimit);
     }
@@ -87,33 +223,82 @@ pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
             }
         }
     }
-    let mut parent: Vec<_> = (0..pins.len()).collect();
-    let mut wire_ids = HashSet::new();
-    for wire in document
-        .wires
-        .legacy()
-        .map_err(|_| CompileError::GeometricWiring)?
-    {
-        if !wire_ids.insert(wire.id) {
-            return Err(CompileError::DuplicateWire(wire.id));
+    let (partitions, geometric) = match &document.wires {
+        Wiring::LegacyPinPairs(wires) => {
+            let mut parent: Vec<_> = (0..pins.len()).collect();
+            let mut wire_ids = HashSet::new();
+            for wire in wires {
+                if !wire_ids.insert(wire.id) {
+                    return Err(CompileError::DuplicateWire(wire.id));
+                }
+                let mut ends = [0; 2];
+                for (i, pin) in wire.endpoints.iter().enumerate() {
+                    ends[i] = *indices.get(pin).ok_or(CompileError::InvalidEndpoint {
+                        wire: wire.id,
+                        pin: *pin,
+                    })?;
+                }
+                let a = root(&mut parent, ends[0]);
+                let b = root(&mut parent, ends[1]);
+                parent[a] = b;
+            }
+            let mut groups: BTreeMap<usize, Vec<PinRef>> = BTreeMap::new();
+            for (i, pin) in pins.iter().enumerate() {
+                groups.entry(root(&mut parent, i)).or_default().push(*pin);
+            }
+            (
+                groups
+                    .into_values()
+                    .map(|pins| (pins, Vec::<u64>::new()))
+                    .collect::<Vec<_>>(),
+                false,
+            )
         }
-        let mut ends = [0; 2];
-        for (i, pin) in wire.endpoints.iter().enumerate() {
-            ends[i] = *indices.get(pin).ok_or(CompileError::InvalidEndpoint {
-                wire: wire.id,
-                pin: *pin,
-            })?;
+        Wiring::GeometricSegments(segments) => {
+            let mut placed = Vec::with_capacity(pins.len());
+            for pin in &pins {
+                let component_index =
+                    *components
+                        .get(&pin.component)
+                        .ok_or(CompileError::InvalidPlacement {
+                            component: pin.component,
+                        })?;
+                let component = &document.components[component_index];
+                let point =
+                    crate::pin_geometry::pin_point(component, pin.pin).map_err(|e| match e {
+                        crate::pin_geometry::PinGeometryError::Fractional(_) => {
+                            CompileError::FractionalPlacement {
+                                component: component.id,
+                            }
+                        }
+                        _ => CompileError::InvalidPlacement {
+                            component: component.id,
+                        },
+                    })?;
+                placed.push(crate::topology::PinPoint { pin: *pin, point });
+            }
+            (
+                crate::topology::resolve_detailed(&placed, segments)
+                    .map_err(|e| match e {
+                        crate::topology::TopologyError::ZeroLength(id) => {
+                            CompileError::ZeroLengthSegment { segment: id }
+                        }
+                        crate::topology::TopologyError::DuplicateSegment(id) => {
+                            CompileError::DuplicateSegmentId { segment: id }
+                        }
+                        crate::topology::TopologyError::WorkLimit => {
+                            CompileError::GeometricWorkLimit
+                        }
+                    })?
+                    .into_iter()
+                    .map(|net| (net.pins, net.segment_ids))
+                    .collect::<Vec<_>>(),
+                true,
+            )
         }
-        let a = root(&mut parent, ends[0]);
-        let b = root(&mut parent, ends[1]);
-        parent[a] = b;
-    }
-    let mut groups: BTreeMap<usize, Vec<PinRef>> = BTreeMap::new();
-    for (i, pin) in pins.iter().enumerate() {
-        groups.entry(root(&mut parent, i)).or_default().push(*pin);
-    }
+    };
     let mut nets = Vec::new();
-    for pins in groups.into_values() {
+    for (pins, segment_ids) in partitions {
         let drivers: Vec<_> = pins
             .iter()
             .copied()
@@ -125,9 +310,19 @@ pub fn compile(document: &Document) -> Result<CompiledCircuit, CompileError> {
             .filter(|p| p.pin.direction == PinDirection::Input)
             .collect();
         if drivers.len() > 1 {
-            return Err(CompileError::MultipleDrivers { pins });
+            return Err(if geometric {
+                CompileError::GeometricMultipleDrivers { pins, segment_ids }
+            } else {
+                CompileError::MultipleDrivers { pins }
+            });
         }
         if drivers.is_empty() && !receivers.is_empty() {
+            if geometric {
+                if segment_ids.is_empty() && receivers.len() == 1 {
+                    return Err(CompileError::DisconnectedReceiver { pin: receivers[0] });
+                }
+                return Err(CompileError::FloatingReceiverNet { pins, segment_ids });
+            }
             return Err(CompileError::MissingDriver { pins });
         }
 
@@ -185,6 +380,100 @@ mod tests {
                 wires: crate::domain::Wiring::LegacyPinPairs(vec![])
             })
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn geometric_compilation_and_diagnostics_use_integer_endpoint_topology() {
+        use crate::geometric_wiring::{Point, Segment};
+        let input = component(1, ComponentKind::Input);
+        let output = component(2, ComponentKind::Output);
+        let input_pin = pin(1, PinDirection::Output, 0);
+        let output_pin = pin(2, PinDirection::Input, 0);
+        let a = crate::pin_geometry::pin_point(&input, input_pin.pin).unwrap();
+        let b = crate::pin_geometry::pin_point(&output, output_pin.pin).unwrap();
+        let mut doc = Document {
+            components: vec![input, output],
+            wires: Wiring::GeometricSegments(vec![Segment { id: 9, a, b }]),
+        };
+        assert!(compile(&doc).is_ok());
+        doc.wires = Wiring::GeometricSegments(vec![]);
+        assert_eq!(
+            compile(&doc),
+            Err(CompileError::DisconnectedReceiver { pin: output_pin })
+        );
+        doc.wires = Wiring::GeometricSegments(vec![
+            Segment {
+                id: 11,
+                a: Point::new(0, 0),
+                b: Point::new(10, 10),
+            },
+            Segment {
+                id: 12,
+                a: Point::new(10, 10),
+                b: Point::new(20, 20),
+            },
+        ]);
+        assert!(compile(&doc).is_err()); // the receiver pin is not at this remote wire
+        doc.wires = Wiring::GeometricSegments(vec![Segment {
+            id: 11,
+            a: Point::new(b.x + 10, b.y),
+            b,
+        }]);
+        assert!(matches!(
+            compile(&doc),
+            Err(CompileError::FloatingReceiverNet { .. })
+        ));
+    }
+
+    #[test]
+    fn geometric_multiple_driver_diagnostics_are_stably_located() {
+        use crate::geometric_wiring::Segment;
+        let a = component(4, ComponentKind::Input);
+        let mut b = component(2, ComponentKind::Input);
+        let pa = pin(4, PinDirection::Output, 0);
+        let pb = pin(2, PinDirection::Output, 0);
+        let point = crate::pin_geometry::pin_point(&a, pa.pin).unwrap();
+        b.position = a.position;
+        let doc = Document {
+            components: vec![a, b],
+            wires: Wiring::GeometricSegments(vec![Segment {
+                id: 44,
+                a: point,
+                b: crate::geometric_wiring::Point::new(point.x + 10, point.y),
+            }]),
+        };
+        assert!(
+            matches!(compile(&doc),Err(CompileError::GeometricMultipleDrivers{pins,segment_ids}) if pins==vec![pb,pa] && segment_ids==vec![44])
+        );
+    }
+
+    #[test]
+    fn geometric_validation_rejects_fractional_placements_and_bad_segments() {
+        let mut c = component(1, ComponentKind::Input);
+        c.position.x = 0.5;
+        let d = Document {
+            components: vec![c],
+            wires: Wiring::GeometricSegments(vec![]),
+        };
+        assert_eq!(
+            compile(&d),
+            Err(CompileError::FractionalPlacement {
+                component: ComponentId(1)
+            })
+        );
+        let c = component(1, ComponentKind::Input);
+        let d = Document {
+            components: vec![c],
+            wires: Wiring::GeometricSegments(vec![crate::geometric_wiring::Segment {
+                id: 7,
+                a: crate::geometric_wiring::Point::new(1, 1),
+                b: crate::geometric_wiring::Point::new(1, 1),
+            }]),
+        };
+        assert_eq!(
+            compile(&d),
+            Err(CompileError::ZeroLengthSegment { segment: 7 })
         );
     }
 
@@ -267,6 +556,36 @@ mod tests {
             ]),
         };
         assert!(compile(&multi).is_ok());
+    }
+
+    #[test]
+    fn geometric_feedback_cycles_remain_legal_for_existing_scheduler() {
+        let not = component(8, ComponentKind::Not);
+        let input = crate::pin_geometry::pin_point(
+            &not,
+            PinId {
+                direction: PinDirection::Input,
+                index: 0,
+            },
+        )
+        .unwrap();
+        let output = crate::pin_geometry::pin_point(
+            &not,
+            PinId {
+                direction: PinDirection::Output,
+                index: 0,
+            },
+        )
+        .unwrap();
+        let document = Document {
+            components: vec![not],
+            wires: Wiring::GeometricSegments(vec![crate::geometric_wiring::Segment {
+                id: 81,
+                a: input,
+                b: output,
+            }]),
+        };
+        assert!(compile(&document).is_ok());
     }
 
     #[test]

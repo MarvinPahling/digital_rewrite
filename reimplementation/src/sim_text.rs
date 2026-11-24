@@ -50,8 +50,22 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
         CompileError::WorkLimit => {
             format!("The circuit is too large to simulate (work limit {MAX_WORK}).")
         }
-        CompileError::GeometricWiring => {
-            "Geometric wiring must be migrated before simulation.".into()
+        CompileError::FractionalPlacement { component } => format!(
+            "{} has a fractional position; geometric compilation requires integer coordinates.",
+            component_name(document, *component)
+        ),
+        CompileError::InvalidPlacement { component } => format!(
+            "{} has an out-of-range or unsupported pin placement.",
+            component_name(document, *component)
+        ),
+        CompileError::ZeroLengthSegment { segment } => {
+            format!("Wire segment #{segment} has zero length.")
+        }
+        CompileError::DuplicateSegmentId { segment } => {
+            format!("Wire segment id #{segment} is duplicated.")
+        }
+        CompileError::GeometricWorkLimit => {
+            "Geometric connectivity exceeds its bounded work limit.".into()
         }
         CompileError::DuplicateComponent(id) => {
             format!("Component id #{} is used more than once.", id.0)
@@ -70,9 +84,30 @@ pub fn describe_compile_error(document: &Document, error: &CompileError) -> Stri
             "Nothing drives {}. Wire an output pin to it.",
             pin_list(document, pins)
         ),
+        CompileError::DisconnectedReceiver { pin } => {
+            format!("{} is disconnected.", pin_name(document, *pin))
+        }
+        CompileError::FloatingReceiverNet { pins, segment_ids } => format!(
+            "Receiver net has no driver: {} (segments {}).",
+            pin_list(document, pins),
+            segment_ids
+                .iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         CompileError::MultipleDrivers { pins } => format!(
             "Several outputs drive one net: {}. A net may have only one output.",
             pin_list(document, pins)
+        ),
+        CompileError::GeometricMultipleDrivers { pins, segment_ids } => format!(
+            "Several outputs drive one geometric net: {} (segments {}). A net may have only one output.",
+            pin_list(document, pins),
+            segment_ids
+                .iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }

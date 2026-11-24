@@ -1048,45 +1048,17 @@ impl Session {
         if self.runtime.is_some() {
             return Err(SessionDigError::SimulationActive);
         }
-        let legacy = self
-            .document
-            .wires
-            .legacy()
-            .map_err(|_| SessionDigError::GeometricMode)?;
-        let dig = formats::from_domain(&self.document).map_err(SessionDigError::Domain)?;
-        let recovered = formats::to_domain(&dig).map_err(SessionDigError::Domain)?;
-        let expected: std::collections::BTreeSet<_> = legacy
-            .iter()
-            .map(|wire| {
-                let mut endpoints = wire.endpoints;
-                endpoints.sort();
-                endpoints
-            })
-            .collect();
-        let actual: std::collections::BTreeSet<_> = recovered
-            .wires
-            .legacy()
-            .map_err(|_| SessionDigError::GeometricMode)?
-            .iter()
-            .map(|wire| {
-                let mut endpoints = wire.endpoints;
-                for endpoint in &mut endpoints {
-                    endpoint.component = self
-                        .document
-                        .components
-                        .get(endpoint.component.0 as usize)
-                        .map(|component| component.id)
-                        .unwrap_or(endpoint.component);
-                }
-                endpoints.sort();
-                endpoints
-            })
-            .collect();
-        if expected != actual {
-            return Err(SessionDigError::GeometryMigration(
-                "canonical routing changes pin connectivity",
-            ));
+        if !matches!(
+            self.document.wires,
+            crate::domain::Wiring::LegacyPinPairs(_)
+        ) {
+            return Err(SessionDigError::GeometricMode);
         }
+        let dig = formats::from_domain(&self.document).map_err(SessionDigError::Domain)?;
+        // The migration comparison is deliberately electrical-connectivity-only: incomplete
+        // documents need not pass driver validation in order to be migrated safely.
+        let expected = crate::simulation::logical_pin_partitions(&self.document)
+            .map_err(|_| SessionDigError::GeometryMigration("legacy connectivity is invalid"))?;
         if matches!(
             self.document.wires,
             crate::domain::Wiring::GeometricSegments(_)
@@ -1108,6 +1080,16 @@ impl Session {
                 .map_err(|_| {
                     SessionDigError::GeometryMigration("canonical routes cannot be normalized")
                 })?;
+        let mut candidate = self.document.clone();
+        candidate.wires = crate::domain::Wiring::GeometricSegments(normalized.clone());
+        let actual = crate::simulation::logical_pin_partitions(&candidate).map_err(|_| {
+            SessionDigError::GeometryMigration("normalized connectivity is invalid")
+        })?;
+        if expected != actual {
+            return Err(SessionDigError::GeometryMigration(
+                "normalization changes pin connectivity",
+            ));
+        }
         self.commit_geometric(normalized)
             .map_err(|_| SessionDigError::GeometryMigration("segment ID exhausted"))
     }
@@ -1418,11 +1400,121 @@ mod tests {
         assert_eq!(session.document(), &legacy);
         assert!(session.redo().is_ok());
         assert_eq!(session.document(), &geometric);
+        assert!(crate::simulation::compile(session.document()).is_ok());
+    }
+    #[test]
+    fn migration_rejects_topology_changed_by_final_collinear_normalization_atomically() {
+        use crate::domain::{PinDirection, PinId};
+        let center_for_pin = |kind| {
+            let offset =
+                crate::symbols::center_from_origin_offset(crate::symbols::SymbolStyle::Rect, kind)
+                    .unwrap();
+            Position {
+                x: 40.0 + offset[0],
+                y: offset[1],
+            }
+        };
+        let mut session = Session::default();
+        let left = session
+            .place(
+                ComponentKind::Input,
+                Position {
+                    x: crate::symbols::center_from_origin_offset(
+                        crate::symbols::SymbolStyle::Rect,
+                        ComponentKind::Input,
+                    )
+                    .unwrap()[0],
+                    y: 0.0,
+                },
+            )
+            .unwrap();
+        let middle = session
+            .place(ComponentKind::Output, center_for_pin(ComponentKind::Output))
+            .unwrap();
+        let right = session
+            .place(
+                ComponentKind::Input,
+                Position {
+                    x: 80.0
+                        + crate::symbols::center_from_origin_offset(
+                            crate::symbols::SymbolStyle::Rect,
+                            ComponentKind::Input,
+                        )
+                        .unwrap()[0],
+                    y: 0.0,
+                },
+            )
+            .unwrap();
+        let output = |component| PinRef {
+            component,
+            pin: PinId {
+                direction: PinDirection::Output,
+                index: 0,
+            },
+        };
+        let receiver = |component| PinRef {
+            component,
+            pin: PinId {
+                direction: PinDirection::Input,
+                index: 0,
+            },
+        };
+        session.connect([output(left), receiver(middle)]).unwrap();
+        session.connect([output(right), receiver(middle)]).unwrap();
+        let before = session.document().clone();
+        let undo = session.undo.clone();
+        let redo = session.redo.clone();
         assert!(matches!(
             crate::simulation::compile(session.document()),
-            Err(CompileError::GeometricWiring)
+            Err(CompileError::MultipleDrivers { .. })
         ));
+        assert!(matches!(
+            session.migrate_to_geometric_wiring(),
+            Err(SessionDigError::GeometryMigration(
+                "normalization changes pin connectivity"
+            ))
+        ));
+        assert_eq!(session.document(), &before);
+        assert_eq!(session.undo, undo);
+        assert_eq!(session.redo, redo);
     }
+
+    #[test]
+    fn migration_compares_connectivity_without_requiring_electrical_completeness() {
+        let mut session = Session::default();
+        session
+            .place(ComponentKind::Output, Position { x: 20.0, y: 40.0 })
+            .unwrap();
+        assert!(crate::simulation::compile(session.document()).is_err());
+        assert!(session.migrate_to_geometric_wiring().unwrap());
+        assert!(matches!(
+            session.document().wires,
+            crate::domain::Wiring::GeometricSegments(_)
+        ));
+        assert!(crate::simulation::compile(session.document()).is_err());
+    }
+
+    #[test]
+    fn migrated_geometric_document_runs_through_the_same_runtime() {
+        let mut session = simple_legacy_session();
+        session.migrate_to_geometric_wiring().unwrap();
+        let output = ComponentId(1);
+        let input = ComponentId(0);
+        session.start_running_for_test().unwrap();
+        session.settle_simulation(100).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::Low)
+        );
+        session.toggle_input(input).unwrap();
+        session.settle_simulation(100).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(output),
+            Some(crate::runtime::Level::High)
+        );
+        session.stop_simulation().unwrap();
+    }
+
     #[test]
     fn failed_or_locked_geometry_migration_preserves_session_state() {
         let mut invalid = Session::default();
@@ -1979,6 +2071,27 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+    #[test]
+    fn geometric_inverter_truth_table_uses_production_engine_runtime() {
+        let xml=b"<circuit><version>2</version><attributes/><visualElements><visualElement><elementName>In</elementName><elementAttributes/><pos x=\"0\" y=\"0\"/></visualElement><visualElement><elementName>Not</elementName><elementAttributes/><pos x=\"100\" y=\"0\"/></visualElement><visualElement><elementName>Out</elementName><elementAttributes/><pos x=\"200\" y=\"0\"/></visualElement></visualElements><wires><wire><p1 x=\"0\" y=\"0\"/><p2 x=\"100\" y=\"0\"/></wire><wire><p1 x=\"140\" y=\"0\"/><p2 x=\"200\" y=\"0\"/></wire></wires></circuit>";
+        let mut session = Session::default();
+        session.open_dig_bytes(xml).unwrap();
+        session.migrate_to_geometric_wiring().unwrap();
+        session.start_running_for_test().unwrap();
+        session.settle_simulation(100).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(ComponentId(2)),
+            Some(crate::runtime::Level::High)
+        );
+        session.toggle_input(ComponentId(0)).unwrap();
+        session.settle_simulation(100).unwrap();
+        assert_eq!(
+            session.inspect().unwrap().output_value(ComponentId(2)),
+            Some(crate::runtime::Level::Low)
+        );
+        session.stop_simulation().unwrap();
+    }
+
     #[test]
     fn wiring_validation_history_and_cascade() {
         use crate::domain::{PinDirection, PinId};

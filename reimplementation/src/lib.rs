@@ -6,6 +6,7 @@ pub mod engine;
 pub mod file_session;
 pub mod formats;
 pub mod geometric_wiring;
+pub mod pin_geometry;
 pub mod runtime;
 pub mod sim_text;
 pub mod simulation;
