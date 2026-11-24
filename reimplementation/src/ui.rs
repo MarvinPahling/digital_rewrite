@@ -864,6 +864,19 @@ impl DigitalApp {
                     .copied()
             })
     }
+    fn active_route_target(
+        &mut self,
+        pointer: Option<Pos2>,
+        rect: Rect,
+        transform: CanvasTransform,
+        pins: &[(PinRef, [f32; 2])],
+    ) -> Option<crate::engine::RouteTarget> {
+        pointer
+            .filter(|point| rect.contains(*point))
+            .and_then(|point| self.route_target_at(point, transform, pins))
+            .or(self.focused_route_target)
+            .or_else(|| self.focused_pin.map(crate::engine::RouteTarget::Pin))
+    }
     fn route_targets_at(
         &mut self,
         pointer: Pos2,
@@ -1936,7 +1949,12 @@ impl DigitalApp {
                     }
                 }
             if self.wiring {
-                if let Some(target) = self.focused_route_target
+                let pointer_route_target = ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .filter(|point| rect.contains(*point))
+                    .and_then(|point| self.route_target_at(point, transform, &pins));
+                let marker_target = pointer_route_target.or(self.focused_route_target);
+                if let Some(target) = marker_target
                     && let Some(point) = self.route_target_point(target)
                 {
                     painter.circle_stroke(
@@ -1965,20 +1983,20 @@ impl DigitalApp {
                         Stroke::new(2_f32, palette.selection),
                     );
                 }
-                if !cancelled && !pan_sequence
-                    && let Some(p) = response.hover_pos()
+                if !cancelled
+                    && !pan_sequence
+                    && response.hover_pos().is_some()
                     && let Some(start) = self.geometric_route_start
                     && let Some(a) = self.route_target_point(start)
+                    && let Some(b) = pointer_route_target
+                        .and_then(|target| self.route_target_point(target))
                 {
-                    let target = self.route_target_at(p, transform, &pins);
-                    if let Some(b) = target.and_then(|target| self.route_target_point(target)) {
-                        let points = digital_rust::geometric_wiring::plan_orthogonal_route(a, b, self.route_orientation);
-                        for pair in points.windows(2) {
-                            painter.line_segment(
-                                [transform.to_screen([pair[0].x as f32, pair[0].y as f32]), transform.to_screen([pair[1].x as f32, pair[1].y as f32])],
-                                Stroke::new(1_f32, palette.selection),
-                            );
-                        }
+                    let points = digital_rust::geometric_wiring::plan_orthogonal_route(a, b, self.route_orientation);
+                    for pair in points.windows(2) {
+                        painter.line_segment(
+                            [transform.to_screen([pair[0].x as f32, pair[0].y as f32]), transform.to_screen([pair[1].x as f32, pair[1].y as f32])],
+                            Stroke::new(1_f32, palette.selection),
+                        );
                     }
                 }
             }
@@ -2274,7 +2292,12 @@ impl DigitalApp {
                 }
                 if self.wiring
                     && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                    && let Some(target) = self.focused_route_target.or_else(|| self.focused_pin.map(crate::engine::RouteTarget::Pin))
+                    && let Some(target) = self.active_route_target(
+                        ctx.input(|i| i.pointer.hover_pos()),
+                        rect,
+                        transform,
+                        &pins,
+                    )
                 {
                     if self.route_target_point(target).is_some() {
                         self.choose_route_target(target);
@@ -2583,6 +2606,86 @@ mod tests {
             segments.to_vec()
         }
         assert_eq!(route_via_key(true), route_via_key(false));
+    }
+
+    #[test]
+    fn hover_target_and_enter_match_preview_and_pointer_commit_without_tab() {
+        use digital_rust::geometric_wiring::Point;
+
+        fn route_with_enter(enter: bool) -> Vec<digital_rust::geometric_wiring::Segment> {
+            let ctx = egui::Context::default();
+            let mut app = DigitalApp::default();
+            app.session
+                .add_geometric_segments(&[
+                    (Point::new(100, 200), Point::new(300, 200)),
+                    (Point::new(200, 100), Point::new(200, 300)),
+                    (Point::new(100, 100), Point::new(120, 100)),
+                ])
+                .unwrap();
+            frame(&ctx, &mut app, vec![], true);
+            click_at(&ctx, &mut app, Pos2::new(500., 400.));
+            frame(
+                &ctx,
+                &mut app,
+                vec![key(egui::Key::W, egui::Modifiers::NONE)],
+                true,
+            );
+            let rect = app.canvas_rect.unwrap();
+            let transform = app.view.transform(rect).unwrap();
+            let start_point = Point::new(120, 100);
+            let start = transform.to_screen([start_point.x as f32, start_point.y as f32]);
+            click_at(&ctx, &mut app, start);
+            let stale_focus = crate::engine::RouteTarget::ExistingEndpoint(start_point);
+            assert_eq!(app.focused_route_target, Some(stale_focus));
+
+            let target = crate::engine::RouteTarget::SegmentInterior {
+                segment_id: 0,
+                point: Point::new(200, 200),
+            };
+            let hover = transform.to_screen([200., 200.]);
+            let preview = frame(&ctx, &mut app, vec![egui::Event::PointerMoved(hover)], true);
+            assert_eq!(app.route_target_at(hover, transform, &[]), Some(target));
+            assert!(has_line(
+                &preview,
+                start,
+                transform.to_screen([200., 100.]),
+                1.
+            ));
+            assert!(has_line(
+                &preview,
+                transform.to_screen([200., 100.]),
+                hover,
+                1.
+            ));
+            assert!(
+                preview.shapes.iter().any(|clipped| matches!(
+                    &clipped.shape,
+                    egui::Shape::Circle(circle) if circle.center == hover && circle.radius == 9.0
+                )),
+                "selection marker follows the hovered preview target, not stale focus"
+            );
+
+            if enter {
+                frame(
+                    &ctx,
+                    &mut app,
+                    vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+                    true,
+                );
+            } else {
+                click_at(&ctx, &mut app, hover);
+            }
+            assert!(app.geometric_route_start.is_none());
+            let segments = app.session.document().wires.geometric().unwrap();
+            assert!(segments.iter().any(|segment| {
+                segment.id == 1
+                    && segment.a == Point::new(200, 100)
+                    && segment.b == Point::new(200, 300)
+            }));
+            segments.to_vec()
+        }
+
+        assert_eq!(route_with_enter(true), route_with_enter(false));
     }
 
     #[test]
