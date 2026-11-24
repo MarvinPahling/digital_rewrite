@@ -16,7 +16,30 @@ Compatibility target: Digital source `d118dce079b6b8867024d40f9b14dfa667e52106`;
 
 Final audit evidence for the simulator/history review blockers: the workflow observes nonzero pending startup inspection after the production Start click with a zero work budget, sees an immediate repaint while that work is still pending, and then observes bounded continuation finish after raising the injected budget; every polling loop has a frame cap. Microstep and Full step are each invoked from real pending work created by a visible input toggle. For each action the test records pending inspection before the click, confirms a zero-budget click did not consume it, resumes through production egui frames with budget 1, and verifies the pending inspection changes to empty together with the expected output transition. The second inverter remains unchanged until its own visible input toggle. The paste-cancel assertion now traverses the entire existing document history by visible Undo/Redo controls before and after cancellation and compares each exact document snapshot, rather than comparing `can_undo`/`can_redo` booleans. No production UI workflow was altered for test convenience; only the bounded service budget is injected.
 
-Final Rust test totals for this audit: **435 passed, 0 failed, 1 ignored** across compiled test harnesses (237 library, 162 native binary including the ignored developer-preview test, 3 CLI unit, 21 CLI integration, 6 M2 exit-gate, 6 trace integration; 0 doc tests). Counts are harness totals, not a count of unique behaviors. Final required checks after this documentation update: `cargo fmt --manifest-path reimplementation/Cargo.toml --all -- --check`, `cargo check --manifest-path reimplementation/Cargo.toml --all-targets`, `cargo test --manifest-path reimplementation/Cargo.toml`, and `cargo clippy --manifest-path reimplementation/Cargo.toml --all-targets -- -D warnings`.
+Final Rust checks for this audit were run from the mission worktree after the documentation update. Exact command outcomes and per-harness test result lines are recorded below; passing-test totals exclude ignored tests and doc-tests are reported separately. This is current audit evidence only: older counts later in this file are explicitly historical checkpoints and are not substituted for these results.
+
+```text
+$ cargo fmt --manifest-path reimplementation/Cargo.toml --all -- --check
+(exit 0; no output)
+$ cargo check --manifest-path reimplementation/Cargo.toml --all-targets
+(exit 0)
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: use `cargo report future-incompatibilities --id 1` to see the report
+$ cargo test --manifest-path reimplementation/Cargo.toml
+test result: ok. 237 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 162 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ cargo clippy --manifest-path reimplementation/Cargo.toml --all-targets -- -D warnings
+(exit 0)
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: use `cargo report future-incompatibilities --id 1` to see the report
+```
+
+The six compiled harnesses total **435 passed, 0 failed, 1 ignored** (237 library, 162 native binary, 3 CLI unit, 21 CLI integration, 6 M2 exit-gate, 6 trace integration); their pass sum is 237+162+3+21+6+6 = 435, excluding the ignored test. The ignored test is `symbol_sheet::write_symbol_sheet`, explicitly marked `ignored, developer preview; run with `just symbol-sheet``. Doc-tests are separate: **0 passed, 0 failed, 0 ignored**. These are harness totals, not unique behavior counts. The result lines above preserve the exact harness counts and omit volatile elapsed times. All four commands exited 0. `cargo check` and Clippy emitted the `block v0.1.6` future-incompatibility warning.
 
 | M4 checklist row (same order as root `ROADMAP.md`) | Audit status and evidence |
 | --- | --- |
