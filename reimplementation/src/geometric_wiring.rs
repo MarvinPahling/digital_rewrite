@@ -6,7 +6,8 @@ use crate::domain::Wire;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_SEGMENTS: usize = 30_000;
-pub const MAX_NORMALIZATION_WORK: usize = 80_000;
+/// Conservative bound covering source-pair checks, generated pieces and collinear merge scans.
+pub const MAX_NORMALIZATION_WORK: usize = 5_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Point {
@@ -78,6 +79,14 @@ impl Wiring {
 /// create vertices. Diagonal segments are retained (except duplicate edges) and only their
 /// endpoints can split another segment.
 pub fn normalize(input: &[Segment]) -> Result<Vec<Segment>, GeometryError> {
+    normalize_with_high_water(input, input.iter().map(|s| s.id).max().unwrap_or(0))
+}
+
+/// Normalize while reserving every ID at or below `high_water`, including retired IDs.
+pub fn normalize_with_high_water(
+    input: &[Segment],
+    high_water: u64,
+) -> Result<Vec<Segment>, GeometryError> {
     if input.len() > MAX_SEGMENTS {
         return Err(GeometryError::SegmentLimit);
     }
@@ -95,7 +104,17 @@ pub fn normalize(input: &[Segment]) -> Result<Vec<Segment>, GeometryError> {
         .checked_mul(input.len().saturating_sub(1))
         .and_then(|n| n.checked_div(2))
         .ok_or(GeometryError::WorkLimit)?;
-    if pairs > MAX_NORMALIZATION_WORK {
+    // Four endpoint predicates are evaluated per pair. Before allocating generated pieces, bound
+    // the worst-case cuts (two endpoints from each other segment) and later quadratic merge scan.
+    let max_pieces = input
+        .len()
+        .checked_mul(input.len().saturating_mul(2).saturating_add(1))
+        .ok_or(GeometryError::WorkLimit)?;
+    let preflight = pairs
+        .checked_mul(5)
+        .and_then(|n| n.checked_add(max_pieces))
+        .ok_or(GeometryError::WorkLimit)?;
+    if preflight > MAX_NORMALIZATION_WORK {
         return Err(GeometryError::WorkLimit);
     }
     let mut cuts: Vec<BTreeSet<Point>> = input.iter().map(|s| BTreeSet::from([s.a, s.b])).collect();
@@ -105,18 +124,27 @@ pub fn normalize(input: &[Segment]) -> Result<Vec<Segment>, GeometryError> {
             let b = input[j];
             // Endpoints lying on another segment are the only cross-segment split contacts.
             for p in [a.a, a.b] {
-                if on_segment(p, b) {
+                if on_segment(p, b) && (is_orthogonal(b) || p == b.a || p == b.b) {
                     cuts[j].insert(p);
                 }
             }
             for p in [b.a, b.b] {
-                if on_segment(p, a) {
+                if on_segment(p, a) && (is_orthogonal(a) || p == a.a || p == a.b) {
                     cuts[i].insert(p);
                 }
             }
             // Orthogonal proper crossings remain unconnected. Collinear overlap boundaries are
             // already endpoint cuts; adjacent intervals will be merged below.
         }
+    }
+    let piece_upper = cuts
+        .iter()
+        .try_fold(0usize, |count, points| {
+            count.checked_add(points.len().saturating_sub(1))
+        })
+        .ok_or(GeometryError::WorkLimit)?;
+    if piece_upper > MAX_SEGMENTS {
+        return Err(GeometryError::SegmentLimit);
     }
     let mut pieces: BTreeMap<(Point, Point), Vec<u64>> = BTreeMap::new();
     for (s, points) in input.iter().zip(cuts) {
@@ -130,6 +158,19 @@ pub fn normalize(input: &[Segment]) -> Result<Vec<Segment>, GeometryError> {
                     .push(s.id);
             }
         }
+    }
+    // Bound generated pieces and merge scans before invoking the merge's quadratic junction pass.
+    let merge_work = pieces
+        .len()
+        .checked_mul(pieces.len())
+        .ok_or(GeometryError::WorkLimit)?;
+    if pairs
+        .saturating_mul(5)
+        .saturating_add(pieces.len())
+        .saturating_add(merge_work)
+        > MAX_NORMALIZATION_WORK
+    {
+        return Err(GeometryError::WorkLimit);
     }
     // Join touching/overlapping horizontal and vertical intervals unless a different-orientation
     // endpoint establishes a junction there. Pieces remain distinct at branch points.
@@ -148,7 +189,7 @@ pub fn normalize(input: &[Segment]) -> Result<Vec<Segment>, GeometryError> {
     }
     // Ensure IDs are unique while preserving unchanged IDs and deterministic source ownership.
     let mut used = BTreeSet::new();
-    let mut next = input.iter().map(|s| s.id).max().unwrap_or(0);
+    let mut next = high_water.max(input.iter().map(|s| s.id).max().unwrap_or(0));
     for s in &mut out {
         if !used.insert(s.id) {
             next = next.checked_add(1).ok_or(GeometryError::IdExhausted)?;
@@ -174,6 +215,9 @@ fn along_key(p: Point, s: Segment) -> i128 {
         let dy = i128::from(s.b.y) - i128::from(s.a.y);
         (i128::from(p.x) - i128::from(s.a.x)) * dx + (i128::from(p.y) - i128::from(s.a.y)) * dy
     }
+}
+fn is_orthogonal(s: Segment) -> bool {
+    s.a.x == s.b.x || s.a.y == s.b.y
 }
 fn on_segment(p: Point, s: Segment) -> bool {
     let dx = i128::from(s.b.x) - i128::from(s.a.x);
@@ -331,17 +375,21 @@ impl GeometricSession {
             all.push(Segment { id: next, a, b });
             next = next.checked_add(1).ok_or(GeometryError::IdExhausted)?;
         }
-        let norm = normalize(&all)?;
+        let norm = normalize_with_high_water(&all, next.saturating_sub(1))?;
         if all.len() == self.wiring.geometric()?.len() || norm.is_empty() {
             return Ok(false);
         }
-        let changed = self.commit(Wiring::GeometricSegments(norm.clone()))?;
+        let following = norm
+            .iter()
+            .map(|s| s.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(GeometryError::IdExhausted)?
+            .max(next);
+        let changed = self.commit(Wiring::GeometricSegments(norm))?;
         if changed {
-            if let Some(following) = norm.iter().map(|s| s.id).max().unwrap_or(0).checked_add(1) {
-                self.next_id = following.max(next);
-            } else {
-                self.next_id = u64::MAX;
-            }
+            self.next_id = following;
         }
         Ok(changed)
     }
@@ -374,7 +422,7 @@ impl GeometricSession {
             a: point,
             b: segment.b,
         });
-        let candidate_segments = normalize(&all)?;
+        let candidate_segments = normalize_with_high_water(&all, self.next_id.saturating_sub(1))?;
         let maximum = candidate_segments.iter().map(|s| s.id).max().unwrap_or(0);
         let following = if let Some(following) = maximum.checked_add(1) {
             following.max(next)
@@ -389,10 +437,25 @@ impl GeometricSession {
     }
     /// Apply canonical overlap/contact merging as one document edit. Already-normalized input is
     /// a no-op and therefore preserves redo history and identifiers.
+    fn commit_segments(&mut self, segments: Vec<Segment>) -> Result<bool, GeometryError> {
+        let next = segments
+            .iter()
+            .map(|s| s.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(GeometryError::IdExhausted)?;
+        let changed = self.commit(Wiring::GeometricSegments(segments))?;
+        if changed {
+            self.next_id = self.next_id.max(next);
+        }
+        Ok(changed)
+    }
     pub fn merge_collinear(&mut self) -> Result<bool, GeometryError> {
         self.ensure_editable()?;
-        let candidate = Wiring::GeometricSegments(normalize(self.wiring.geometric()?)?);
-        self.commit(candidate)
+        let candidate =
+            normalize_with_high_water(self.wiring.geometric()?, self.next_id.saturating_sub(1))?;
+        self.commit_segments(candidate)
     }
     pub fn delete(&mut self, id: u64) -> Result<bool, GeometryError> {
         self.ensure_editable()?;
@@ -402,8 +465,8 @@ impl GeometricSession {
         if n == all.len() {
             return Ok(false);
         }
-        let candidate = Wiring::GeometricSegments(normalize(&all)?);
-        self.commit(candidate)
+        let candidate = normalize_with_high_water(&all, self.next_id.saturating_sub(1))?;
+        self.commit_segments(candidate)
     }
     pub fn move_segment(&mut self, id: u64, dx: i32, dy: i32) -> Result<bool, GeometryError> {
         self.ensure_editable()?;
@@ -414,7 +477,8 @@ impl GeometricSession {
         let shift = |p: Point| Some(Point::new(p.x.checked_add(dx)?, p.y.checked_add(dy)?));
         s.a = shift(s.a).ok_or(GeometryError::InvalidMigration("coordinate overflow"))?;
         s.b = shift(s.b).ok_or(GeometryError::InvalidMigration("coordinate overflow"))?;
-        self.commit(Wiring::GeometricSegments(normalize(&all)?))
+        let candidate = normalize_with_high_water(&all, self.next_id.saturating_sub(1))?;
+        self.commit_segments(candidate)
     }
     pub fn move_endpoint(
         &mut self,
@@ -435,7 +499,8 @@ impl GeometricSession {
         } else {
             s.b = p
         }
-        self.commit(Wiring::GeometricSegments(normalize(&all)?))
+        let candidate = normalize_with_high_water(&all, self.next_id.saturating_sub(1))?;
+        self.commit_segments(candidate)
     }
     pub fn undo(&mut self) -> Result<bool, GeometryError> {
         if self.locked {
@@ -499,6 +564,23 @@ mod tests {
                 .len(),
             1
         );
+        let diagonal = normalize(&[s(1, (0, 0), (10, 10)), s(2, (5, 5), (5, 0))]).unwrap();
+        assert_eq!(
+            diagonal.len(),
+            2,
+            "orthogonal endpoint must not cut diagonal interior"
+        );
+        assert!(
+            diagonal
+                .iter()
+                .any(|x| x.a == Point::new(0, 0) && x.b == Point::new(10, 10))
+        );
+        let diagonal_endpoint = normalize(&[s(1, (0, 0), (10, 0)), s(2, (5, 0), (10, 5))]).unwrap();
+        assert_eq!(
+            diagonal_endpoint.len(),
+            3,
+            "diagonal endpoint cuts orthogonal interior"
+        );
     }
     #[test]
     fn overlap_normalizes_deterministically_and_is_idempotent() {
@@ -552,10 +634,60 @@ mod tests {
         assert_eq!(editor.wiring().geometric().unwrap().len(), 1);
     }
     #[test]
+    fn normalization_ids_advance_high_water_and_never_reuse_retired_ids() {
+        let mut editor = GeometricSession::new();
+        editor
+            .add_batch(&[
+                (Point::new(0, 0), Point::new(10, 0)),
+                (Point::new(5, -5), Point::new(5, 5)),
+            ])
+            .unwrap();
+        assert!(editor.move_endpoint(1, 0, Point::new(5, 0)).unwrap());
+        let ids = editor
+            .wiring()
+            .geometric()
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect::<BTreeSet<_>>();
+        assert!(ids.contains(&2), "split must allocate ID 2: {ids:?}");
+        editor
+            .add_batch(&[(Point::new(20, 0), Point::new(21, 0))])
+            .unwrap();
+        let segments = editor.wiring().geometric().unwrap();
+        assert!(
+            segments
+                .iter()
+                .any(|s| s.a == Point::new(20, 0) && s.id >= 3)
+        );
+        editor
+            .delete(segments.iter().find(|s| s.id >= 3).unwrap().id)
+            .unwrap();
+        editor
+            .add_batch(&[(Point::new(30, 0), Point::new(31, 0))])
+            .unwrap();
+        assert!(
+            editor
+                .wiring()
+                .geometric()
+                .unwrap()
+                .iter()
+                .any(|s| s.id >= 4)
+        );
+    }
+
+    #[test]
     fn checked_limits() {
         let too_many = vec![s(0, (0, 0), (1, 0)); MAX_SEGMENTS + 1];
         assert_eq!(normalize(&too_many), Err(GeometryError::SegmentLimit));
-        let pair_work = (0..401)
+        let moderate = (0..401)
+            .map(|i| s(i, (0, i as i32), (1, i as i32)))
+            .collect::<Vec<_>>();
+        assert!(
+            normalize(&moderate).is_ok(),
+            "moderate circuits should exceed the old 400-edge cap"
+        );
+        let pair_work = (0..2_500)
             .map(|i| s(i, (0, i as i32), (1, i as i32)))
             .collect::<Vec<_>>();
         assert_eq!(normalize(&pair_work), Err(GeometryError::WorkLimit));
