@@ -7,6 +7,7 @@ use digital_rust::{
     },
     engine::Session,
     runtime::{Level, Runtime, SettleOutcome, SimulationOptions, StepOutcome},
+    signal::SignalValue,
     trace::{TraceEvent, TraceLog},
 };
 
@@ -58,11 +59,10 @@ fn settle(runtime: &mut Runtime, budget: usize) {
 }
 type CanonicalTraceEntry = (u8, u64, u8, u8, u8);
 
-fn level_code(level: Level) -> u8 {
+fn level_code(level: Option<SignalValue>) -> u8 {
     match level {
-        Level::Unavailable => 0,
-        Level::Low => 1,
-        Level::High => 2,
+        None => 0,
+        Some(value) => 1 + value.bits() as u8,
     }
 }
 fn gate_oracle(kind: K, a: bool, b: bool) -> bool {

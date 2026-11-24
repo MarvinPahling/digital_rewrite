@@ -20,13 +20,13 @@ pub enum TraceEvent {
     GateEvaluated {
         component: ComponentId,
         immediate: bool,
-        value: super::runtime::Level,
+        value: Option<crate::signal::SignalValue>,
     },
     NetPublished {
         net: usize,
         driver: PinRef,
-        old: super::runtime::Level,
-        new: super::runtime::Level,
+        old: Option<crate::signal::SignalValue>,
+        new: Option<crate::signal::SignalValue>,
     },
     FrontierComplete {
         startup: bool,
@@ -40,7 +40,7 @@ pub enum TraceEvent {
     },
     InputChanged {
         component: ComponentId,
-        value: bool,
+        value: crate::signal::SignalValue,
     },
     Stable,
     Terminal,
@@ -210,6 +210,15 @@ mod tests {
             [TraceEvent::Stop]
         );
     }
+    #[test]
+    fn typed_trace_payload_keeps_allocation_within_byte_ceiling() {
+        let bytes_per_record = size_of::<Option<TraceRecord>>();
+        let bytes = MAX_TRACE_CAPACITY.checked_mul(bytes_per_record).unwrap();
+        assert!(bytes <= MAX_TRACE_BYTES);
+        let log = TraceLog::new(MAX_TRACE_CAPACITY, 0, 0).unwrap();
+        assert_eq!(log.capacity(), MAX_TRACE_CAPACITY);
+    }
+
     #[test]
     fn sequence_headroom_accepts_maximum_once_then_rejects() {
         let mut trace = TraceLog::new(2, 0, 0).unwrap();

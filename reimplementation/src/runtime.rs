@@ -71,6 +71,20 @@ impl Level {
     fn from_bool(value: bool) -> Self {
         if value { Self::High } else { Self::Low }
     }
+
+    fn signal_value(self) -> Option<crate::signal::SignalValue> {
+        match self {
+            Self::Unavailable => None,
+            Self::Low => Some(crate::signal::SignalValue::known(
+                crate::signal::SignalWidth::ONE,
+                0,
+            )),
+            Self::High => Some(crate::signal::SignalValue::known(
+                crate::signal::SignalWidth::ONE,
+                1,
+            )),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -142,10 +156,16 @@ struct Gate {
 
 impl Gate {
     fn evaluate(&self, values: &[Level]) -> Level {
+        self.evaluate_signal(values)
+            .and_then(|value| value.as_bool().ok())
+            .map_or(Level::Unavailable, Level::from_bool)
+    }
+
+    fn evaluate_signal(&self, values: &[Level]) -> Option<crate::signal::SignalValue> {
         let a = values[self.inputs[0]];
         let b = values[self.inputs[1]];
         if a == Level::Unavailable || (self.kind != ComponentKind::Not && b == Level::Unavailable) {
-            return Level::Unavailable;
+            return None;
         }
         let value = |level| {
             crate::signal::SignalValue::known(
@@ -154,8 +174,6 @@ impl Gate {
             )
         };
         evaluate_signal_gate(self.kind, value(a), value(b))
-            .and_then(|value| value.as_bool().ok())
-            .map_or(Level::Unavailable, Level::from_bool)
     }
 }
 
@@ -185,7 +203,7 @@ fn evaluate_signal_gate(
 /// A microstep whose gates are being evaluated; nothing is published until all are done.
 struct Batch {
     gates: Vec<usize>,
-    staged: Vec<Level>,
+    staged: Vec<Option<crate::signal::SignalValue>>,
 }
 
 // The polarity descriptor is production infrastructure; no supported public component currently
@@ -753,7 +771,13 @@ impl Runtime {
         }
         self.values[net] = level;
         self.trace_stable = false;
-        self.trace_event(TraceEvent::InputChanged { component, value });
+        self.trace_event(TraceEvent::InputChanged {
+            component,
+            value: crate::signal::SignalValue::known(
+                crate::signal::SignalWidth::ONE,
+                u64::from(value),
+            ),
+        });
         self.schedule_consumers(net);
         Ok(InputChange::Changed)
     }
@@ -1175,7 +1199,7 @@ impl Runtime {
                 self.trace_event(TraceEvent::GateEvaluated {
                     component: gate_id,
                     immediate: true,
-                    value: level,
+                    value: level.signal_value(),
                 });
                 if !self.reset_is_held(net) && self.values[net] != level {
                     let old = self.values[net];
@@ -1189,8 +1213,8 @@ impl Runtime {
                                 index: 0,
                             },
                         },
-                        old,
-                        new: level,
+                        old: old.signal_value(),
+                        new: level.signal_value(),
                     });
                     for &consumer in &self.consumers[net] {
                         if !self.startup_queued[consumer] {
@@ -1230,8 +1254,8 @@ impl Runtime {
                             self.trace_event(TraceEvent::NetPublished {
                                 net,
                                 driver,
-                                old,
-                                new: released_level,
+                                old: old.signal_value(),
+                                new: released_level.signal_value(),
                             });
                         }
                         self.schedule_consumers(net);
@@ -1306,20 +1330,23 @@ impl Runtime {
             *batch.gates.get(batch.staged.len())?
         };
         let gate_id = self.gates[gate].id;
-        let value = self.gates[gate].evaluate(&self.values);
+        let signal_value = self.gates[gate].evaluate_signal(&self.values);
         self.trace_event(TraceEvent::GateEvaluated {
             component: gate_id,
             immediate: false,
-            value,
+            value: signal_value,
         });
         let batch = self.batch.as_mut()?;
-        batch.staged.push(value);
+        batch.staged.push(signal_value);
         if batch.staged.len() < batch.gates.len() {
             return None;
         }
         let batch = self.batch.take()?;
         let mut changed = Vec::new();
-        for (&gate, &level) in batch.gates.iter().zip(&batch.staged) {
+        for (&gate, &staged) in batch.gates.iter().zip(&batch.staged) {
+            let level = staged
+                .and_then(|signal| signal.as_bool().ok())
+                .map_or(Level::Unavailable, Level::from_bool);
             let net = self.gates[gate].output;
             if self.values[net] != level {
                 let old = self.values[net];
@@ -1333,8 +1360,8 @@ impl Runtime {
                             index: 0,
                         },
                     },
-                    old,
-                    new: level,
+                    old: old.signal_value(),
+                    new: level.signal_value(),
                 });
                 changed.push(net);
             }
@@ -3048,7 +3075,7 @@ mod tests {
                 phase: StartupPhase::ResetSettling
             }
         )));
-        assert!(rows.iter().any(|event| matches!(event, TraceEvent::NetPublished { net, new: Level::Low, .. } if *net == net_b)));
+        assert!(rows.iter().any(|event| matches!(event, TraceEvent::NetPublished { net, new, .. } if *net == net_b && *new == Some(crate::signal::SignalValue::known(crate::signal::SignalWidth::ONE, 0)))));
         let release = rows
             .iter()
             .rposition(|event| matches!(event, TraceEvent::ResetReleased { .. }))

@@ -170,7 +170,10 @@ fn trace_is_partition_invariant_capture_observational_and_retained_after_stop() 
     assert!(whole.trace().unwrap().records().any(|r| r.event
         == digital_rust::trace::TraceEvent::InputChanged {
             component: ComponentId(1),
-            value: true
+            value: digital_rust::signal::SignalValue::known(
+                digital_rust::signal::SignalWidth::ONE,
+                1,
+            )
         }));
     assert!(whole.trace().unwrap().records().any(|r| matches!(
         r.event,
@@ -179,6 +182,24 @@ fn trace_is_partition_invariant_capture_observational_and_retained_after_stop() 
             ..
         }
     )));
+    for record in whole.trace().unwrap().records() {
+        match record.event {
+            digital_rust::trace::TraceEvent::GateEvaluated {
+                value: Some(value), ..
+            }
+            | digital_rust::trace::TraceEvent::InputChanged { value, .. } => {
+                assert_eq!(value.width().get(), 1);
+                assert_eq!(value.high_z(), 0);
+            }
+            digital_rust::trace::TraceEvent::NetPublished { old, new, .. } => {
+                for value in [old, new].into_iter().flatten() {
+                    assert_eq!(value.width().get(), 1);
+                    assert_eq!(value.high_z(), 0);
+                }
+            }
+            _ => {}
+        }
+    }
 
     let mut session = Session::default();
     let id = session.place(K::Input, Position { x: 0., y: 0. }).unwrap();
