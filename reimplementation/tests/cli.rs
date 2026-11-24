@@ -862,3 +862,363 @@ fn trace_terminal_failure_reports_diagnostic_rows_without_settled_success() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("oscillat"));
     assert_eq!(fs::read(dir.0.join("ring.dig")).unwrap(), bytes);
 }
+
+// CLI geometry fixtures are serialized from explicit v2 endpoint coordinates, not routed_wires.
+type EndpointPair = ((i32, i32), (i32, i32));
+fn endpoint_fixture(
+    elements: &[(digital_rust::domain::ComponentKind, (i32, i32), &str)],
+    wires: &[EndpointPair],
+) -> Vec<u8> {
+    use digital_rust::formats::{DigElement, DigPoint, DigV2, DigWire};
+    let elements = elements
+        .iter()
+        .map(|(kind, (x, y), label)| DigElement {
+            name: kind.digital_name().into(),
+            x: *x,
+            y: *y,
+            label: Some((*label).into()),
+            value: None,
+        })
+        .collect();
+    let wires = wires
+        .iter()
+        .map(|(a, b)| DigWire {
+            p1: DigPoint { x: a.0, y: a.1 },
+            p2: DigPoint { x: b.0, y: b.1 },
+        })
+        .collect();
+    digital_rust::formats::serialize_v2(&DigV2 { elements, wires }).unwrap()
+}
+
+#[test]
+fn subprocess_geometric_fanout_crossings_junctions_and_pin_interior_contract() {
+    use digital_rust::domain::ComponentKind as K;
+    let dir = TempDir::new();
+    // A degree-four endpoint junction distributes one source to three receivers.
+    let fanout = endpoint_fixture(
+        &[
+            (K::Input, (0, 0), "source"),
+            (K::Output, (100, 0), "east"),
+            (K::Output, (50, 50), "south"),
+            (K::Output, (50, -50), "north"),
+        ],
+        &[
+            ((0, 0), (50, 0)),
+            ((50, 0), (100, 0)),
+            ((50, 0), (50, 50)),
+            ((50, 0), (50, -50)),
+        ],
+    );
+    fs::write(dir.0.join("fanout.dig"), &fanout).unwrap();
+    let opened = cli(&dir, &["open", "fanout.dig"]);
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let valid = cli(&dir, &["validate", "fanout.dig"]);
+    assert!(
+        valid.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&valid.stderr),
+        String::from_utf8_lossy(&opened.stdout)
+    );
+    for level in [0, 1] {
+        let simulated = cli(
+            &dir,
+            &["simulate", "fanout.dig", "--input", &format!("0={level}")],
+        );
+        assert!(
+            simulated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&simulated.stderr)
+        );
+        let rows = String::from_utf8(simulated.stdout).unwrap();
+        for id in [1, 2, 3] {
+            assert!(
+                rows.lines().any(|line| {
+                    line.contains(&format!("output id={id} label="))
+                        && line.ends_with(&format!("value={level}"))
+                }),
+                "expected output {id}={level} in {rows}"
+            );
+        }
+    }
+    assert_eq!(fs::read(dir.0.join("fanout.dig")).unwrap(), fanout);
+
+    // Two diagonal nets cross geometrically but have no common endpoint: input assignments
+    // reach their corresponding outputs independently.
+    let crossing = endpoint_fixture(
+        &[
+            (K::Input, (0, 0), "a"),
+            (K::Input, (0, 100), "b"),
+            (K::Output, (100, 100), "oa"),
+            (K::Output, (100, 0), "ob"),
+        ],
+        &[((0, 0), (100, 100)), ((0, 100), (100, 0))],
+    );
+    fs::write(dir.0.join("crossing.dig"), &crossing).unwrap();
+    let valid = cli(&dir, &["validate", "crossing.dig"]);
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    let run = cli(
+        &dir,
+        &[
+            "simulate",
+            "crossing.dig",
+            "--input",
+            "0=0",
+            "--input",
+            "1=1",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let rows = String::from_utf8(run.stdout).unwrap();
+    assert!(rows.contains("output id=2 label=\"oa\" value=0"), "{rows}");
+    assert!(rows.contains("output id=3 label=\"ob\" value=1"), "{rows}");
+    assert_eq!(fs::read(dir.0.join("crossing.dig")).unwrap(), crossing);
+
+    // Splitting BOTH crossing lines at their intersection explicitly creates a shared
+    // multi-driver net. It must fail validation with location and never print success rows.
+    let junction = endpoint_fixture(
+        &[
+            (K::Input, (0, 0), "a"),
+            (K::Input, (0, 100), "b"),
+            (K::Output, (100, 100), "oa"),
+            (K::Output, (100, 0), "ob"),
+        ],
+        &[
+            ((0, 0), (50, 50)),
+            ((50, 50), (100, 100)),
+            ((0, 100), (50, 50)),
+            ((50, 50), (100, 0)),
+        ],
+    );
+    fs::write(dir.0.join("junction.dig"), &junction).unwrap();
+    let failed = cli(&dir, &["validate", "junction.dig"]);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        diagnostic.contains("Several outputs") && diagnostic.contains("segments #"),
+        "{diagnostic}"
+    );
+    let failed = cli(&dir, &["simulate", "junction.dig"]);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert_eq!(fs::read(dir.0.join("junction.dig")).unwrap(), junction);
+
+    // Raw T contact and receiver-pin-on-interior are not implicit connections. Splitting
+    // the stored segment at that exact pin coordinate makes it an explicit endpoint.
+    let raw_t = endpoint_fixture(
+        &[
+            (K::Input, (0, 0), "driver"),
+            (K::Output, (50, 0), "receiver"),
+        ],
+        &[((0, 0), (100, 0))],
+    );
+    fs::write(dir.0.join("raw-t.dig"), &raw_t).unwrap();
+    let opened = cli(&dir, &["open", "raw-t.dig"]);
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let invalid = cli(&dir, &["validate", "raw-t.dig"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        diagnostic.contains("disconnected") || diagnostic.contains("no driver"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("Output")
+            && diagnostic.contains("#1")
+            && diagnostic.contains("input pin"),
+        "{diagnostic}"
+    );
+    let failed = cli(&dir, &["simulate", "raw-t.dig"]);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("input pin"));
+    let disconnected = endpoint_fixture(&[(K::Output, (300, 0), "isolated")], &[]);
+    fs::write(dir.0.join("disconnected.dig"), &disconnected).unwrap();
+    assert!(cli(&dir, &["open", "disconnected.dig"]).status.success());
+    for command in ["validate", "simulate"] {
+        let failed = cli(&dir, &[command, "disconnected.dig"]);
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(failed.stdout.is_empty());
+        let diagnostic = String::from_utf8_lossy(&failed.stderr);
+        assert!(
+            diagnostic.contains("Output")
+                && diagnostic.contains("#0")
+                && diagnostic.contains("input pin"),
+            "{diagnostic}"
+        );
+    }
+    assert_eq!(
+        fs::read(dir.0.join("disconnected.dig")).unwrap(),
+        disconnected
+    );
+    let split = endpoint_fixture(
+        &[
+            (K::Input, (0, 0), "driver"),
+            (K::Output, (50, 0), "receiver"),
+        ],
+        &[((0, 0), (50, 0)), ((50, 0), (100, 0))],
+    );
+    fs::write(dir.0.join("split-pin.dig"), &split).unwrap();
+    let run = cli(&dir, &["simulate", "split-pin.dig", "--input", "0=1"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("output id=1 label=\"receiver\" value=1")
+    );
+    assert_eq!(fs::read(dir.0.join("raw-t.dig")).unwrap(), raw_t);
+    assert_eq!(fs::read(dir.0.join("split-pin.dig")).unwrap(), split);
+}
+
+fn cli_adder_fixture(full: bool) -> Vec<u8> {
+    use digital_rust::domain::ComponentKind as K;
+    let mut parts: Vec<(K, (i32, i32), &str)> =
+        vec![(K::Input, (-100, 0), "a"), (K::Input, (-100, 40), "b")];
+    if full {
+        parts.push((K::Input, (-100, 80), "cin"));
+    }
+    let (xor1, and1) = if full { (3, 4) } else { (2, 3) };
+    parts.push((K::XOr, (0, 0), "xor1"));
+    parts.push((K::And, (0, 100), "and1"));
+    if full {
+        parts.extend([
+            (K::XOr, (200, 40), "xor2"),
+            (K::And, (200, 140), "and2"),
+            (K::Or, (400, 100), "or"),
+        ]);
+    }
+    let sum_id = parts.len();
+    parts.push((K::Output, if full { (300, 60) } else { (300, 20) }, "sum"));
+    let carry_id = parts.len();
+    parts.push((
+        K::Output,
+        if full { (500, 120) } else { (300, 120) },
+        "carry",
+    ));
+    let pin = |id: usize, input: Option<u8>| {
+        let (kind, (x, y), _) = parts[id];
+        let (px, py) = match (kind, input) {
+            (K::Input, _) | (K::Output, _) => (0, 0),
+            (K::And | K::XOr | K::Or, Some(1)) => (0, 40),
+            (K::And | K::XOr | K::Or, Some(_)) => (0, 0),
+            (K::And | K::XOr | K::Or, None) => (60, 20),
+            _ => unreachable!(),
+        };
+        (x + px, y + py)
+    };
+    let mut connections = vec![
+        (pin(0, None), pin(xor1, Some(0))),
+        (pin(0, None), pin(and1, Some(0))),
+        (pin(1, None), pin(xor1, Some(1))),
+        (pin(1, None), pin(and1, Some(1))),
+    ];
+    if full {
+        let xor2 = 5;
+        let and2 = 6;
+        let or = 7;
+        let cin = 2;
+        connections.extend([
+            (pin(xor1, None), pin(xor2, Some(0))),
+            (pin(xor1, None), pin(and2, Some(0))),
+            (pin(cin, None), pin(xor2, Some(1))),
+            (pin(cin, None), pin(and2, Some(1))),
+            (pin(and1, None), pin(or, Some(0))),
+            (pin(and2, None), pin(or, Some(1))),
+            (pin(xor2, None), pin(sum_id, Some(0))),
+            (pin(or, None), pin(carry_id, Some(0))),
+        ]);
+    } else {
+        connections.extend([
+            (pin(xor1, None), pin(sum_id, Some(0))),
+            (pin(and1, None), pin(carry_id, Some(0))),
+        ]);
+    }
+    let wires = connections;
+    endpoint_fixture(&parts, &wires)
+}
+
+#[test]
+fn subprocess_half_and_full_adder_truth_tables_open_validate_and_preserve_bytes() {
+    for full in [false, true] {
+        let dir = TempDir::new();
+        let path = if full {
+            "full-adder.dig"
+        } else {
+            "half-adder.dig"
+        };
+        let bytes = cli_adder_fixture(full);
+        fs::write(dir.0.join(path), &bytes).unwrap();
+        let opened = cli(&dir, &["open", path]);
+        assert!(
+            opened.status.success(),
+            "{}",
+            String::from_utf8_lossy(&opened.stderr)
+        );
+        let valid = cli(&dir, &["validate", path]);
+        assert!(
+            valid.status.success(),
+            "{}",
+            String::from_utf8_lossy(&valid.stderr)
+        );
+        let input_count = if full { 3 } else { 2 };
+        for row in 0..(1 << input_count) {
+            let mut args = vec!["simulate".to_owned(), path.to_owned()];
+            for input in 0..input_count {
+                args.push("--input".into());
+                args.push(format!("{input}={}", (row >> input) & 1));
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_digital-rust-cli"))
+                .args(&args)
+                .current_dir(&dir.0)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "row={row}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let a = row & 1 != 0;
+            let b = row & 2 != 0;
+            let cin = full && row & 4 != 0;
+            let sum = a ^ b ^ cin;
+            let carry = (a && b) || (a && cin) || (b && cin);
+            assert!(
+                stdout.contains(&format!(
+                    "output id={} label=\"sum\" value={}",
+                    if full { 8 } else { 4 },
+                    u8::from(sum)
+                )),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains(&format!(
+                    "output id={} label=\"carry\" value={}",
+                    if full { 9 } else { 5 },
+                    u8::from(carry)
+                )),
+                "{stdout}"
+            );
+        }
+        assert_eq!(fs::read(dir.0.join(path)).unwrap(), bytes);
+    }
+}
