@@ -3255,13 +3255,54 @@ mod tests {
             C::new(I::Label, V::Label("A  ".into())),
             C::new(I::WideShape, V::WideShape(true)),
             C::new(I::Rotation, V::Rotation(1)),
-            C::new(I::Mirror, V::Mirror(true)),
+            C::new(I::Mirror, V::Mirror(false)),
         ];
         assert_eq!(session.set_component_attributes(id, &patch), Ok(true));
         assert_eq!(session.undo.len(), undo_before + 1);
         let edited = session.document().components[0].clone();
         assert!(edited.wide_shape);
         assert_eq!(edited.label, "A  ");
+        // Original center (50,20), narrow center offset (30,20): logical origin is (20,0).
+        // A wide AND has local center offset (40,20), which rotates to (20,-40).
+        assert_eq!(edited.position, Position { x: 40., y: -40. });
+        assert_eq!(
+            (edited.position.x as i32 - 20, edited.position.y as i32 + 40),
+            (20, 0)
+        );
+        let layout = crate::symbol_render::SymbolLayout::oriented_config_on(
+            crate::symbols::DEFAULT_STYLE,
+            edited.kind,
+            [edited.position.x, edited.position.y],
+            crate::domain::Orientation {
+                rotation: 1,
+                mirror: false,
+            },
+            true,
+        )
+        .unwrap();
+        use crate::domain::{PinDirection as D, PinId};
+        assert_eq!(layout.origin(), [20., 0.]);
+        assert_eq!(
+            layout.pin_position(PinId {
+                direction: D::Input,
+                index: 0
+            }),
+            Some([20., 0.])
+        );
+        assert_eq!(
+            layout.pin_position(PinId {
+                direction: D::Input,
+                index: 1
+            }),
+            Some([60., 0.])
+        );
+        assert_eq!(
+            layout.pin_position(PinId {
+                direction: D::Output,
+                index: 0
+            }),
+            Some([40., -80.])
+        );
         let invalid = [
             C::new(I::Label, V::Label("would mutate".into())),
             C::new(I::Rotation, V::Rotation(4)),
@@ -3273,13 +3314,36 @@ mod tests {
         assert_eq!(session.undo.len(), undo);
         session.undo().unwrap();
         assert_eq!(session.document(), &base);
+        assert!(!session.redo.is_empty());
+        let redo_document = session.redo.clone();
+        let undo_document = session.undo.clone();
+        let saved_document = session.saved.clone();
+        let next_id = session.next_id;
+        let next_segment_id = session.next_segment_id;
+        let duplicate = [
+            C::new(I::Label, V::Label("first".into())),
+            C::new(I::Label, V::Label("second".into())),
+        ];
+        let wrong_type = [C::new(I::Label, V::Value(true))];
+        for invalid_patch in [&duplicate[..], &wrong_type[..], &invalid[..]] {
+            assert!(session.set_component_attributes(id, invalid_patch).is_err());
+            assert_eq!(session.document(), &base);
+            assert_eq!(session.undo, undo_document);
+            assert_eq!(session.redo, redo_document);
+            assert_eq!(session.saved, saved_document);
+            assert_eq!(session.next_id, next_id);
+            assert_eq!(session.next_segment_id, next_segment_id);
+        }
+        assert_eq!(session.set_label(id, &base.components[0].label), Ok(()));
+        assert_eq!(
+            session.redo, redo_document,
+            "no-op must preserve a live redo branch"
+        );
         session.redo().unwrap();
         assert_eq!(session.document().components[0], edited);
         session.undo().unwrap();
         session.set_label(id, "branch").unwrap();
-        let redo = session.redo.len();
-        assert_eq!(session.set_label(id, "branch"), Ok(()));
-        assert_eq!(session.redo.len(), redo);
+        assert!(session.redo.is_empty());
         assert!(matches!(
             session.set_component_attributes(ComponentId(999), &patch),
             Err(EditError::UnknownComponent)

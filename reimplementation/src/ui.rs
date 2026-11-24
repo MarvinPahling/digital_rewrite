@@ -902,32 +902,27 @@ impl DigitalApp {
         let Some(draft) = self.label_modal.as_ref().cloned() else {
             return;
         };
-        let mut changes = vec![
-            crate::components::AttributeChange::new(
-                crate::components::AttributeId::Label,
-                crate::components::AttributeValue::Label(draft.text.clone()),
-            ),
-            crate::components::AttributeChange::new(
-                crate::components::AttributeId::Rotation,
-                crate::components::AttributeValue::Rotation(draft.rotation),
-            ),
-            crate::components::AttributeChange::new(
-                crate::components::AttributeId::Mirror,
-                crate::components::AttributeValue::Mirror(draft.mirror),
-            ),
-        ];
-        if crate::components::has_attribute(draft.kind, crate::components::AttributeId::Value) {
-            changes.push(crate::components::AttributeChange::new(
-                crate::components::AttributeId::Value,
-                crate::components::AttributeValue::Value(draft.value),
-            ));
-        }
-        if crate::components::has_attribute(draft.kind, crate::components::AttributeId::WideShape) {
-            changes.push(crate::components::AttributeChange::new(
-                crate::components::AttributeId::WideShape,
-                crate::components::AttributeValue::WideShape(draft.wide_shape),
-            ));
-        }
+        let changes = crate::components::attribute_descriptors(draft.kind)
+            .into_iter()
+            .filter(|descriptor| descriptor.editable)
+            .filter_map(|descriptor| {
+                use crate::components::{
+                    AttributeId as Id, AttributeType as Type, AttributeValue as Value,
+                };
+                let value = match (descriptor.id, descriptor.value_type) {
+                    (Id::Label, Type::Text) => Value::Label(draft.text.clone()),
+                    (Id::Value, Type::Boolean) => Value::Value(draft.value),
+                    (Id::Mirror, Type::Boolean) => Value::Mirror(draft.mirror),
+                    (Id::WideShape, Type::Boolean) => Value::WideShape(draft.wide_shape),
+                    (Id::Rotation, Type::QuarterTurns) => Value::Rotation(draft.rotation),
+                    _ => return None,
+                };
+                Some(crate::components::AttributeChange::new(
+                    descriptor.id,
+                    value,
+                ))
+            })
+            .collect::<Vec<_>>();
         match self.session.set_component_attributes(draft.id, &changes) {
             Ok(_) => {
                 self.error = None;
@@ -1336,25 +1331,54 @@ impl DigitalApp {
             self.cancel_label_edit();
             return;
         }
-        if apply {
-            self.finish_label_edit();
-        }
         let mut action = None;
         egui::Modal::new(egui::Id::new("component_attributes_modal")).show(ctx, |ui| {
             ui.set_min_width(420.);
             if let Some(draft) = self.label_modal.as_mut() {
                 ui.heading(format!("Edit attributes — component #{}", draft.id.0));
-                ui.add(
-                    egui::TextEdit::multiline(&mut draft.text)
-                        .desired_rows(5)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Component label"),
-                );
-                ui.label(format!("Label: {} / 4096 UTF-8 bytes", draft.text.len()));
-                if crate::components::has_attribute(draft.kind, crate::components::AttributeId::Value) { ui.horizontal(|ui| { ui.label("Value"); ui.selectable_value(&mut draft.value, false, "LOW (0)"); ui.selectable_value(&mut draft.value, true, "HIGH (1)"); }); }
-                ui.horizontal(|ui| { ui.label("Rotation"); egui::ComboBox::from_id_salt("attribute_rotation").selected_text(["0°", "90°", "180°", "270°"][draft.rotation as usize]).show_ui(ui, |ui| { for (turn, label) in ["0°", "90°", "180°", "270°"].into_iter().enumerate() { ui.selectable_value(&mut draft.rotation, turn as u8, label); } }); ui.checkbox(&mut draft.mirror, "Mirror"); });
-                if crate::components::has_attribute(draft.kind, crate::components::AttributeId::WideShape) { ui.checkbox(&mut draft.wide_shape, "Wide shape"); }
-                ui.small("Inputs are fixed at 2; input inversion and Bits are not supported here. NOT wideShape uses different geometry and is unsupported.");
+                for descriptor in crate::components::attribute_descriptors(draft.kind) {
+                    use crate::components::{AttributeId as Id, AttributeType as Type};
+                    if !descriptor.editable {
+                        match (descriptor.id, descriptor.value_type) {
+                            (Id::Inputs, Type::InputCount) => ui.small("Inputs are fixed at 2 and cannot be edited here."),
+                            _ => ui.small(format!("{} is not editable here.", descriptor.name)),
+                        };
+                        continue;
+                    }
+                    match (descriptor.id, descriptor.value_type) {
+                        (Id::Label, Type::Text) => {
+                            ui.add(egui::TextEdit::multiline(&mut draft.text)
+                                .id(egui::Id::new(("component_attribute_label", draft.id.0)))
+                                .desired_rows(5)
+                                .desired_width(f32::INFINITY)
+                                .hint_text(descriptor.name));
+                            ui.label(format!("{}: {} / 4096 UTF-8 bytes", descriptor.name, draft.text.len()));
+                        }
+                        (Id::Value, Type::Boolean) => {
+                            ui.horizontal(|ui| {
+                                ui.label(descriptor.name);
+                                ui.selectable_value(&mut draft.value, false, "LOW (0)");
+                                ui.selectable_value(&mut draft.value, true, "HIGH (1)");
+                            });
+                        }
+                        (Id::Rotation, Type::QuarterTurns) => {
+                            ui.horizontal(|ui| {
+                                ui.label(descriptor.name);
+                                egui::ComboBox::from_id_salt(("attribute", draft.id.0, descriptor.id))
+                                    .selected_text(["0°", "90°", "180°", "270°"][draft.rotation as usize])
+                                    .show_ui(ui, |ui| {
+                                        for (turn, label) in ["0°", "90°", "180°", "270°"].into_iter().enumerate() {
+                                            ui.selectable_value(&mut draft.rotation, turn as u8, label);
+                                        }
+                                    });
+                            });
+                        }
+                        (Id::Mirror, Type::Boolean) => { ui.checkbox(&mut draft.mirror, descriptor.name); }
+                        (Id::WideShape, Type::Boolean) => { ui.checkbox(&mut draft.wide_shape, descriptor.name); }
+                        _ => { ui.small(format!("{} has an unsupported editor type and is not editable.", descriptor.name)); }
+                    }
+                }
+                ui.small("Input inversion and Bits are not supported here. NOT wideShape uses different geometry and is unsupported.");
                 if let Err(error) = crate::domain::validate_label(&draft.text) {
                     ui.colored_label(ui.visuals().error_fg_color, error.to_string());
                 }
@@ -1375,6 +1399,7 @@ impl DigitalApp {
         match action {
             Some(true) => self.finish_label_edit(),
             Some(false) => self.cancel_label_edit(),
+            None if apply => self.finish_label_edit(),
             None => {}
         }
     }
@@ -7996,9 +8021,9 @@ mod tests {
         for text in [
             "Edit attributes",
             "Label",
-            "Rotation",
-            "Mirror",
-            "Wide shape",
+            "rotation",
+            "mirror",
+            "wideShape",
             "Inputs are fixed at 2",
             "Apply",
             "Cancel",
@@ -8031,6 +8056,52 @@ mod tests {
             ),
             (0, false, false)
         );
+    }
+
+    #[test]
+    fn command_enter_applies_text_entered_in_the_same_frame() {
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        let id = app
+            .session
+            .place(ComponentKind::Output, Position { x: 100., y: 100. })
+            .unwrap();
+        app.selected = Some(id);
+        app.begin_label_edit();
+        let shown = frame(&ctx, &mut app, vec![], true);
+        let label_pos = shown
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Output" => Some(text.pos),
+                _ => None,
+            })
+            .expect("label text should be visible");
+        click_at(&ctx, &mut app, label_pos + Vec2::new(8., 8.));
+        ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new(("component_attribute_label", id.0)))
+        });
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::A, egui::Modifiers::COMMAND)],
+            true,
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::Text("Latest\nlabel".into()),
+                key(egui::Key::Enter, egui::Modifiers::COMMAND),
+            ],
+            true,
+        );
+        assert!(
+            app.label_modal.is_none(),
+            "Cmd+Enter should apply after widget input"
+        );
+        assert_eq!(app.session.document().components[0].label, "Latest\nlabel");
     }
 
     #[test]
