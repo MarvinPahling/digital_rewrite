@@ -193,6 +193,13 @@ fn fragment_preview_document(draft: &FragmentDraft) -> Result<Document, String> 
         {
             return Err("Placement offset exceeds supported component coordinates".into());
         }
+        let max_center = f64::from(crate::symbol_render::MAX_EXACT_SYMBOL_CENTER);
+        if x.abs() > max_center || y.abs() > max_center {
+            return Err(format!(
+                "Clipboard component center exceeds exact symbol-rendering range (±{} world units)",
+                crate::symbol_render::MAX_EXACT_SYMBOL_CENTER
+            ));
+        }
         component.position = Position {
             x: x as f32,
             y: y as f32,
@@ -559,6 +566,10 @@ impl DigitalApp {
             .geometric()
             .map(|segments| segments.iter().map(|segment| segment.id).collect())
             .unwrap_or_default();
+        if let Err(error) = fragment_preview_document(&draft) {
+            self.clipboard_error = Some(error);
+            return;
+        }
         match self.session.insert_clipboard_fragment(
             &draft.fragment,
             draft.delta[0],
@@ -630,6 +641,17 @@ impl DigitalApp {
         if digital_rust::formats::to_domain(&candidate).is_err() {
             self.clipboard_error =
                 Some("Clipboard rotation produces invalid component geometry".into());
+            return;
+        }
+        let candidate_draft = FragmentDraft {
+            fragment: candidate.clone(),
+            anchor: draft.anchor,
+            delta: draft.delta,
+            center_fallback: draft.center_fallback,
+            keyboard_adjusted: true,
+        };
+        if let Err(error) = fragment_preview_document(&candidate_draft) {
+            self.clipboard_error = Some(format!("Cannot rotate clipboard fragment: {error}"));
             return;
         }
         draft.fragment = candidate;
@@ -2789,9 +2811,21 @@ impl DigitalApp {
                     );
                 }
             }
-            if let Some(draft) = &self.fragment_draft
-                && let Ok(document) = fragment_preview_document(draft)
+            let draft_preview = self
+                .fragment_draft
+                .as_ref()
+                .map(fragment_preview_document);
+            if let Some(Err(error)) = &draft_preview {
+                self.clipboard_error = Some(error.clone());
+            } else if draft_preview.is_some()
+                && self.clipboard_error.as_deref().is_some_and(|error| {
+                    error.starts_with("Clipboard component center exceeds exact symbol-rendering range")
+                        || error.starts_with("Placement offset exceeds supported")
+                })
             {
+                self.clipboard_error = None;
+            }
+            if let Some(Ok(document)) = draft_preview {
                     for segment in document.wires.geometric().unwrap_or(&[]) {
                         painter.line_segment([
                             transform.to_screen_i32(segment.a.x, segment.a.y),
@@ -3400,6 +3434,93 @@ mod tests {
         assert_eq!(app.session.document().components.len(), 1);
         assert_eq!(app.selection.components.len(), 1);
         assert!(app.fragment_draft.is_none());
+    }
+
+    #[test]
+    fn clipboard_boundary_placement_refusal_is_transactional_for_click_and_enter() {
+        for commit_by_click in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = DigitalApp::default();
+            let not_offset =
+                digital_rust::pin_geometry::origin_to_center_offset(ComponentKind::Not).unwrap();
+            let fragment = digital_rust::formats::DigV2 {
+                elements: vec![digital_rust::formats::DigElement {
+                    name: "Not".into(),
+                    x: 1_048_560 - not_offset.0,
+                    y: -not_offset.1,
+                    label: None,
+                    value: None,
+                    rotation: 0,
+                    mirror: false,
+                }],
+                wires: vec![],
+            };
+            app.begin_fragment_draft(fragment, [20, 20], false).unwrap();
+            frame(&ctx, &mut app, vec![], true);
+            let draft = app.fragment_draft.as_mut().unwrap();
+            draft.delta = [20, 20];
+            draft.keyboard_adjusted = true;
+            assert_eq!(app.fragment_draft.as_ref().unwrap().delta, [20, 20]);
+            assert!(
+                fragment_preview_document(app.fragment_draft.as_ref().unwrap()).is_err(),
+                "preview: {:?}",
+                fragment_preview_document(app.fragment_draft.as_ref().unwrap())
+            );
+            app.selection.components.insert(ComponentId(42));
+            app.selected = Some(ComponentId(42));
+            let before_document = app.session.document().clone();
+            let before_selection = app.selection.clone();
+            let before_selected = app.selected;
+            if commit_by_click {
+                let pointer = app.canvas_rect.unwrap().center();
+                frame(
+                    &ctx,
+                    &mut app,
+                    vec![egui::Event::PointerMoved(pointer)],
+                    true,
+                );
+                frame(&ctx, &mut app, vec![button(pointer, true)], true);
+                let draft = app.fragment_draft.as_mut().unwrap();
+                draft.delta = [20, 20];
+                draft.keyboard_adjusted = true;
+                frame(&ctx, &mut app, vec![button(pointer, false)], true);
+            } else {
+                frame(
+                    &ctx,
+                    &mut app,
+                    vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+                    true,
+                );
+            }
+            assert_eq!(
+                app.fragment_draft.as_ref().map(|draft| draft.delta),
+                Some([20, 20]),
+                "commit must use the final rejected preview"
+            );
+            assert_eq!(app.session.document(), &before_document);
+            assert_eq!(app.selection, before_selection);
+            assert_eq!(app.selected, before_selected);
+            assert!(
+                app.fragment_draft.is_some(),
+                "invalid draft must remain available"
+            );
+            assert!(
+                app.clipboard_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("exact symbol-rendering range"))
+            );
+            assert!(!app.session.dirty());
+
+            // A refused placement must not consume the component ID or add history.
+            let draft = app.fragment_draft.as_mut().unwrap();
+            draft.delta = [0, 0];
+            draft.keyboard_adjusted = true;
+            app.clipboard_error = None;
+            app.commit_fragment_draft();
+            assert_eq!(app.session.document().components[0].id, ComponentId(0));
+            app.session.undo().unwrap();
+            assert_eq!(app.session.document(), &before_document);
+        }
     }
 
     #[test]
