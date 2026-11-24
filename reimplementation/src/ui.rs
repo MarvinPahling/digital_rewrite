@@ -42,6 +42,16 @@ const SETTLE_BUDGET_PER_FRAME: usize = 2_048;
 /// Shown wherever editing is disabled.
 const EDIT_LOCK_NOTE: &str =
     "Editing is locked while the simulation is running. Stop it (Shift+F5) to edit.";
+fn unique_route_targets(
+    targets: impl IntoIterator<Item = crate::engine::RouteTarget>,
+) -> Vec<crate::engine::RouteTarget> {
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .into_iter()
+        .filter(|target| seen.insert(*target))
+        .collect()
+}
+
 fn route_target_description(target: crate::engine::RouteTarget) -> String {
     match target {
         crate::engine::RouteTarget::Pin(pin) => format!(
@@ -510,6 +520,7 @@ impl DigitalApp {
         self.cancel_label_edit();
         self.pan_owner = None;
         self.selected = None;
+        self.selected_segment = None;
         self.cancel_gestures();
         self.failed_start = None;
         self.settling = false;
@@ -844,6 +855,21 @@ impl DigitalApp {
         transform: CanvasTransform,
         pins: &[(PinRef, [f32; 2])],
     ) -> Option<crate::engine::RouteTarget> {
+        let targets = self.route_targets_at(pointer, transform, pins);
+        self.focused_route_target
+            .filter(|target| targets.contains(target))
+            .or_else(|| {
+                targets
+                    .get(self.route_pick_cycle % targets.len().max(1))
+                    .copied()
+            })
+    }
+    fn route_targets_at(
+        &mut self,
+        pointer: Pos2,
+        transform: CanvasTransform,
+        pins: &[(PinRef, [f32; 2])],
+    ) -> Vec<crate::engine::RouteTarget> {
         use crate::engine::RouteTarget;
         use digital_rust::geometric_wiring::Point;
         let mut choices: Vec<(u8, f32, u64, u8, i32, i32, RouteTarget)> = Vec::new();
@@ -863,7 +889,7 @@ impl DigitalApp {
         }
         let Ok(segments) = self.session.document().wires.geometric() else {
             self.error = Some("Cannot pick route targets: invalid wire geometry".into());
-            return None;
+            return Vec::new();
         };
         for segment in segments {
             for endpoint in [segment.a, segment.b] {
@@ -938,14 +964,15 @@ impl DigitalApp {
                 .then(a.1.total_cmp(&b.1))
                 .then((a.2, a.3, a.4, a.5).cmp(&(b.2, b.3, b.4, b.5)))
         });
-        let priority = choices.first()?.0;
-        let ambiguous: Vec<_> = choices
-            .iter()
-            .filter(|choice| choice.0 == priority)
-            .collect();
-        ambiguous
-            .get(self.route_pick_cycle % ambiguous.len())
-            .map(|choice| choice.6)
+        let Some(priority) = choices.first().map(|choice| choice.0) else {
+            return Vec::new();
+        };
+        unique_route_targets(
+            choices
+                .into_iter()
+                .filter(|choice| choice.0 == priority)
+                .map(|choice| choice.6),
+        )
     }
     fn route_target_point(
         &mut self,
@@ -973,7 +1000,21 @@ impl DigitalApp {
                     }
                 }
             }
-            RouteTarget::ExistingEndpoint(point) => Some(point),
+            RouteTarget::ExistingEndpoint(point) => match self.session.document().wires.geometric()
+            {
+                Ok(segments)
+                    if segments
+                        .iter()
+                        .any(|segment| segment.a == point || segment.b == point) =>
+                {
+                    Some(point)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    self.error = Some(format!("Invalid wire route target: {error}"));
+                    None
+                }
+            },
             RouteTarget::SegmentInterior { segment_id, point } => {
                 match self.session.document().wires.geometric() {
                     Ok(segments)
@@ -2173,42 +2214,44 @@ impl DigitalApp {
                 let forwards =
                     ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
                 if backwards || forwards {
-                    if self.wiring && ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| rect.contains(p))) {
-                        self.route_pick_cycle = self.route_pick_cycle.wrapping_add(1);
-                    }
-                    let visible_pins: Vec<_> = pins
-                        .iter()
-                        .filter(|(_, p)| rect.contains(transform.to_screen(*p)))
-                        .collect();
                     if self.wiring {
-                        let mut targets: Vec<crate::engine::RouteTarget> = visible_pins.iter().map(|v| crate::engine::RouteTarget::Pin(v.0)).collect();
-                        match self.session.document().wires.geometric() {
-                            Ok(segments) => for segment in segments {
-                                for point in [segment.a, segment.b] {
-                                    if rect.contains(transform.to_screen([point.x as f32, point.y as f32])) {
-                                        targets.push(crate::engine::RouteTarget::ExistingEndpoint(point));
+                        let pointer = ctx.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p));
+                        let mut targets = pointer
+                            .map(|p| self.route_targets_at(p, transform, &pins))
+                            .filter(|targets| !targets.is_empty())
+                            .unwrap_or_default();
+                        if targets.is_empty() {
+                            let visible_pins: Vec<_> = pins
+                                .iter()
+                                .filter(|(_, p)| rect.contains(transform.to_screen(*p)))
+                                .collect();
+                            targets.extend(visible_pins.iter().map(|v| crate::engine::RouteTarget::Pin(v.0)));
+                            match self.session.document().wires.geometric() {
+                                Ok(segments) => for segment in segments {
+                                    for point in [segment.a, segment.b] {
+                                        if rect.contains(transform.to_screen([point.x as f32, point.y as f32])) {
+                                            targets.push(crate::engine::RouteTarget::ExistingEndpoint(point));
+                                        }
                                     }
-                                }
-                                let midpoint = digital_rust::geometric_wiring::Point::new(
-                                    ((i64::from(segment.a.x)+i64::from(segment.b.x))/2) as i32,
-                                    ((i64::from(segment.a.y)+i64::from(segment.b.y))/2) as i32);
-                                if (segment.a.x == segment.b.x || segment.a.y == segment.b.y)
-                                    && midpoint != segment.a
-                                    && midpoint != segment.b
-                                    && rect.contains(transform.to_screen([midpoint.x as f32, midpoint.y as f32])) {
-                                    targets.push(crate::engine::RouteTarget::SegmentInterior { segment_id: segment.id, point: midpoint });
-                                }
-                            },
-                            Err(error) => self.error = Some(format!("Cannot navigate wire targets: {error}")),
+                                    let midpoint = digital_rust::geometric_wiring::Point::new(
+                                        ((i64::from(segment.a.x)+i64::from(segment.b.x))/2) as i32,
+                                        ((i64::from(segment.a.y)+i64::from(segment.b.y))/2) as i32);
+                                    if (segment.a.x == segment.b.x || segment.a.y == segment.b.y)
+                                        && midpoint != segment.a
+                                        && midpoint != segment.b
+                                        && rect.contains(transform.to_screen([midpoint.x as f32, midpoint.y as f32])) {
+                                        targets.push(crate::engine::RouteTarget::SegmentInterior { segment_id: segment.id, point: midpoint });
+                                    }
+                                },
+                                Err(error) => self.error = Some(format!("Cannot navigate wire targets: {error}")),
+                            }
+                            targets = unique_route_targets(targets);
                         }
-                        let mut unique = Vec::new();
-                        targets.retain(|target| {
-                            if unique.contains(target) { false } else { unique.push(*target); true }
-                        });
                         if !targets.is_empty() {
                             let current = self.focused_route_target.and_then(|target| targets.iter().position(|v| *v == target));
                             let next = match current { Some(i) if backwards => (i+targets.len()-1)%targets.len(), Some(i)=>(i+1)%targets.len(), None if backwards=>targets.len()-1, None=>0 };
                             self.focused_route_target = Some(targets[next]);
+                            self.route_pick_cycle = next;
                             self.focused_pin = match targets[next] { crate::engine::RouteTarget::Pin(pin)=>Some(pin), _=>None };
                         }
                     } else if !self.wiring {
@@ -2233,7 +2276,14 @@ impl DigitalApp {
                     && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                     && let Some(target) = self.focused_route_target.or_else(|| self.focused_pin.map(crate::engine::RouteTarget::Pin))
                 {
-                    self.choose_route_target(target);
+                    if self.route_target_point(target).is_some() {
+                        self.choose_route_target(target);
+                    } else {
+                        self.focused_route_target = None;
+                        self.focused_pin = None;
+                        self.route_pick_cycle = 0;
+                        self.error = Some("Focused wire target is stale; select a current target".into());
+                    }
                 }
                 if let Some(id) = self.selected_segment
                     && !locked
@@ -2309,6 +2359,31 @@ impl eframe::App for DigitalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keyboard_target_dedup_scales_to_maximum_wire_candidate_count_and_keeps_order() {
+        use crate::engine::RouteTarget;
+        use digital_rust::geometric_wiring::Point;
+        let mut candidates = Vec::with_capacity(180_000);
+        for id in 0..30_000_u64 {
+            let x = (id * 10) as i32;
+            candidates.extend([
+                RouteTarget::ExistingEndpoint(Point::new(x, 0)),
+                RouteTarget::ExistingEndpoint(Point::new(x + 2, 0)),
+                RouteTarget::SegmentInterior {
+                    segment_id: id,
+                    point: Point::new(x + 1, 0),
+                },
+            ]);
+        }
+        let expected_first = candidates[0];
+        let expected_last = *candidates.last().unwrap();
+        candidates.extend_from_within(..90_000);
+        let unique = unique_route_targets(candidates);
+        assert_eq!(unique.len(), 90_000);
+        assert_eq!(unique.first(), Some(&expected_first));
+        assert_eq!(unique.last(), Some(&expected_last));
+    }
+
     #[test]
     fn wire_retry_and_cancel_are_non_destructive() {
         let mut app = DigitalApp::default();
@@ -2422,6 +2497,95 @@ mod tests {
         assert_eq!(app.session.document().wires.geometric().unwrap().len(), 5);
     }
     #[test]
+    fn keyboard_selected_crossing_agrees_with_marker_preview_enter_and_pointer_commit() {
+        use digital_rust::geometric_wiring::Point;
+        fn route_via_key(enter: bool) -> Vec<digital_rust::geometric_wiring::Segment> {
+            let ctx = egui::Context::default();
+            let mut app = DigitalApp::default();
+            app.session
+                .add_geometric_segments(&[
+                    (Point::new(100, 200), Point::new(300, 200)),
+                    (Point::new(200, 100), Point::new(200, 300)),
+                    (Point::new(100, 100), Point::new(120, 100)),
+                ])
+                .unwrap();
+            frame(&ctx, &mut app, vec![], true);
+            click_at(&ctx, &mut app, Pos2::new(500., 400.));
+            frame(
+                &ctx,
+                &mut app,
+                vec![key(egui::Key::W, egui::Modifiers::NONE)],
+                true,
+            );
+            let rect = app.canvas_rect.unwrap();
+            let transform = app.view.transform(rect).unwrap();
+            let start = transform.to_screen([120., 100.]);
+            let crossing = transform.to_screen([200., 200.]);
+            click_at(&ctx, &mut app, start);
+            assert_eq!(
+                app.geometric_route_start,
+                Some(crate::engine::RouteTarget::ExistingEndpoint(Point::new(
+                    120, 100
+                )))
+            );
+            frame(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(crossing),
+                    key(egui::Key::Tab, egui::Modifiers::NONE),
+                ],
+                true,
+            );
+            let selected = crate::engine::RouteTarget::SegmentInterior {
+                segment_id: 0,
+                point: Point::new(200, 200),
+            };
+            assert_eq!(app.focused_route_target, Some(selected));
+            assert_eq!(
+                app.route_target_at(crossing, transform, &[]),
+                Some(selected)
+            );
+            let preview = frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerMoved(crossing)],
+                true,
+            );
+            let route = digital_rust::geometric_wiring::plan_orthogonal_route(
+                Point::new(120, 100),
+                Point::new(200, 200),
+                app.route_orientation,
+            );
+            assert!(route.windows(2).all(|pair| has_line(
+                &preview,
+                transform.to_screen([pair[0].x as f32, pair[0].y as f32]),
+                transform.to_screen([pair[1].x as f32, pair[1].y as f32]),
+                1.0,
+            )));
+            if enter {
+                frame(
+                    &ctx,
+                    &mut app,
+                    vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+                    true,
+                );
+            } else {
+                click_at(&ctx, &mut app, crossing);
+            }
+            assert!(app.geometric_route_start.is_none());
+            let segments = app.session.document().wires.geometric().unwrap();
+            assert!(
+                segments.iter().any(|s| s.id == 1
+                    && s.a == Point::new(200, 100)
+                    && s.b == Point::new(200, 300))
+            );
+            segments.to_vec()
+        }
+        assert_eq!(route_via_key(true), route_via_key(false));
+    }
+
+    #[test]
     fn crossing_target_cycle_is_explicit_and_route_does_not_split_other_crossing_wire() {
         use digital_rust::geometric_wiring::Point;
         let ctx = egui::Context::default();
@@ -2461,13 +2625,46 @@ mod tests {
             ],
             true,
         );
+        let selected = crate::engine::RouteTarget::SegmentInterior {
+            segment_id: 1,
+            point: Point::new(200, 200),
+        };
+        assert_eq!(app.focused_route_target, Some(selected));
         assert_eq!(
             app.route_target_at(crossing, transform, &[]),
-            Some(crate::engine::RouteTarget::SegmentInterior {
-                segment_id: 1,
-                point: Point::new(200, 200)
-            }),
-            "Tab exposes the other coincident segment without changing route start"
+            Some(selected)
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(crossing),
+                key(egui::Key::Tab, egui::Modifiers::SHIFT),
+            ],
+            true,
+        );
+        let backwards = crate::engine::RouteTarget::SegmentInterior {
+            segment_id: 0,
+            point: Point::new(200, 200),
+        };
+        assert_eq!(app.focused_route_target, Some(backwards));
+        assert_eq!(
+            app.route_target_at(crossing, transform, &[]),
+            Some(backwards)
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(crossing),
+                key(egui::Key::Tab, egui::Modifiers::NONE),
+            ],
+            true,
+        );
+        assert_eq!(app.focused_route_target, Some(selected));
+        assert_eq!(
+            app.route_target_at(crossing, transform, &[]),
+            Some(selected)
         );
         let endpoint = transform.to_screen([100., 100.]);
         click_at(&ctx, &mut app, endpoint);
@@ -2479,6 +2676,62 @@ mod tests {
             "nonselected crossing segment remains unsplit and disconnected"
         );
     }
+    #[test]
+    fn keyboard_rebuilds_candidates_when_the_focused_route_target_becomes_stale() {
+        use digital_rust::geometric_wiring::Point;
+        let ctx = egui::Context::default();
+        let mut app = DigitalApp::default();
+        app.session
+            .add_geometric_segments(&[
+                (Point::new(100, 200), Point::new(300, 200)),
+                (Point::new(200, 100), Point::new(200, 300)),
+            ])
+            .unwrap();
+        frame(&ctx, &mut app, vec![], true);
+        click_at(&ctx, &mut app, Pos2::new(500., 400.));
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::W, egui::Modifiers::NONE)],
+            true,
+        );
+        let rect = app.canvas_rect.unwrap();
+        let transform = app.view.transform(rect).unwrap();
+        let crossing = transform.to_screen([200., 200.]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(crossing),
+                key(egui::Key::Tab, egui::Modifiers::NONE),
+            ],
+            true,
+        );
+        assert_eq!(
+            app.focused_route_target,
+            Some(crate::engine::RouteTarget::SegmentInterior {
+                segment_id: 0,
+                point: Point::new(200, 200),
+            })
+        );
+        app.session.delete_geometric_segment(0).unwrap();
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(crossing),
+                key(egui::Key::Tab, egui::Modifiers::NONE),
+            ],
+            true,
+        );
+        let current = crate::engine::RouteTarget::SegmentInterior {
+            segment_id: 1,
+            point: Point::new(200, 200),
+        };
+        assert_eq!(app.focused_route_target, Some(current));
+        assert_eq!(app.route_target_at(crossing, transform, &[]), Some(current));
+    }
+
     #[test]
     fn keyboard_can_start_a_route_at_an_existing_segment_midpoint() {
         use digital_rust::geometric_wiring::Point;
@@ -5218,6 +5471,46 @@ mod tests {
         );
         assert!(segments.iter().all(|s| s.a.x == s.b.x || s.a.y == s.b.y));
         assert!(app.session.dirty());
+    }
+
+    #[test]
+    fn opening_replacement_clears_selected_segment_before_delete_shortcut() {
+        use digital_rust::geometric_wiring::Point;
+        let ctx = egui::Context::default();
+        let dir = test_dir("open-clears-wire-selection");
+        let mut app = ui_file_app(&dir);
+        app.session
+            .add_geometric_segments(&[(Point::new(100, 100), Point::new(300, 100))])
+            .unwrap();
+        let rect = camera_rect(&ctx, &mut app);
+        let transform = app.view.transform(rect).unwrap();
+        click_at(&ctx, &mut app, transform.to_screen([200., 100.]));
+        assert_eq!(app.selected_segment, Some(0));
+
+        let mut destination = Session::default();
+        destination
+            .add_geometric_segments(&[(Point::new(500, 500), Point::new(700, 500))])
+            .unwrap();
+        destination
+            .save_as(
+                app.file_io.as_mut().unwrap().as_mut(),
+                std::path::Path::new("replacement.dig"),
+                SaveAsIntent::CreateOnly,
+            )
+            .unwrap();
+
+        app.open_path_dialog();
+        type_file_path(&ctx, &mut app, "replacement.dig");
+        click_text(&ctx, &mut app, "Open path");
+        if matches!(app.file_modal, Some(FileModal::Unsaved)) {
+            click_text(&ctx, &mut app, "Discard");
+        }
+        assert_eq!(app.session.document().wires.geometric().unwrap().len(), 1);
+        assert_eq!(app.session.document().wires.geometric().unwrap()[0].id, 0);
+        press(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
+        assert_eq!(app.session.document().wires.geometric().unwrap().len(), 1);
+        assert_eq!(app.selected_segment, None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

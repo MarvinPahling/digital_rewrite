@@ -37,7 +37,7 @@ pub struct Session {
 }
 /// A wire-routing endpoint chosen by the user. Interior targets name the exact segment to split,
 /// so a click at a crossing never implicitly joins both wires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RouteTarget {
     Pin(PinRef),
     ExistingEndpoint(crate::geometric_wiring::Point),
@@ -188,6 +188,16 @@ fn normalize_document_segments(
     }
     crate::geometric_wiring::normalize_with_high_water_preserving(segments, high_water, &pins)
         .map_err(EditError::Geometry)
+}
+
+fn validate_component_pin_geometry(component: &Component) -> Result<(), EditError> {
+    crate::pin_geometry::all_pin_points(component)
+        .map(|_| ())
+        .map_err(|_| {
+            EditError::Geometry(crate::geometric_wiring::GeometryError::InvalidGeometry(
+                "component pin is not exactly representable",
+            ))
+        })
 }
 
 fn valid_geometric_position(position: Position) -> bool {
@@ -696,16 +706,19 @@ impl Session {
             return Err(EditError::InvalidPosition);
         }
         let id = ComponentId(self.next_id);
-        self.next_id = self.next_id.checked_add(1).ok_or(EditError::IdExhausted)?;
+        let next_id = self.next_id.checked_add(1).ok_or(EditError::IdExhausted)?;
         let mut next = self.document.clone();
-        next.components.push(Component {
+        let component = Component {
             id,
             kind,
             position,
             label: kind.name().into(),
             constant_value: true,
-        });
+        };
+        validate_component_pin_geometry(&component)?;
+        next.components.push(component);
         self.edit(next);
+        self.next_id = next_id;
         Ok(id)
     }
     /// Set a constant's configured one-bit level; runtime values are independent.
@@ -773,6 +786,7 @@ impl Session {
             .ok_or(EditError::UnknownComponent)?;
         if component.position != position {
             component.position = position;
+            validate_component_pin_geometry(component)?;
             self.edit(next);
         }
         Ok(())
@@ -2009,29 +2023,131 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_origin_refuses_save_without_io_or_clean_mark() {
-        use crate::file_session::SaveAsIntent;
+    fn unrepresentable_origin_move_is_rejected_before_session_mutation() {
         let mut session = Session::default();
         let id = session
             .place(ComponentKind::XOr, Position { x: 0.0, y: 0.0 })
             .unwrap();
-        session
-            .move_component(
+        let document = session.document().clone();
+        let undo = session.undo.clone();
+        let next_id = session.next_id;
+        assert!(matches!(
+            session.move_component(
                 id,
                 Position {
                     x: i32::MIN as f32,
                     y: 0.0,
                 },
-            )
-            .unwrap();
-        assert!(session.dirty());
-        let mut io = NoFileAccess;
-        assert!(matches!(
-            session.save_as(&mut io, Path::new("refused.dig"), SaveAsIntent::Replace),
-            Err(SaveError::Codec(SessionDigError::Domain(_)))
+            ),
+            Err(EditError::Geometry(_))
         ));
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo, undo);
+        assert_eq!(session.next_id, next_id);
         assert!(session.dirty());
         assert!(session.path().is_none());
+    }
+
+    #[test]
+    fn place_and_move_reject_unrepresentable_pin_origins_transactionally() {
+        let mut session = Session::default();
+        let input = session
+            .place(ComponentKind::Input, Position { x: 18., y: 0. })
+            .unwrap();
+        let id = session
+            .place(ComponentKind::Not, Position { x: 40., y: 0. })
+            .unwrap();
+        let output = session
+            .place(ComponentKind::Output, Position { x: 98., y: 0. })
+            .unwrap();
+        let pin = |component, direction, index| PinRef {
+            component,
+            pin: crate::domain::PinId { direction, index },
+        };
+        session
+            .connect([
+                pin(input, crate::domain::PinDirection::Output, 0),
+                pin(id, crate::domain::PinDirection::Input, 0),
+            ])
+            .unwrap();
+        session
+            .connect([
+                pin(id, crate::domain::PinDirection::Output, 0),
+                pin(output, crate::domain::PinDirection::Input, 0),
+            ])
+            .unwrap();
+        session
+            .place(ComponentKind::Const, Position { x: 300., y: 300. })
+            .unwrap();
+        session.undo().unwrap();
+        session
+            .start_simulation_with_trace(SimulationOptions::default(), 32)
+            .unwrap();
+        session.settle_simulation(100).unwrap();
+        session.stop_simulation().unwrap();
+        session.oscillation_diagnostic = Some(OscillationDiagnostic {
+            threshold: 4,
+            steps: 5,
+            components: Vec::new(),
+        });
+        let trace_state = |trace: &TraceLog| {
+            (
+                trace.header,
+                trace.records().collect::<Vec<_>>(),
+                trace.dropped(),
+                trace.has_unrecorded_stop(),
+            )
+        };
+        let trace = session.trace.as_ref().map(trace_state);
+        let diagnostic = session.oscillation_diagnostic.clone();
+        let document = session.document().clone();
+        let undo = session.undo.clone();
+        let redo = session.redo.clone();
+        let next_id = session.next_id;
+
+        assert!(matches!(
+            session.place(
+                ComponentKind::Not,
+                Position {
+                    x: i32::MIN as f32,
+                    y: 0.
+                }
+            ),
+            Err(EditError::Geometry(_))
+        ));
+        assert!(matches!(
+            session.move_component(
+                id,
+                Position {
+                    x: i32::MIN as f32,
+                    y: 0.
+                }
+            ),
+            Err(EditError::Geometry(_))
+        ));
+        assert_eq!(session.document(), &document);
+        assert_eq!(session.undo, undo);
+        assert_eq!(session.redo, redo);
+        assert_eq!(session.next_id, next_id);
+        assert_eq!(session.oscillation_diagnostic, diagnostic);
+        assert_eq!(session.trace.as_ref().map(trace_state), trace);
+
+        // Large exactly representable coordinates remain valid when all derived pins fit i32.
+        let large = Position {
+            x: 16_777_216.,
+            y: 1_000_000_000.,
+        };
+        session.move_component(id, large).unwrap();
+        assert_eq!(
+            session
+                .document()
+                .components
+                .iter()
+                .find(|component| component.id == id)
+                .unwrap()
+                .position,
+            large
+        );
     }
 
     #[test]
