@@ -183,6 +183,24 @@ impl std::fmt::Display for SimulationError {
     }
 }
 impl std::error::Error for SimulationError {}
+fn normalize_document_segments(
+    document: &Document,
+    segments: &[crate::geometric_wiring::Segment],
+    high_water: u64,
+) -> Result<Vec<crate::geometric_wiring::Segment>, EditError> {
+    let mut pins = Vec::new();
+    for component in &document.components {
+        let resolved = crate::pin_geometry::all_pin_points(component).map_err(|_| {
+            EditError::Geometry(crate::geometric_wiring::GeometryError::InvalidMigration(
+                "component pin is not exactly representable",
+            ))
+        })?;
+        pins.extend(resolved.into_iter().map(|(_, point)| point));
+    }
+    crate::geometric_wiring::normalize_with_high_water_preserving(segments, high_water, &pins)
+        .map_err(EditError::Geometry)
+}
+
 fn integer_point_on_segment(
     p: crate::geometric_wiring::Point,
     a: crate::geometric_wiring::Point,
@@ -953,23 +971,46 @@ impl Session {
                 crate::geometric_wiring::GeometryError::SegmentLimit,
             ));
         }
-        let mut segments = existing.to_vec();
-        let mut next_id = self.next_segment_id;
+        let mut split_points = std::collections::BTreeMap::<
+            u64,
+            std::collections::BTreeSet<crate::geometric_wiring::Point>,
+        >::new();
         for (segment_id, point) in splits {
-            let index = segments
-                .iter()
-                .position(|s| s.id == segment_id)
-                .ok_or(EditError::InvalidRouteTarget)?;
-            let old = segments[index];
-            segments[index].b = point;
-            segments.push(crate::geometric_wiring::Segment {
-                id: next_id,
-                a: point,
-                b: old.b,
+            split_points.entry(segment_id).or_default().insert(point);
+        }
+        let mut segments = Vec::with_capacity(existing.len() + points.len());
+        let mut next_id = self.next_segment_id;
+        for old in existing {
+            let Some(cuts) = split_points.remove(&old.id) else {
+                segments.push(*old);
+                continue;
+            };
+            let dx = i128::from(old.b.x) - i128::from(old.a.x);
+            let dy = i128::from(old.b.y) - i128::from(old.a.y);
+            let mut ordered = vec![old.a];
+            ordered.extend(cuts);
+            ordered.push(old.b);
+            ordered.sort_by_key(|point| {
+                (i128::from(point.x) - i128::from(old.a.x)) * dx
+                    + (i128::from(point.y) - i128::from(old.a.y)) * dy
             });
-            next_id = next_id.checked_add(1).ok_or(EditError::Geometry(
-                crate::geometric_wiring::GeometryError::IdExhausted,
-            ))?;
+            ordered.dedup();
+            for (index, pair) in ordered.windows(2).enumerate() {
+                let id = if index == 0 {
+                    old.id
+                } else {
+                    let id = next_id;
+                    next_id = next_id.checked_add(1).ok_or(EditError::Geometry(
+                        crate::geometric_wiring::GeometryError::IdExhausted,
+                    ))?;
+                    id
+                };
+                segments.push(crate::geometric_wiring::Segment {
+                    id,
+                    a: pair[0],
+                    b: pair[1],
+                });
+            }
         }
         for pair in points.windows(2) {
             if pair[0] == pair[1] {
@@ -1020,9 +1061,7 @@ impl Session {
                 crate::geometric_wiring::GeometryError::IdExhausted,
             ))?;
         }
-        let normalized =
-            crate::geometric_wiring::normalize_with_high_water(&all, self.next_segment_id)
-                .map_err(EditError::Geometry)?;
+        let normalized = normalize_document_segments(&self.document, &all, self.next_segment_id)?;
         if normalized == existing {
             return Ok(false);
         }
@@ -1041,10 +1080,7 @@ impl Session {
         if segments.len() == count {
             return Ok(false);
         }
-        let normalized =
-            crate::geometric_wiring::normalize_with_high_water(&segments, self.next_segment_id)
-                .map_err(EditError::Geometry)?;
-        self.commit_geometric(normalized)
+        self.commit_geometric(segments)
     }
     pub fn move_geometric_segment(&mut self, id: u64, dx: i32, dy: i32) -> Result<bool, EditError> {
         self.ensure_editable()?;
@@ -1073,8 +1109,7 @@ impl Session {
             crate::geometric_wiring::GeometryError::InvalidMigration("coordinate overflow"),
         ))?;
         let normalized =
-            crate::geometric_wiring::normalize_with_high_water(&segments, self.next_segment_id)
-                .map_err(EditError::Geometry)?;
+            normalize_document_segments(&self.document, &segments, self.next_segment_id)?;
         self.commit_geometric(normalized)
     }
     pub fn move_geometric_endpoint(
@@ -1110,8 +1145,7 @@ impl Session {
             segment.b = point;
         }
         let normalized =
-            crate::geometric_wiring::normalize_with_high_water(&segments, self.next_segment_id)
-                .map_err(EditError::Geometry)?;
+            normalize_document_segments(&self.document, &segments, self.next_segment_id)?;
         self.commit_geometric(normalized)
     }
     pub fn split_geometric_segment(
@@ -1156,14 +1190,14 @@ impl Session {
     }
     pub fn merge_geometric_segments(&mut self) -> Result<bool, EditError> {
         self.ensure_editable()?;
-        let normalized = crate::geometric_wiring::normalize_with_high_water(
+        let normalized = normalize_document_segments(
+            &self.document,
             self.document
                 .wires
                 .geometric()
                 .map_err(EditError::Geometry)?,
             self.next_segment_id,
-        )
-        .map_err(EditError::Geometry)?;
+        )?;
         self.commit_geometric(normalized)
     }
     /// Canonical, transactional legacy-route conversion. The codec's shared pin metrics/router
@@ -1200,10 +1234,9 @@ impl Session {
             })
             .collect();
         let normalized =
-            crate::geometric_wiring::normalize_with_high_water(&segments, self.next_segment_id)
-                .map_err(|_| {
-                    SessionDigError::GeometryMigration("canonical routes cannot be normalized")
-                })?;
+            normalize_document_segments(&self.document, &segments, self.next_segment_id).map_err(
+                |_| SessionDigError::GeometryMigration("canonical routes cannot be normalized"),
+            )?;
         let mut candidate = self.document.clone();
         candidate.wires = crate::domain::Wiring::GeometricSegments(normalized.clone());
         let actual = crate::simulation::logical_pin_partitions(&candidate).map_err(|_| {
@@ -1526,7 +1559,7 @@ mod tests {
         assert!(crate::simulation::compile(session.document()).is_ok());
     }
     #[test]
-    fn migration_rejects_topology_changed_by_final_collinear_normalization_atomically() {
+    fn migration_preserves_pin_contacts_during_collinear_normalization() {
         use crate::domain::{PinDirection, PinId};
         let center_for_pin = |kind| {
             let offset =
@@ -1584,22 +1617,21 @@ mod tests {
         };
         session.connect([output(left), receiver(middle)]).unwrap();
         session.connect([output(right), receiver(middle)]).unwrap();
-        let before = session.document().clone();
-        let undo = session.undo.clone();
-        let redo = session.redo.clone();
+        let expected = crate::simulation::logical_pin_partitions(session.document()).unwrap();
         assert!(matches!(
             crate::simulation::compile(session.document()),
             Err(CompileError::MultipleDrivers { .. })
         ));
-        assert!(matches!(
-            session.migrate_to_geometric_wiring(),
-            Err(SessionDigError::GeometryMigration(
-                "normalization changes pin connectivity"
-            ))
-        ));
-        assert_eq!(session.document(), &before);
-        assert_eq!(session.undo, undo);
-        assert_eq!(session.redo, redo);
+        assert!(session.migrate_to_geometric_wiring().unwrap());
+        assert_eq!(
+            crate::simulation::logical_pin_partitions(session.document()).unwrap(),
+            expected
+        );
+        let compiled = crate::simulation::compile(session.document());
+        assert!(
+            matches!(compiled, Err(CompileError::GeometricMultipleDrivers { .. })),
+            "{compiled:?}"
+        );
     }
 
     #[test]

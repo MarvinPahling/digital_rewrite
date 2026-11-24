@@ -85,6 +85,15 @@ pub fn normalize_with_high_water(
     input: &[Segment],
     high_water: u64,
 ) -> Result<Vec<Segment>, GeometryError> {
+    normalize_with_high_water_preserving(input, high_water, &[])
+}
+
+/// Normalize while retaining vertices at protected coordinates, such as component pin contacts.
+pub fn normalize_with_high_water_preserving(
+    input: &[Segment],
+    high_water: u64,
+    protected_points: &[Point],
+) -> Result<Vec<Segment>, GeometryError> {
     if input.len() > MAX_SEGMENTS {
         return Err(GeometryError::SegmentLimit);
     }
@@ -180,7 +189,7 @@ pub fn normalize_with_high_water(
             b,
         })
         .collect::<Vec<_>>();
-    merge_collinear(&mut out);
+    merge_collinear(&mut out, protected_points);
     out.sort_by_key(|s| (s.a, s.b, s.id));
     if out.len() > MAX_SEGMENTS {
         return Err(GeometryError::SegmentLimit);
@@ -228,10 +237,10 @@ fn on_segment(p: Point, s: Segment) -> bool {
         && p.y >= s.a.y.min(s.b.y)
         && p.y <= s.a.y.max(s.b.y)
 }
-fn merge_collinear(segments: &mut Vec<Segment>) {
+fn merge_collinear(segments: &mut Vec<Segment>, protected_points: &[Point]) {
     // Preserve branches and all diagonal segments. Merge only orthogonal connected intervals
     // having no non-collinear segment endpoint at their common location.
-    let mut protected = BTreeSet::new();
+    let mut protected = protected_points.iter().copied().collect::<BTreeSet<_>>();
     for a in segments.iter() {
         for b in segments.iter() {
             if a.id != b.id && !same_line(a, b) {
@@ -363,6 +372,20 @@ mod tests {
         let x = normalize(&[segment(1, (0, 0), (10, 0)), segment(2, (5, -5), (5, 5))]).unwrap();
         assert_eq!(x.len(), 2);
     }
+    #[test]
+    fn normalization_retains_protected_pin_contact_vertices() {
+        let pieces = [segment(1, (0, 0), (10, 0)), segment(2, (10, 0), (20, 0))];
+        assert_eq!(normalize(&pieces).unwrap().len(), 1);
+        let preserved =
+            normalize_with_high_water_preserving(&pieces, 2, &[Point::new(10, 0)]).unwrap();
+        assert_eq!(preserved.len(), 2);
+        assert!(
+            preserved
+                .iter()
+                .any(|s| s.a == Point::new(10, 0) || s.b == Point::new(10, 0))
+        );
+    }
+
     #[test]
     fn canonical_overlap_is_idempotent_and_bounded() {
         let input = [segment(8, (0, 0), (10, 0)), segment(9, (5, 0), (15, 0))];
