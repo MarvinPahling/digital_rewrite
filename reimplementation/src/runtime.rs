@@ -59,31 +59,41 @@ impl OscillationDetector {
     }
 }
 
-/// A one-bit net value. `Unavailable` means no gate has computed it yet; it is not false.
+/// Runtime net state. Scheduling unavailability is distinct from every electrical signal value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Level {
+pub enum RuntimeValue {
     Unavailable,
-    Low,
-    High,
+    Value(crate::signal::SignalValue),
 }
 
-impl Level {
+impl RuntimeValue {
     fn from_bool(value: bool) -> Self {
-        if value { Self::High } else { Self::Low }
+        Level::from_bool(value)
     }
 
     fn signal_value(self) -> Option<crate::signal::SignalValue> {
         match self {
             Self::Unavailable => None,
-            Self::Low => Some(crate::signal::SignalValue::known(
-                crate::signal::SignalWidth::ONE,
-                0,
-            )),
-            Self::High => Some(crate::signal::SignalValue::known(
-                crate::signal::SignalWidth::ONE,
-                1,
-            )),
+            Self::Value(value) => Some(value),
         }
+    }
+}
+
+/// Compatibility namespace for one-bit constants, all represented as typed runtime values.
+#[allow(non_snake_case, non_upper_case_globals)]
+pub mod Level {
+    use super::RuntimeValue;
+    pub const Unavailable: RuntimeValue = RuntimeValue::Unavailable;
+    pub const Low: RuntimeValue = RuntimeValue::Value(crate::signal::SignalValue::known(
+        crate::signal::SignalWidth::ONE,
+        0,
+    ));
+    pub const High: RuntimeValue = RuntimeValue::Value(crate::signal::SignalValue::known(
+        crate::signal::SignalWidth::ONE,
+        1,
+    ));
+    pub fn from_bool(value: bool) -> RuntimeValue {
+        if value { High } else { Low }
     }
 }
 
@@ -155,25 +165,19 @@ struct Gate {
 }
 
 impl Gate {
-    fn evaluate(&self, values: &[Level]) -> Level {
-        self.evaluate_signal(values)
-            .and_then(|value| value.as_bool().ok())
-            .map_or(Level::Unavailable, Level::from_bool)
-    }
-
-    fn evaluate_signal(&self, values: &[Level]) -> Option<crate::signal::SignalValue> {
-        let a = values[self.inputs[0]];
-        let b = values[self.inputs[1]];
-        if a == Level::Unavailable || (self.kind != ComponentKind::Not && b == Level::Unavailable) {
+    fn evaluate_signal(&self, values: &[RuntimeValue]) -> Option<crate::signal::SignalValue> {
+        let RuntimeValue::Value(a) = values[self.inputs[0]] else {
             return None;
-        }
-        let value = |level| {
-            crate::signal::SignalValue::known(
-                crate::signal::SignalWidth::ONE,
-                u64::from(level == Level::High),
-            )
         };
-        evaluate_signal_gate(self.kind, value(a), value(b))
+        let b = if self.kind == ComponentKind::Not {
+            a
+        } else {
+            let RuntimeValue::Value(b) = values[self.inputs[1]] else {
+                return None;
+            };
+            b
+        };
+        evaluate_signal_gate(self.kind, a, b)
     }
 }
 
@@ -215,13 +219,13 @@ pub(crate) enum ResetOutputPolarity {
     Inverted,
 }
 impl ResetOutputPolarity {
-    fn asserted_level(self) -> Level {
+    fn asserted_level(self) -> RuntimeValue {
         match self {
             Self::Normal => Level::High,
             Self::Inverted => Level::Low,
         }
     }
-    fn released_level(self) -> Level {
+    fn released_level(self) -> RuntimeValue {
         match self {
             Self::Normal => Level::Low,
             Self::Inverted => Level::High,
@@ -256,7 +260,7 @@ impl ResetParticipant {
             released: false,
         })
     }
-    fn asserted_level(&self) -> Level {
+    fn asserted_level(&self) -> RuntimeValue {
         self.polarity.asserted_level()
     }
 }
@@ -324,7 +328,7 @@ pub struct Runtime {
     pin_nets: HashMap<PinRef, usize>,
     gates: Vec<Gate>,
     consumers: Vec<Vec<usize>>,
-    values: Vec<Level>,
+    values: Vec<RuntimeValue>,
     queue: Vec<usize>,
     queued: Vec<bool>,
     startup_frontier: Vec<usize>,
@@ -649,7 +653,7 @@ impl Runtime {
         self.queued.fill(true);
     }
     #[cfg(test)]
-    pub(crate) fn seed_output_for_test(&mut self, id: ComponentId, value: Level) {
+    pub(crate) fn seed_output_for_test(&mut self, id: ComponentId, value: RuntimeValue) {
         if let Some(gate) = self.gates.iter().find(|gate| gate.id == id) {
             self.values[gate.output] = value;
         }
@@ -731,24 +735,25 @@ impl Runtime {
         self.values.len()
     }
 
-    pub fn net_value(&self, net: usize) -> Option<Level> {
+    /// Typed value of a net; `None` means the net index is out of range.
+    pub fn net_value(&self, net: usize) -> Option<RuntimeValue> {
         self.values.get(net).copied()
     }
 
-    /// Value of the net containing `pin`; `None` if the pin does not exist in the circuit.
-    pub fn pin_value(&self, pin: PinRef) -> Option<Level> {
+    /// Typed value of the net containing `pin`; `None` means the pin does not exist.
+    pub fn pin_value(&self, pin: PinRef) -> Option<RuntimeValue> {
         self.pin_nets.get(&pin).map(|&net| self.values[net])
     }
 
-    /// What an Output component currently sees; `None` if `component` is not an Output.
-    pub fn output_value(&self, component: ComponentId) -> Option<Level> {
+    /// Typed value seen by an Output; `None` means `component` is not an Output.
+    pub fn output_value(&self, component: ComponentId) -> Option<RuntimeValue> {
         match self.roles.get(&component) {
             Some(Role::Output { net }) => Some(self.values[*net]),
             _ => None,
         }
     }
 
-    /// Accepted only while idle. Setting the current value schedules nothing.
+    /// One-bit Boolean input adapter, accepted only while idle. Setting the current value schedules nothing.
     pub fn set_input(
         &mut self,
         component: ComponentId,
@@ -762,7 +767,7 @@ impl Runtime {
         if self.startup_phase != StartupPhase::Running || self.is_pending() {
             return Err(RuntimeError::Pending);
         }
-        let level = Level::from_bool(value);
+        let level = RuntimeValue::from_bool(value);
         if self.values[net] == level {
             return Ok(InputChange::Unchanged);
         }
@@ -782,6 +787,7 @@ impl Runtime {
         Ok(InputChange::Changed)
     }
 
+    /// Toggles the supported one-bit input value; unavailable is treated as low for this adapter.
     pub fn toggle_input(&mut self, component: ComponentId) -> Result<InputChange, RuntimeError> {
         match self.roles.get(&component) {
             Some(Role::Input { net }) => {
@@ -1194,7 +1200,12 @@ impl Runtime {
                 self.startup_cursor += 1;
                 let (gate_id, net, level) = {
                     let gate = &self.gates[index];
-                    (gate.id, gate.output, gate.evaluate(&self.values))
+                    (
+                        gate.id,
+                        gate.output,
+                        gate.evaluate_signal(&self.values)
+                            .map_or(RuntimeValue::Unavailable, RuntimeValue::Value),
+                    )
                 };
                 self.trace_event(TraceEvent::GateEvaluated {
                     component: gate_id,
@@ -1344,9 +1355,7 @@ impl Runtime {
         let batch = self.batch.take()?;
         let mut changed = Vec::new();
         for (&gate, &staged) in batch.gates.iter().zip(&batch.staged) {
-            let level = staged
-                .and_then(|signal| signal.as_bool().ok())
-                .map_or(Level::Unavailable, Level::from_bool);
+            let level = staged.map_or(RuntimeValue::Unavailable, RuntimeValue::Value);
             let net = self.gates[gate].output;
             if self.values[net] != level {
                 let old = self.values[net];
@@ -1480,7 +1489,7 @@ mod tests {
         pins.sort();
         pins
     }
-    fn snapshot(runtime: &Runtime, document: &Document) -> Vec<Option<Level>> {
+    fn snapshot(runtime: &Runtime, document: &Document) -> Vec<Option<RuntimeValue>> {
         all_pins(document)
             .into_iter()
             .map(|pin| runtime.pin_value(pin))
@@ -1493,7 +1502,7 @@ mod tests {
         ));
         assert!(!runtime.is_pending());
     }
-    fn level(value: bool) -> Level {
+    fn level(value: bool) -> RuntimeValue {
         if value { High } else { Low }
     }
     // Legacy scheduler regressions are explicitly placed in a private normal-running state;
@@ -2365,6 +2374,90 @@ mod tests {
     }
 
     #[test]
+    fn public_net_inspection_and_trace_keep_known_one_bit_values_distinct_from_unavailable() {
+        use crate::{
+            signal::{SignalValue, SignalWidth},
+            trace::TraceEvent,
+        };
+        let doc = document(
+            &[
+                (1, ComponentKind::Input),
+                (2, ComponentKind::Not),
+                (3, ComponentKind::Output),
+            ],
+            &[(out(1), inp(2, 0)), (out(2), inp(3, 0))],
+        );
+        let mut runtime =
+            Runtime::start_with_trace(&doc, 91, crate::trace::TraceLog::new(128, 91, 0).unwrap())
+                .unwrap();
+        let known_zero = RuntimeValue::Value(SignalValue::known(SignalWidth::ONE, 0));
+        assert_eq!(
+            runtime.net_value(runtime.pin_nets[&out(1)]),
+            Some(known_zero)
+        );
+        assert_ne!(Some(RuntimeValue::Unavailable), Some(known_zero));
+        while runtime.is_pending() {
+            assert!(matches!(
+                runtime.settle(10_000),
+                SettleOutcome::Settled { .. }
+            ));
+        }
+        let known_one = RuntimeValue::Value(SignalValue::known(SignalWidth::ONE, 1));
+        assert_eq!(runtime.output_value(ComponentId(3)), Some(known_one));
+        let records = runtime
+            .trace()
+            .unwrap()
+            .records()
+            .map(|record| record.event)
+            .collect::<Vec<_>>();
+        assert!(records.iter().any(|event| matches!(event,
+            TraceEvent::GateEvaluated { value: Some(value), .. }
+                if *value == SignalValue::known(SignalWidth::ONE, 1) && value.high_z() == 0
+        )));
+        assert!(records.iter().any(|event| matches!(event,
+            TraceEvent::NetPublished { new: Some(value), .. }
+                if *value == known_one.signal_value().unwrap() && value.high_z() == 0
+        )));
+
+        runtime.force_running_for_test();
+        let output_net = runtime.pin_nets[&out(2)];
+        assert_eq!(
+            runtime.output_value(ComponentId(3)),
+            Some(RuntimeValue::Unavailable)
+        );
+        assert_eq!(runtime.net_value(runtime.net_count()), None);
+        assert_ne!(
+            runtime.net_value(output_net),
+            runtime.net_value(runtime.net_count())
+        );
+    }
+
+    #[test]
+    fn multi_bit_internal_net_evaluation_and_storage_stay_width_aware() {
+        use crate::signal::{SignalValue, SignalWidth};
+        let doc = document(
+            &[
+                (1, ComponentKind::Input),
+                (2, ComponentKind::Not),
+                (3, ComponentKind::Output),
+            ],
+            &[(out(1), inp(2, 0)), (out(2), inp(3, 0))],
+        );
+        let width = SignalWidth::new(4).unwrap();
+        let mut runtime = Runtime::start(&doc).unwrap();
+        runtime.force_running_for_test();
+        let input_net = runtime.pin_nets[&out(1)];
+        runtime.values[input_net] = RuntimeValue::Value(SignalValue::known(width, 0b1010));
+        assert!(matches!(
+            runtime.step(),
+            StepOutcome::Stepped { evaluated: 1 }
+        ));
+        let expected = RuntimeValue::Value(SignalValue::known(width, 0b0101));
+        assert_eq!(runtime.net_value(runtime.pin_nets[&out(2)]), Some(expected));
+        assert_eq!(runtime.output_value(ComponentId(3)), Some(expected));
+    }
+
+    #[test]
     fn binary_gates_are_strictly_unavailable_with_unavailable_operand() {
         use Level::*;
         for kind in [ComponentKind::And, ComponentKind::Or] {
@@ -2377,12 +2470,12 @@ mod tests {
             };
             for known in [Low, High, Unavailable] {
                 assert_eq!(
-                    gate.evaluate(&[Unavailable, known, Unavailable]),
-                    Unavailable
+                    gate.evaluate_signal(&[Unavailable, known, Unavailable]),
+                    None
                 );
                 assert_eq!(
-                    gate.evaluate(&[known, Unavailable, Unavailable]),
-                    Unavailable
+                    gate.evaluate_signal(&[known, Unavailable, Unavailable]),
+                    None
                 );
             }
         }

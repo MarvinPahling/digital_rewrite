@@ -4,7 +4,7 @@ use digital_rust::{
     domain::{ComponentId, ComponentKind},
     engine::{Session, SimulationError},
     file_session::{DiscardIntent, FileIo, LocalFileIo},
-    runtime::{Level, SettleOutcome, SimulationOptions},
+    runtime::{Level, RuntimeValue, SettleOutcome, SimulationOptions},
     sim_text,
     simulation::{self, MAX_COMPONENTS, MAX_WORK},
 };
@@ -512,9 +512,28 @@ fn run_with_io_output(
                 .collect::<Vec<_>>();
             for (id, label, value) in rows {
                 let value = match value {
-                    Level::Low => "0",
-                    Level::High => "1",
-                    Level::Unavailable => "?",
+                    RuntimeValue::Unavailable => "?".to_owned(),
+                    RuntimeValue::Value(signal)
+                        if signal.width().get() == 1 && signal.high_z() == 0 =>
+                    {
+                        match signal.as_bool() {
+                            Ok(false) => "0".to_owned(),
+                            Ok(true) => "1".to_owned(),
+                            Err(_) => signal.format_hex(),
+                        }
+                    }
+                    RuntimeValue::Value(signal) if signal.high_z() != 0 => format!(
+                        "{}-bit {} (high-Z mask 0x{:X})",
+                        signal.width().get(),
+                        signal.format_hex(),
+                        signal.high_z()
+                    ),
+                    RuntimeValue::Value(signal) => format!(
+                        "{}-bit {} (unsigned {})",
+                        signal.width().get(),
+                        signal.format_hex(),
+                        signal.format_unsigned()
+                    ),
                 };
                 outln!("output id={} label=\"{}\" value={value}", id.0, label);
             }

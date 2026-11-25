@@ -5,7 +5,7 @@
 use crate::{
     domain::{ComponentId, Document, PinDirection, PinRef},
     engine::SimulationError,
-    runtime::{Level, OscillationDiagnostic, RuntimeError},
+    runtime::{OscillationDiagnostic, RuntimeError, RuntimeValue},
     simulation::{CompileError, MAX_COMPONENTS, MAX_WIRES, MAX_WORK},
 };
 
@@ -215,21 +215,45 @@ pub fn describe_oscillation(
     )
 }
 
-/// A one-bit value as symbol plus word.
-pub fn level_text(level: Level) -> &'static str {
+/// Signal display without implicitly sampling high-impedance bits.
+pub fn level_text(level: RuntimeValue) -> String {
     match level {
-        Level::Low => "0 (low)",
-        Level::High => "1 (high)",
-        Level::Unavailable => "? (unavailable)",
+        RuntimeValue::Unavailable => "? (unavailable)".to_owned(),
+        RuntimeValue::Value(value) if value.high_z() != 0 => format!(
+            "{}-bit {} (high-Z mask 0x{:X})",
+            value.width().get(),
+            value.format_hex(),
+            value.high_z()
+        ),
+        RuntimeValue::Value(value) if value.width().get() == 1 && value.bits() == 0 => {
+            "0 (low)".to_owned()
+        }
+        RuntimeValue::Value(value) if value.width().get() == 1 => "1 (high)".to_owned(),
+        RuntimeValue::Value(value) => format!(
+            "{}-bit {} (unsigned {})",
+            value.width().get(),
+            value.format_hex(),
+            value.format_unsigned()
+        ),
     }
 }
 
-/// Short form for on-canvas badges.
-pub fn level_badge(level: Level) -> &'static str {
+/// Short form for on-canvas badges; width and high-Z information are retained.
+pub fn level_badge(level: RuntimeValue) -> String {
     match level {
-        Level::Low => "= 0",
-        Level::High => "= 1",
-        Level::Unavailable => "= ?",
+        RuntimeValue::Unavailable => "= ?".to_owned(),
+        RuntimeValue::Value(value) if value.high_z() != 0 => {
+            format!(
+                "= {}-bit {} Z:{:X}",
+                value.width().get(),
+                value.format_hex(),
+                value.high_z()
+            )
+        }
+        RuntimeValue::Value(value) if value.width().get() == 1 => format!("= {}", value.bits()),
+        RuntimeValue::Value(value) => {
+            format!("= {}-bit {}", value.width().get(), value.format_hex())
+        }
     }
 }
 
@@ -237,6 +261,7 @@ pub fn level_badge(level: Level) -> &'static str {
 mod tests {
     use super::*;
     use crate::domain::{Component, ComponentKind, PinId, Position};
+    use crate::runtime::Level;
 
     fn document() -> Document {
         let component = |id, kind: ComponentKind, label: &str| Component {
@@ -313,6 +338,10 @@ mod tests {
         assert_eq!(level_text(Level::High), "1 (high)");
         assert_eq!(level_text(Level::Unavailable), "? (unavailable)");
         assert_eq!(level_badge(Level::Unavailable), "= ?");
+        let width = crate::signal::SignalWidth::new(4).unwrap();
+        let z_value = RuntimeValue::Value(crate::signal::SignalValue::new(width, 0b1010, 0b0010));
+        assert_eq!(level_text(z_value), "4-bit 0x8 (high-Z mask 0x2)");
+        assert_eq!(level_badge(z_value), "= 4-bit 0x8 Z:2");
     }
 
     #[test]

@@ -2585,7 +2585,7 @@ impl DigitalApp {
                                     component.id.0,
                                     runtime
                                         .output_value(component.id)
-                                        .map_or("? (unavailable)", level_text)
+                                        .map_or_else(|| "? (unavailable)".to_owned(), level_text)
                                 ));
                             }
                         }
@@ -3742,6 +3742,7 @@ mod shell_polish_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RuntimeValue;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -5611,7 +5612,7 @@ mod tests {
                 .pin_value(value_pin)
                 .unwrap_or(Level::Unavailable);
             let galley = painter.layout_no_wrap(
-                level_badge(value).into(),
+                level_badge(value),
                 egui::FontId::monospace(14.),
                 egui::Color32::WHITE,
             );
@@ -7040,7 +7041,7 @@ mod tests {
     ) {
         frame(ctx, app, vec![key(key_, modifiers)], true);
     }
-    fn output_level(app: &DigitalApp, output: ComponentId) -> Option<Level> {
+    fn output_level(app: &DigitalApp, output: ComponentId) -> Option<RuntimeValue> {
         app.session.inspect()?.output_value(output)
     }
     fn wants_immediate_repaint(output: &egui::FullOutput) -> bool {

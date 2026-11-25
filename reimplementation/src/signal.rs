@@ -48,6 +48,13 @@ pub struct SignalValue {
     high_z: u64,
 }
 
+/// Explicit policy for reading high-impedance positions when interpreting signed values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplingPolicy {
+    HighZIsZero,
+    RandomBits(u64),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignalValueError {
     NotOneBit,
@@ -97,15 +104,19 @@ impl SignalValue {
         self.bits
     }
 
-    /// Signed two's-complement interpretation with sign extension from the declared width.
-    pub const fn signed(self) -> i64 {
+    /// Two's-complement interpretation using the caller's explicit high-Z sampling policy.
+    pub const fn signed_with(self, policy: SamplingPolicy) -> i64 {
+        let bits = match policy {
+            SamplingPolicy::HighZIsZero => self.read_zero(),
+            SamplingPolicy::RandomBits(random) => self.read_random(random),
+        };
         let sign = 1u64 << (self.width.get() - 1);
         if self.width.get() == 64 {
-            self.bits as i64
-        } else if self.bits & sign != 0 {
-            (self.bits | !self.width.mask()) as i64
+            bits as i64
+        } else if bits & sign != 0 {
+            (bits | !self.width.mask()) as i64
         } else {
-            self.bits as i64
+            bits as i64
         }
     }
 
@@ -160,8 +171,9 @@ impl SignalValue {
     pub fn format_unsigned(self) -> String {
         self.bits.to_string()
     }
-    pub fn format_signed(self) -> String {
-        self.signed().to_string()
+    /// Signed decimal formatting requires a sampling choice for any high-Z bits.
+    pub fn format_signed(self, policy: SamplingPolicy) -> String {
+        self.signed_with(policy).to_string()
     }
 }
 
@@ -206,7 +218,8 @@ mod tests {
             (64, 1u64 << 63, i64::MIN),
         ] {
             assert_eq!(
-                SignalValue::known(SignalWidth::new(width).unwrap(), bits).signed(),
+                SignalValue::known(SignalWidth::new(width).unwrap(), bits)
+                    .signed_with(SamplingPolicy::HighZIsZero),
                 signed
             );
         }
@@ -223,6 +236,15 @@ mod tests {
         let value = SignalValue::known(SignalWidth::new(8).unwrap(), 0xA5);
         assert_eq!(value.format_hex(), "0xA5");
         assert_eq!(value.format_unsigned(), "165");
-        assert_eq!(value.format_signed(), "-91");
+        assert_eq!(value.format_signed(SamplingPolicy::HighZIsZero), "-91");
+
+        let high_z_sign = SignalValue::new(SignalWidth::new(4).unwrap(), 0, 0b1000);
+        assert_eq!(high_z_sign.format_signed(SamplingPolicy::HighZIsZero), "0");
+        assert_eq!(
+            high_z_sign.format_signed(SamplingPolicy::RandomBits(0b1000)),
+            "-8"
+        );
+        assert_eq!(high_z_sign.format_hex(), "0x0");
+        assert_eq!(high_z_sign.format_unsigned(), "0");
     }
 }
